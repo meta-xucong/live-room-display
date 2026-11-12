@@ -1,5 +1,32 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+const THEME_STORAGE_KEY = "live-room-theme";
+
+function initialTheme() {
+  if (document.documentElement.dataset.theme === "dark") return "dark";
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
+function ThemeToggle({ theme, onToggle }) {
+  const dark = theme === "dark";
+  return (
+    <button
+      className="theme-toggle"
+      type="button"
+      aria-label={`当前为${dark ? "暗色" : "浅色"}模式，切换到${dark ? "浅色" : "暗色"}模式`}
+      aria-pressed={dark}
+      onClick={onToggle}
+    >
+      <span className="theme-toggle-icon" aria-hidden="true">{dark ? "☾" : "☼"}</span>
+      <span>{dark ? "暗色" : "浅色"}</span>
+    </button>
+  );
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials: "same-origin", ...options });
   const body = await response.json().catch(() => ({}));
@@ -108,7 +135,7 @@ function MerchandisingInfo({ products = [], salesTarget = "" }) {
 function Brand({ compact = false }) {
   return (
     <div className="brand-lockup">
-      <div className="brand-mark" aria-hidden="true">L</div>
+      <img className="brand-mark" src="/soho-logo.png" alt="SOHO 标识" />
       <div>
         <div className="brand-kicker">STUDIO DISPLAY</div>
         <div className="brand-title">直播间信息牌{compact ? " · 管理端" : ""}</div>
@@ -117,11 +144,16 @@ function Brand({ compact = false }) {
   );
 }
 
-function AuthHeader() {
-  return <header className="auth-brand"><Brand /></header>;
+function AuthHeader({ theme, onToggleTheme }) {
+  return (
+    <>
+      <header className="auth-brand"><Brand /></header>
+      <div className="auth-theme-control"><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div>
+    </>
+  );
 }
 
-function LoginPage({ onLogin }) {
+function LoginPage({ onLogin, theme, onToggleTheme }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
@@ -141,7 +173,7 @@ function LoginPage({ onLogin }) {
   }
   return (
     <div className="auth-shell">
-      <AuthHeader />
+      <AuthHeader theme={theme} onToggleTheme={onToggleTheme} />
       <main className="auth-card">
         <div className="section-kicker">WELCOME BACK</div>
         <h1>登录工作台</h1>
@@ -161,7 +193,7 @@ function LoginPage({ onLogin }) {
   );
 }
 
-function AdminPage({ user, csrfToken, onLogout }) {
+function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
@@ -198,6 +230,7 @@ function AdminPage({ user, csrfToken, onLogout }) {
         <div className="admin-account">
           <span className="account-avatar">{user.username.slice(0, 1).toUpperCase()}</span>
           <span>{user.username}<small>管理员</small></span>
+        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           <button className="topbar-action" type="button" onClick={onLogout}>退出</button>
         </div>
       </header>
@@ -234,6 +267,7 @@ function AdminPage({ user, csrfToken, onLogout }) {
 }
 
 export function App() {
+  const [theme, setTheme] = useState(initialTheme);
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
   const [csrfToken, setCsrfToken] = useState("");
@@ -243,6 +277,16 @@ export function App() {
   const [serverOffset, setServerOffset] = useState(0);
   const [realTime, setRealTime] = useState(Date.now());
   const [connectionError, setConnectionError] = useState("");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, theme); } catch {}
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#0b0e13" : "#edf2f7");
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => current === "dark" ? "light" : "dark");
+  }, []);
 
   const loadRooms = useCallback(async () => {
     const response = await api("/api/v1/rooms");
@@ -400,8 +444,8 @@ export function App() {
   const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : "暂无排班";
 
   if (authLoading) return <div className="system-loading"><div className="loading-orbit" /><span>正在连接展示系统</span></div>;
-  if (!user) return <LoginPage onLogin={login} />;
-  if (user.role === "admin") return <AdminPage user={user} csrfToken={csrfToken} onLogout={logout} />;
+  if (!user) return <LoginPage onLogin={login} theme={theme} onToggleTheme={toggleTheme} />;
+  if (user.role === "admin") return <AdminPage user={user} csrfToken={csrfToken} onLogout={logout} theme={theme} onToggleTheme={toggleTheme} />;
 
   return (
     <div className="app-shell">
@@ -416,6 +460,7 @@ export function App() {
         <div className="topbar-right">
           <span className="refresh-indicator" />
           <span>{connectionError ? "正在重连" : "实时同步"}</span>
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <span className="topbar-divider" />
           <span className="viewer-account">{user.username}</span>
           <button className="topbar-action" type="button" onClick={logout}>退出</button>
