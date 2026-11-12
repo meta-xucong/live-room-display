@@ -339,7 +339,7 @@ async function handle(request, response) {
       failures.set(loginKey, next);
       return error(response, 401, "LOGIN_FAILED", "用户名或密码不正确");
     }
-    failures.delete(ip);
+    failures.delete(loginKey);
     const token = randomBytes(32).toString("base64url");
     const csrf = randomBytes(24).toString("base64url");
     const expiresAt = Date.now() + 12 * 60 * 60_000;
