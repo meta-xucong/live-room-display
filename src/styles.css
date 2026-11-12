@@ -203,7 +203,7 @@ button { cursor: pointer; }
 
 /* Login and administrator workspace */
 .brand-lockup { min-width: 0; display: flex; align-items: center; gap: 11px; }
-.brand-mark { width: 42px; height: 42px; flex: none; display: block; padding: 3px; border: 1px solid rgba(215, 177, 74, .22); border-radius: 10px; background: #08090b; object-fit: contain; box-shadow: 0 4px 14px rgba(10, 14, 20, .17); }
+.brand-mark { width: 42px; height: 42px; flex: none; display: block; padding: 3px; border: 1px solid rgba(215, 177, 74, .22); border-radius: 10px; background: #fff; object-fit: contain; box-shadow: 0 4px 14px rgba(10, 14, 20, .08); }
 .viewer-account { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-action { min-height: 30px; padding: 0 10px; border: 1px solid rgba(116, 137, 163, .2); border-radius: 7px; background: rgba(255,255,255,.64); color: #61738d; font-size: 10px; transition: background .18s ease, border-color .18s ease; }
 .topbar-action:hover { border-color: rgba(78, 121, 189, .35); background: #fff; }
@@ -525,6 +525,7 @@ body { background: #edf2f7; }
 :root[data-theme="dark"] .section-kicker { color: #9ca9ba; }
 :root[data-theme="dark"] .brand-title,
 :root[data-theme="dark"] .section-heading h2 { color: #eef2f7; }
+:root[data-theme="dark"] .brand-mark { background: #08090b; box-shadow: 0 4px 14px rgba(0, 0, 0, .28); }
 :root[data-theme="dark"] .room-selector-inline label,
 :root[data-theme="dark"] .topbar-right { color: #aab4c2; }
 :root[data-theme="dark"] .room-selector-inline select {
