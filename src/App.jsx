@@ -238,7 +238,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <section className="admin-hero">
           <div className="section-kicker">DATA MANAGEMENT</div>
           <h1>排班信息管理</h1>
-          <p>每个工作表对应一个直播间。上传完整工作簿后，系统会先校验所有工作表，再一次性更新展示数据。</p>
+          <p>每个工作表对应一个直播间。上传完整工作簿后，系统会先校验所有工作表，再一次性更新展示数据。<a className="template-link" href="/live-room-schedule-template.xlsx" download>下载空白模板</a></p>
         </section>
         <section className="admin-card">
           <div className="admin-card-heading">
@@ -259,7 +259,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           {problems.length > 0 && <div className="issue-list"><h3>需要修正的内容 <span>{problems.length}</span></h3>{problems.map((issue, index) => <div className="issue-row" key={`${issue.sheet}-${issue.row}-${index}`}><span>{issue.sheet || "工作簿"}</span><span>{issue.row ? `第 ${issue.row} 行 · ` : ""}{issue.field}</span><strong>{issue.message}</strong></div>)}</div>}
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
-        <aside className="admin-note"><span>i</span><div><strong>更新规则</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。照片须放在对应排班行的 G 列单元格区域。</p></div></aside>
+        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片添加方式</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。照片请用 Excel「插入 → 图片」嵌入工作簿，并把图片左上角放在对应排班行的 G 列（每场一张，JPG/PNG，单张不超过 8 MB）。系统会按图片所在行自动识别；请勿使用网络图片链接。</p></div></aside>
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
     </div>
