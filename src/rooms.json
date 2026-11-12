@@ -1,0 +1,33 @@
+[
+  {
+    "id": "01",
+    "sheetName": "01号直播间",
+    "name": "服饰直播间",
+    "defaultPreview": "2026-11-12T09:15",
+    "schedule": [
+      {
+        "date": "2026-11-12",
+        "start": "07:00",
+        "end": "11:00",
+        "director": "导演示例",
+        "host": "主播示例",
+        "assistant": "助播示例",
+        "featuredProducts": ["商品示例 A", "商品示例 B", "商品示例 C"],
+        "salesTarget": "20万元",
+        "photo": "",
+        "notes": ""
+      }
+    ]
+  },
+  {
+    "id": "02",
+    "sheetName": "02号直播间",
+    "name": "精选直播间",
+    "defaultPreview": "2026-11-12T10:30",
+    "schedule": [
+      { "date": "2026-11-12", "start": "07:30", "end": "10:00", "director": "导演示例", "host": "主播示例 A", "assistant": "助播示例", "photo": "", "notes": "" },
+      { "date": "2026-11-12", "start": "10:00", "end": "12:30", "director": "导演示例", "host": "主播示例 B", "assistant": "助播示例", "photo": "", "notes": "" },
+      { "date": "2026-11-12", "start": "12:30", "end": "15:00", "director": "导演示例", "host": "主播示例 C", "assistant": "助播示例", "photo": "", "notes": "" }
+    ]
+  }
+]
