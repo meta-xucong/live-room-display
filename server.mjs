@@ -183,6 +183,18 @@ function csrfValid(request, user) {
   return Boolean(user && request.headers["x-csrf-token"] && request.headers["x-csrf-token"] === user.csrf_token);
 }
 
+function apiTokenLibraryPayload() {
+  const tokens = db.prepare(`SELECT id,name,created_at,last_used_at,revoked_at
+    FROM api_tokens ORDER BY created_at DESC`).all().map((item) => ({
+    id: item.id,
+    name: item.name,
+    createdAt: new Date(item.created_at).toISOString(),
+    lastUsedAt: item.last_used_at ? new Date(item.last_used_at).toISOString() : null,
+    revokedAt: item.revoked_at ? new Date(item.revoked_at).toISOString() : null,
+  }));
+  return { tokens };
+}
+
 async function readBody(request, maxBytes) {
   const chunks = [];
   let size = 0;
@@ -1010,6 +1022,51 @@ async function handle(request, response) {
     const user = requireUser(request, response, "admin");
     if (!user) return;
     return json(response, 200, avatarLibraryPayload());
+  }
+
+  if (request.method === "GET" && pathname === "/api/v1/admin/api-tokens") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    return json(response, 200, apiTokenLibraryPayload());
+  }
+
+  if (request.method === "POST" && pathname === "/api/v1/admin/api-tokens") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    const createWindow = uploadWindows.get(`api-tokens:${user.id}`);
+    if (createWindow && createWindow.until > Date.now() && createWindow.count >= 5) {
+      return error(response, 429, "TOKEN_CREATE_RATE_LIMIT", "密钥创建次数过多，请稍后再试");
+    }
+    let input;
+    try { input = await readJson(request); } catch (cause) {
+      return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+    }
+    const name = String(input.name ?? "").trim();
+    if (!name || name.length > 80 || /[\r\n]/.test(name)) {
+      return error(response, 400, "INVALID_TOKEN_NAME", "请输入密钥用途名称，最多 80 个字符且不能换行");
+    }
+    uploadWindows.set(`api-tokens:${user.id}`, createWindow?.until > Date.now()
+      ? { count: createWindow.count + 1, until: createWindow.until }
+      : { count: 1, until: Date.now() + 10 * 60_000 });
+    const id = randomBytes(16).toString("hex");
+    const token = `lrd_live_${randomBytes(32).toString("base64url")}`;
+    const now = Date.now();
+    db.prepare("INSERT INTO api_tokens(id,name,token_hash,created_at) VALUES (?,?,?,?)")
+      .run(id, name, hashToken(token), now);
+    return json(response, 201, { ok: true, id, name, token, createdAt: new Date(now).toISOString(), ...apiTokenLibraryPayload() });
+  }
+
+  const adminApiTokenMatch = pathname.match(/^\/api\/v1\/admin\/api-tokens\/([a-f\d]{32})$/i);
+  if (request.method === "DELETE" && adminApiTokenMatch) {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    const id = adminApiTokenMatch[1];
+    const result = db.prepare("UPDATE api_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(Date.now(), id);
+    if (!result.changes) return error(response, 404, "API_TOKEN_NOT_FOUND", "密钥不存在或已撤销");
+    db.prepare("DELETE FROM mcp_previews WHERE token_id=?").run(id);
+    return json(response, 200, { ok: true, ...apiTokenLibraryPayload() });
   }
 
   if (request.method === "POST" && pathname === "/api/v1/admin/host-avatars") {

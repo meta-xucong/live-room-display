@@ -436,6 +436,142 @@ function AvatarLibrary({ csrfToken }) {
   );
 }
 
+function McpKeyManager({ csrfToken }) {
+  const [tokens, setTokens] = useState(null);
+  const [name, setName] = useState("");
+  const [oneTimeToken, setOneTimeToken] = useState("");
+  const [oneTimeTokenId, setOneTimeTokenId] = useState("");
+  const [message, setMessage] = useState("");
+  const [messageType, setMessageType] = useState("success");
+  const [busy, setBusy] = useState(false);
+  const [revokingId, setRevokingId] = useState("");
+  const secretInput = useRef(null);
+
+  const loadTokens = useCallback(async () => {
+    const response = await api("/api/v1/admin/api-tokens");
+    setTokens(response.tokens ?? []);
+  }, []);
+
+  useEffect(() => {
+    loadTokens().catch((cause) => {
+      setMessageType("error");
+      setMessage(cause.message);
+    });
+  }, [loadTokens]);
+
+  async function createToken(event) {
+    event.preventDefault();
+    if (busy || !name.trim()) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      const response = await api("/api/v1/admin/api-tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-csrf-token": csrfToken },
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      setTokens(response.tokens ?? []);
+      setOneTimeToken(response.token);
+      setOneTimeTokenId(response.id);
+      setName("");
+      setMessageType("success");
+      setMessage("密钥已创建。请立即复制并保存；离开此页面后将无法再次查看。");
+    } catch (cause) {
+      setMessageType("error");
+      setMessage(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyToken() {
+    if (!oneTimeToken) return;
+    try {
+      await navigator.clipboard.writeText(oneTimeToken);
+      setMessageType("success");
+      setMessage("密钥已复制，请立即保存到对应 Harness 的安全配置中。");
+    } catch {
+      secretInput.current?.focus();
+      secretInput.current?.select();
+      setMessageType("error");
+      setMessage("浏览器未开放剪贴板权限，已选中密钥，请按 Ctrl+C 手动复制。");
+    }
+  }
+
+  async function revokeToken(item) {
+    if (!window.confirm(`确定撤销“${item.name}”吗？连接它的 Harness 将无法继续访问 MCP。`)) return;
+    setRevokingId(item.id);
+    setMessage("");
+    try {
+      const response = await api(`/api/v1/admin/api-tokens/${encodeURIComponent(item.id)}`, {
+        method: "DELETE",
+        headers: { "x-csrf-token": csrfToken },
+      });
+      setTokens(response.tokens ?? []);
+      setMessageType("success");
+      setMessage(`已撤销“${item.name}”。`);
+      if (item.id === oneTimeTokenId) {
+        setOneTimeToken("");
+        setOneTimeTokenId("");
+      }
+    } catch (cause) {
+      setMessageType("error");
+      setMessage(cause.message);
+    } finally {
+      setRevokingId("");
+    }
+  }
+
+  function formatDate(value) {
+    if (!value) return "尚未使用";
+    return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+  }
+
+  return (
+    <section className="mcp-key-workspace" aria-label="MCP 密钥管理">
+      <div className="mcp-key-intro">
+        <div><span className="section-kicker">MCP ACCESS</span><h2>Harness 连接密钥</h2><p>为 Codex、WorkBuddy 等工具分别创建独立密钥。每把密钥都可以单独撤销。</p></div>
+        <span className="mcp-key-shield" aria-hidden="true">⌘</span>
+      </div>
+
+      <form className="admin-card mcp-token-create-card" onSubmit={createToken}>
+        <div className="admin-card-heading">
+          <div className="admin-icon">＋</div>
+          <div><h2>生成 MCP 密钥</h2><p>建议按使用工具命名，例如“Codex MCP”或“WorkBuddy MCP”。</p></div>
+        </div>
+        <div className="mcp-token-form-row">
+          <label className="mcp-token-name-field" htmlFor="mcp-token-name">密钥用途名称<input id="mcp-token-name" value={name} maxLength={80} onChange={(event) => setName(event.target.value)} placeholder="例如：Codex MCP" required /></label>
+          <button className="button-primary mcp-create-button" type="submit" disabled={busy || !name.trim()}>{busy ? "正在生成…" : "生成密钥"}</button>
+        </div>
+      </form>
+
+      {oneTimeToken && (
+        <div className="mcp-token-reveal" role="alert">
+          <div className="mcp-token-reveal-heading"><span className="mcp-token-check">✓</span><div><strong>新密钥已生成</strong><span>出于安全考虑，完整密钥只显示这一次。</span></div></div>
+          <div className="mcp-token-copy-row"><input ref={secretInput} aria-label="新生成的一次性 MCP 密钥" value={oneTimeToken} readOnly onFocus={(event) => event.target.select()} /><button type="button" className="mcp-copy-button" onClick={copyToken}>复制密钥</button></div>
+          <p>现在将它粘贴到 Harness 的 MCP 连接配置中。关闭或刷新页面后，若未保存只能撤销并重新生成。</p>
+        </div>
+      )}
+
+      {message && <div className={`form-message${messageType === "error" ? " form-error" : " form-success"}`} role={messageType === "error" ? "alert" : "status"}>{message}</div>}
+
+      <div className="mcp-token-list-heading"><div><span className="section-kicker">KEY INVENTORY</span><h2>密钥列表</h2></div><span>{tokens?.length ?? "—"} 把</span></div>
+      {tokens ? tokens.length ? (
+        <div className="mcp-token-list">
+          {tokens.map((item) => (
+            <article className={`mcp-token-card${item.revokedAt ? " revoked" : ""}`} key={item.id}>
+              <div className="mcp-token-card-main"><span className="mcp-token-mark" aria-hidden="true">⌘</span><div className="mcp-token-card-title"><strong>{item.name}</strong><span>创建于 {formatDate(item.createdAt)}</span></div></div>
+              <div className="mcp-token-card-usage"><span className={`mcp-token-status${item.revokedAt ? " inactive" : ""}`}><i />{item.revokedAt ? "已撤销" : "有效"}</span><small>{item.revokedAt ? `撤销于 ${formatDate(item.revokedAt)}` : `最近使用：${formatDate(item.lastUsedAt)}`}</small></div>
+              {!item.revokedAt && <button className="mcp-revoke-button" type="button" disabled={revokingId === item.id} onClick={() => revokeToken(item)}>{revokingId === item.id ? "处理中…" : "撤销密钥"}</button>}
+            </article>
+          ))}
+        </div>
+      ) : <div className="mcp-token-empty">还没有 MCP 密钥。生成后即可在 Harness 中连接直播间信息牌。</div> : <div className="mcp-token-empty">正在读取密钥列表…</div>}
+      <aside className="mcp-key-security-note"><span>i</span><p>系统只保存密钥摘要。请勿将完整密钥提交到 GitHub、写入公开文档或发送到群聊；如果密钥泄露，请立即撤销并为对应 Harness 重新生成。</p></aside>
+    </section>
+  );
+}
+
 function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [activeTab, setActiveTab] = useState("schedule");
   const [file, setFile] = useState(null);
@@ -487,6 +623,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
           <button type="button" role="tab" aria-selected={activeTab === "avatars"} className={activeTab === "avatars" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("avatars")}>主播头像库</button>
+          <button type="button" role="tab" aria-selected={activeTab === "keys"} className={activeTab === "keys" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("keys")}>MCP 密钥</button>
         </div>
         {activeTab === "schedule" ? <>
         <section className="admin-card" role="tabpanel">
@@ -509,7 +646,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
         <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。主播照片可在“主播头像库”集中维护；排班 Excel 中已有的行内照片仍会兼容显示。新主播首次导入时，如果每场照片一致，系统会自动收录到头像库。</p></div></aside>
-        </> : <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div>}
+        </> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
     </div>
