@@ -1,0 +1,20 @@
+{
+  "title": "连接直播间信息牌",
+  "title_en": "Connect to Live Room Display",
+  "description": "粘贴管理员为 WorkBuddy 创建的 API 密钥。WorkBuddy 会将凭证保存在本机连接器设置中。",
+  "description_en": "Paste the API key created for WorkBuddy. WorkBuddy stores the credential in its local connector settings.",
+  "docUrl": "https://github.com/meta-xucong/live-room-display/blob/main/docs/mcp-connectors.md",
+  "docLabel": "查看连接与密钥说明",
+  "docLabel_en": "Connection and API key guide",
+  "fields": [
+    {
+      "key": "API_KEY",
+      "label": "直播间信息牌 API 密钥",
+      "label_en": "Live Room Display API Key",
+      "type": "password",
+      "required": true,
+      "placeholder": "粘贴管理员生成的 lrd_live_... 密钥",
+      "description": "请使用专门为 WorkBuddy 创建的密钥。不要将密钥发到聊天或填写到排班内容中。"
+    }
+  ]
+}

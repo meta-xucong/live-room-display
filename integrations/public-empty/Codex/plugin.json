@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "live-room-schedule",
+  "version": "1.0.0",
+  "description": "Use natural language to review and update live room schedules with a preview and explicit confirmation.",
+  "author": {
+    "name": "Soho Digital"
+  },
+  "homepage": "https://douyin.sohodigital.top",
+  "repository": "https://github.com/meta-xucong/live-room-display",
+  "license": "MIT",
+  "keywords": ["live-streaming", "schedule", "MCP"],
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/live-room-schedule/SKILL.md",
+      "interface": {
+        "displayName": "直播间排班助手",
+        "shortDescription": "用自然语言查看和更新直播间排班",
+        "longDescription": "连接 Soho Digital 直播间信息牌。可查看直播间与排班，更新前先预览并等待用户确认。",
+        "developerName": "Soho Digital",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://douyin.sohodigital.top",
+        "defaultPrompt": [
+          "查看 01 直播间今天的排班",
+          "把 01 直播间明天排班更新为我提供的时段，先给我预览"
+        ]
+      }
+    }
+  }
+}

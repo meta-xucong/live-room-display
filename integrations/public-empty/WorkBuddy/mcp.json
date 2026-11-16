@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "live-room-display": {
+      "type": "streamableHttp",
+      "url": "https://douyin.sohodigital.top/mcp",
+      "headers": {
+        "Authorization": "Bearer ${API_KEY}"
+      },
+      "timeout": 30000
+    }
+  }
+}

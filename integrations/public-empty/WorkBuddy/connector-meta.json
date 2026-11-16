@@ -1,0 +1,22 @@
+{
+  "name": "直播间排班助手",
+  "name_zh": "直播间排班助手",
+  "name_en": "Live Room Schedule Assistant",
+  "description": "Manage livestream room schedules with natural language.",
+  "description_zh": "用自然语言查看直播间与排班；更新前先预览，确认后再提交。",
+  "description_en": "View livestream rooms and schedules in natural language. Preview every update before confirming it.",
+  "source": "soho-live-room-schedule",
+  "type": "mcp",
+  "auth_mode": "token",
+  "version": "1.0.0",
+  "minWorkbuddyVersion": "4.23.0",
+  "examples_zh": [
+    "查看 01 直播间今天的排班",
+    "把 01 直播间明天的排班改成我发的安排，先预览给我看",
+    "把我刚才确认的预览提交到系统"
+  ],
+  "examples_en": [
+    "Show today's schedule for room 01",
+    "Update room 01 tomorrow with the schedule I provided and show me a preview first"
+  ]
+}
