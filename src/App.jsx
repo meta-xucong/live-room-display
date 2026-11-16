@@ -572,6 +572,184 @@ function McpKeyManager({ csrfToken }) {
   );
 }
 
+function AdminScheduleLibrary({ csrfToken }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [roomFilter, setRoomFilter] = useState("all");
+  const [dateFilter, setDateFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [editing, setEditing] = useState(null);
+  const [editValues, setEditValues] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [messageType, setMessageType] = useState("success");
+
+  const loadSchedules = useCallback(async () => {
+    setLoading(true);
+    setLoadError("");
+    try {
+      setData(await api("/api/v1/admin/schedules"));
+    } catch (cause) {
+      setLoadError(cause.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadSchedules(); }, [loadSchedules]);
+
+  const visibleGroups = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase("zh-CN");
+    return (data?.groups ?? []).flatMap((group) => {
+      if (roomFilter !== "all" && group.roomCode !== roomFilter) return [];
+      if (dateFilter && group.date !== dateFilter) return [];
+      const slots = group.slots.filter((slot) => !query || [
+        slot.start, slot.end, slot.director, slot.host, slot.assistant, slot.salesTarget, slot.notes,
+        ...slot.featuredProducts,
+      ].some((value) => String(value ?? "").toLocaleLowerCase("zh-CN").includes(query)));
+      return slots.length ? [{ ...group, slots }] : [];
+    });
+  }, [data, dateFilter, roomFilter, search]);
+
+  function beginEdit(group, slot) {
+    const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
+    setEditing({ key, roomCode: group.roomCode, date: group.date, slotId: slot.id });
+    setEditValues({
+      start: slot.start,
+      end: slot.end,
+      director: slot.director,
+      host: slot.host,
+      assistant: slot.assistant,
+      products: slot.featuredProducts.join("\n"),
+      salesTarget: slot.salesTarget,
+      notes: slot.notes,
+    });
+    setMessage("");
+  }
+
+  function updateEdit(field, value) {
+    setEditValues((current) => ({ ...current, [field]: value }));
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setEditValues(null);
+  }
+
+  async function saveEdit(event, group, slot) {
+    event.preventDefault();
+    if (saving || !editValues) return;
+    setSaving(true);
+    setMessage("");
+    const updatedSlot = {
+      ...slot,
+      start: editValues.start,
+      end: editValues.end,
+      director: editValues.director,
+      host: editValues.host,
+      assistant: editValues.assistant,
+      featuredProducts: editValues.products.split(/[\r\n;；、]+/).map((item) => item.trim()).filter(Boolean),
+      salesTarget: editValues.salesTarget,
+      notes: editValues.notes,
+    };
+    // Filters can hide siblings, so submit the complete unfiltered day from the source payload.
+    const completeGroup = data.groups.find((item) => item.roomCode === group.roomCode && item.date === group.date);
+    const completeSlots = completeGroup.slots.map((item) => item.id === slot.id ? updatedSlot : item);
+    try {
+      await api("/api/v1/admin/schedules", {
+        method: "PUT",
+        headers: { "content-type": "application/json", "x-csrf-token": csrfToken },
+        body: JSON.stringify({
+          roomCode: group.roomCode,
+          date: group.date,
+          dataUpdatedAt: data.dataUpdatedAt,
+          slots: completeSlots,
+        }),
+      });
+      await loadSchedules();
+      setEditing(null);
+      setEditValues(null);
+      setMessageType("success");
+      setMessage(`已保存 ${group.roomName} ${group.date} 的排班修改。`);
+    } catch (cause) {
+      if (cause.status === 409) {
+        setEditing(null);
+        setEditValues(null);
+        await loadSchedules();
+        setMessageType("error");
+        setMessage("排班数据刚刚有更新，列表已刷新。请重新打开这一场再修改。");
+      } else {
+        const details = cause.body?.error?.details ?? [];
+        setMessageType("error");
+        setMessage(details.length ? `${cause.message}：${details.map((item) => item.message).join("；")}` : cause.message);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="schedule-library" role="tabpanel" aria-label="已录入排班">
+      <div className="schedule-library-toolbar">
+        <div><span className="section-kicker">SAVED SCHEDULES</span><h2>已录入排班</h2><p>查看已保存的直播间时段；发现错误可直接编辑对应场次。</p></div>
+        <button className="avatar-secondary-button schedule-refresh-button" type="button" onClick={loadSchedules} disabled={loading}>{loading ? "正在刷新…" : "刷新列表"}</button>
+      </div>
+
+      <div className="schedule-library-filters">
+        <label>直播间<select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}><option value="all">全部直播间</option>{(data?.rooms ?? []).map((room) => <option key={room.code} value={room.code}>{room.name}</option>)}</select></label>
+        <label>排班日期<input type="date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} /></label>
+        <label className="schedule-search">搜索主播、商品或备注<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入关键词" /></label>
+        <div className="schedule-library-count">{loading ? "读取中…" : `共 ${data?.scheduleCount ?? 0} 场 · 当前显示 ${visibleGroups.reduce((count, group) => count + group.slots.length, 0)} 场`}</div>
+      </div>
+
+      {message && <div className={`form-message${messageType === "error" ? " form-error" : " form-success"}`} role={messageType === "error" ? "alert" : "status"}>{message}</div>}
+      {loadError && <div className="form-message form-error" role="alert">读取排班失败：{loadError}</div>}
+      {loading && !data ? <div className="schedule-library-empty">正在读取已录入的排班…</div> : null}
+      {!loading && !loadError && visibleGroups.length === 0 && <div className="schedule-library-empty">没有符合条件的排班记录。</div>}
+
+      {visibleGroups.map((group) => (
+        <article className="schedule-group" key={`${group.roomCode}-${group.date}`}>
+          <header className="schedule-group-heading"><div><h3>{group.roomName}</h3><time>{group.date}</time></div><span>{group.slots.length} 场</span></header>
+          <div className="schedule-table-wrap">
+            <table className="schedule-table">
+              <thead><tr><th>时段</th><th>导演</th><th>主播</th><th>助播</th><th>主推商品</th><th>目标销售额</th><th>头像</th><th>备注</th><th>操作</th></tr></thead>
+              <tbody>{group.slots.map((slot) => {
+                const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
+                const isEditing = editing?.key === key;
+                return isEditing ? (
+                  <tr className="schedule-edit-row" key={slot.id}>
+                    <td colSpan="9">
+                      <form className="schedule-edit-form" onSubmit={(event) => saveEdit(event, group, slot)}>
+                        <label>开始时间<input type="time" value={editValues.start} onChange={(event) => updateEdit("start", event.target.value)} required /></label>
+                        <label>结束时间<input type="time" value={editValues.end} onChange={(event) => updateEdit("end", event.target.value)} required /></label>
+                        <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
+                        <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
+                        <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
+                        <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
+                        <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
+                        <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
+                        <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>
+                      </form>
+                    </td>
+                  </tr>
+                ) : (
+                  <tr key={slot.id}>
+                    <td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
+                    <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td>{slot.salesTarget || "—"}</td>
+                    <td><span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span></td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
+                    <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        </article>
+      ))}
+    </section>
+  );
+}
+
 function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [activeTab, setActiveTab] = useState("schedule");
   const [file, setFile] = useState(null);
@@ -622,6 +800,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         </section>
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
+          <button type="button" role="tab" aria-selected={activeTab === "records"} className={activeTab === "records" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("records")}>已录入排班</button>
           <button type="button" role="tab" aria-selected={activeTab === "avatars"} className={activeTab === "avatars" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("avatars")}>主播头像库</button>
           <button type="button" role="tab" aria-selected={activeTab === "keys"} className={activeTab === "keys" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("keys")}>MCP 密钥</button>
         </div>
@@ -646,7 +825,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
         <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。主播照片可在“主播头像库”集中维护；排班 Excel 中已有的行内照片仍会兼容显示。新主播首次导入时，如果每场照片一致，系统会自动收录到头像库。</p></div></aside>
-        </> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
+        </> : activeTab === "records" ? <AdminScheduleLibrary csrfToken={csrfToken} /> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
     </div>

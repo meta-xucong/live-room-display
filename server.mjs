@@ -580,6 +580,29 @@ function avatarLibraryPayload() {
   return { profiles, conflicts, summary: { total: profiles.length, withPhoto, missingPhoto: profiles.length - withPhoto } };
 }
 
+function adminSchedulePayload() {
+  const rooms = db.prepare("SELECT code,name,sort_order AS sortOrder FROM rooms ORDER BY sort_order").all();
+  const rows = db.prepare(`SELECT s.*,r.name AS room_name,r.sort_order AS room_sort_order
+    FROM slots s JOIN rooms r ON r.code=s.room_code
+    ORDER BY s.date DESC,r.sort_order,s.start_time`).all();
+  const groups = new Map();
+  for (const row of rows) {
+    const key = `${row.room_code}\u0000${row.date}`;
+    if (!groups.has(key)) groups.set(key, {
+      roomCode: row.room_code, roomName: row.room_name, date: row.date, slots: [],
+    });
+    const avatar = row.host ? hostAvatarByNameKey.get(hostNameKey(row.host)) : null;
+    groups.get(key).slots.push({
+      id: row.id, start: row.start_time, end: row.end_time,
+      director: row.director, host: row.host, assistant: row.assistant,
+      featuredProducts: JSON.parse(row.products_json), salesTarget: salesDisplay(row.sales_target_cents), notes: row.notes,
+      hasAvatar: avatar ? Boolean(avatar.photo_type) : Boolean(row.photo_type),
+      avatarSource: avatar?.photo_type ? "头像库" : row.photo_type ? "本场照片" : "未配置",
+    });
+  }
+  return { rooms, groups: [...groups.values()], scheduleCount: rows.length, dataUpdatedAt: updatedAtValue() };
+}
+
 const mcpTools = [
   {
     name: "list_rooms",
@@ -1022,6 +1045,106 @@ async function handle(request, response) {
     const user = requireUser(request, response, "admin");
     if (!user) return;
     return json(response, 200, avatarLibraryPayload());
+  }
+
+  if (request.method === "GET" && pathname === "/api/v1/admin/schedules") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    return json(response, 200, adminSchedulePayload());
+  }
+
+  if (request.method === "PUT" && pathname === "/api/v1/admin/schedules") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    let input;
+    try { input = await readJson(request); } catch (cause) {
+      return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return error(response, 400, "INVALID_REQUEST", "请求正文必须是 JSON 对象");
+    }
+    if (typeof input.dataUpdatedAt !== "string" || input.dataUpdatedAt !== updatedAtValue()) {
+      return error(response, 409, "SCHEDULES_CHANGED", "排班数据已被其他操作更新，请刷新列表后重新修改");
+    }
+
+    const originalNotes = Array.isArray(input.slots)
+      ? input.slots.map((slot) => typeof slot?.notes === "string" ? slot.notes.trim() : "")
+      : [];
+    if (originalNotes.some((notes) => notes.length > 500)) {
+      return error(response, 422, "SCHEDULE_INVALID", "备注不能超过 500 个字符");
+    }
+    const scheduleInput = {
+      roomCode: input.roomCode,
+      date: input.date,
+      slots: Array.isArray(input.slots)
+        ? input.slots.map((slot) => ({
+          ...slot,
+          // The shared schedule parser uses one-line text fields; retain the original
+          // multiline note separately and restore it when writing the validated rows.
+          notes: String(slot?.notes ?? "").replace(/\r\n?/g, " ").replace(/\n/g, " ").trim(),
+        }))
+        : input.slots,
+    };
+    let parsed;
+    let preview;
+    let sourceSlotByKey;
+    try {
+      const scheduleText = fixedScheduleTextFromMcp(scheduleInput);
+      parsed = validateFixedScheduleText(scheduleText);
+      if (parsed.result.errors.length) {
+        return json(response, 422, { error: { code: "SCHEDULE_INVALID", message: "排班内容未通过校验，请修正后重试", details: parsed.result.errors } });
+      }
+      if (!db.prepare("SELECT code FROM rooms WHERE code=?").get(parsed.roomCode)) {
+        return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
+      }
+      preview = mcpPreviewFor(parsed);
+      sourceSlotByKey = new Map(scheduleInput.slots.map((slot, index) => [
+        `${excelTime(slot.start)}\u0000${excelTime(slot.end)}\u0000${String(slot.host ?? "").trim()}`,
+        { id: slot.id, notes: originalNotes[index] ?? "" },
+      ]));
+    } catch (cause) {
+      return error(response, 422, "SCHEDULE_INVALID", cause.message, cause.details ?? []);
+    }
+
+    const currentVersionTime = Date.parse(updatedAtValue()) || 0;
+    const updateAt = new Date(Math.max(Date.now(), currentVersionTime + 1)).toISOString();
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      if (input.dataUpdatedAt !== updatedAtValue()) throw new Error("SCHEDULES_CHANGED");
+      const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
+      const previousByKey = new Map(previousSlots.map((slot) => [
+        `${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot,
+      ]));
+      const previousById = new Map(previousSlots.map((slot) => [slot.id, slot]));
+      db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+      const insertSlot = db.prepare(`INSERT INTO slots(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
+        products_json,sales_target_cents,notes,photo_type,photo_blob
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const slot of parsed.result.rooms[0].slots) {
+        const source = sourceSlotByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
+        const previousByOriginalId = source?.id ? previousById.get(source.id) : null;
+        const previous = (previousByOriginalId?.host === slot.host ? previousByOriginalId : null)
+          ?? previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
+        const id = previous?.id ?? previousByOriginalId?.id ?? slot.id;
+        insertSlot.run(
+          id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
+          slot.director, slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+          source?.notes ?? slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
+        );
+      }
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
+      db.exec("COMMIT");
+    } catch (cause) {
+      try { db.exec("ROLLBACK"); } catch {}
+      if (cause.message === "SCHEDULES_CHANGED") {
+        return error(response, 409, "SCHEDULES_CHANGED", "排班数据已被其他操作更新，请刷新列表后重新修改");
+      }
+      console.error("网页排班修改失败:", cause.message);
+      return error(response, 500, "SCHEDULE_SAVE_FAILED", "保存失败，原有排班数据保持不变");
+    }
+    return json(response, 200, { ok: true, roomCode: parsed.roomCode, date: parsed.date, scheduleCount: preview.scheduleCount, dataUpdatedAt: updateAt });
   }
 
   if (request.method === "GET" && pathname === "/api/v1/admin/api-tokens") {
