@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const THEME_STORAGE_KEY = "live-room-theme";
 
@@ -193,7 +193,251 @@ function LoginPage({ onLogin, theme, onToggleTheme }) {
   );
 }
 
+function AvatarLibrary({ csrfToken }) {
+  const [data, setData] = useState(null);
+  const [pending, setPending] = useState([]);
+  const [search, setSearch] = useState("");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [replaceNames, setReplaceNames] = useState([]);
+  const [replaceName, setReplaceName] = useState("");
+  const [viewing, setViewing] = useState(null);
+  const [removingId, setRemovingId] = useState("");
+  const fileInput = useRef(null);
+  const pendingRef = useRef(pending);
+
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+  useEffect(() => () => pendingRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)), []);
+
+  const loadLibrary = useCallback(async () => {
+    const response = await api("/api/v1/admin/host-avatars");
+    setData(response);
+  }, []);
+
+  useEffect(() => {
+    loadLibrary().catch((cause) => setMessage(cause.message));
+  }, [loadLibrary]);
+
+  function inferredHostName(filename) {
+    const base = filename.replace(/\.[^.]+$/, "").trim();
+    const separator = base.indexOf("_");
+    return separator > 0 ? base.slice(separator + 1).trim() : base;
+  }
+
+  function queueFiles(fileList, preferredName = "") {
+    const selected = Array.from(fileList ?? []);
+    if (!selected.length) return;
+    if (pending.length + selected.length > 20) {
+      setMessage("一次最多选择 20 张照片。");
+      return;
+    }
+    if (pending.reduce((total, item) => total + item.file.size, 0) + selected.reduce((total, file) => total + file.size, 0) > 28 * 1024 * 1024) {
+      setMessage("单次上传总大小不能超过 28 MB，请分批上传。");
+      return;
+    }
+    const items = selected.map((file, index) => ({
+      file,
+      name: preferredName && index === 0 ? preferredName : inferredHostName(file.name),
+      previewUrl: URL.createObjectURL(file),
+    }));
+    setPending((current) => current.concat(items));
+    setMessage("");
+    setReplaceNames([]);
+  }
+
+  function onSelectFiles(event) {
+    queueFiles(event.target.files, replaceName);
+    setReplaceName("");
+    event.target.value = "";
+  }
+
+  function removePending(index) {
+    const item = pending[index];
+    if (item) URL.revokeObjectURL(item.previewUrl);
+    setPending((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function clearPending() {
+    pending.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+    setPending([]);
+    setReplaceNames([]);
+  }
+
+  async function submitUpload(replaceExisting = false) {
+    if (!pending.length || busy) return;
+    if (pending.some((item) => !item.name.trim())) {
+      setMessage("请给每张照片填写主播姓名。");
+      return;
+    }
+    setBusy(true);
+    setMessage("");
+    const form = new FormData();
+    form.append("names", JSON.stringify(pending.map((item) => item.name.trim())));
+    form.append("replaceExisting", String(replaceExisting));
+    pending.forEach((item) => form.append("photos", item.file, item.file.name));
+    try {
+      const response = await fetch("/api/v1/admin/host-avatars", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "x-csrf-token": csrfToken },
+        body: form,
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (response.status === 409 && body.error?.code === "AVATAR_REPLACEMENT_CONFIRMATION_REQUIRED") {
+          setReplaceNames((body.error.details ?? []).map((item) => item.name));
+          return;
+        }
+        throw new Error(body.error?.message ?? "头像上传失败，请稍后重试。");
+      }
+      setData(body);
+      setMessage("头像已保存：新增 " + body.createdCount + " 位，更新 " + body.updatedCount + " 位。展示页会自动同步。");
+      clearPending();
+    } catch (cause) {
+      setMessage(cause.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeAvatar(profile) {
+    const usageText = profile.usedSlots ? "将影响 " + profile.usedSlots + " 个排班，展示页会改为头像占位。" : "这张照片将从头像库移除。";
+    if (!window.confirm("确定移除“" + profile.name + "”的头像吗？" + usageText)) return;
+    setRemovingId(profile.id);
+    setMessage("");
+    try {
+      const response = await api("/api/v1/admin/host-avatars/" + encodeURIComponent(profile.id), {
+        method: "DELETE",
+        headers: { "x-csrf-token": csrfToken },
+      });
+      setData(response);
+      setMessage("已移除“" + profile.name + "”的头像。");
+    } catch (cause) {
+      setMessage(cause.message);
+    } finally {
+      setRemovingId("");
+    }
+  }
+
+  const profiles = data?.profiles ?? [];
+  const visibleProfiles = profiles.filter((profile) => profile.name.toLocaleLowerCase("zh-CN").includes(search.trim().toLocaleLowerCase("zh-CN")));
+  const invalidFiles = pending.filter((item) => item.file.size > 8 * 1024 * 1024 || !/\.(?:jpe?g|png)$/i.test(item.file.name));
+
+  return (
+    <section className="avatar-library">
+      <div className="admin-card avatar-upload-card">
+        <div className="admin-card-heading">
+          <div className="admin-icon avatar-library-icon">◉</div>
+          <div><h2>批量添加主播头像</h2><p>每位主播维护一张常用头像，排班中的姓名匹配后会自动展示。</p></div>
+        </div>
+        <input
+          ref={fileInput}
+          className="avatar-file-input"
+          type="file"
+          accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+          multiple
+          onChange={onSelectFiles}
+          aria-label="选择主播头像"
+        />
+        <div
+          className="avatar-dropzone"
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => { event.preventDefault(); queueFiles(event.dataTransfer.files); }}
+        >
+          <div className="avatar-drop-glyph">＋</div>
+          <strong>拖入照片，或从电脑选择</strong>
+          <span>支持 JPG、PNG；每张不超过 8 MB；单次最多 20 张、合计 28 MB</span>
+          <button className="button-primary avatar-choose-button" type="button" onClick={() => fileInput.current?.click()}>选择照片</button>
+          <small>默认从文件名识别主播姓名；文件名可写为“主播编号_姓名.jpg”，提交前可修改。</small>
+        </div>
+        {pending.length > 0 && (
+          <div className="avatar-pending">
+            <div className="avatar-pending-heading"><strong>待上传 {pending.length} 张</strong><button type="button" className="avatar-text-button" onClick={clearPending}>清空</button></div>
+            <div className="avatar-pending-grid">
+              {pending.map((item, index) => (
+                <div className="avatar-pending-item" key={item.previewUrl}>
+                  <img src={item.previewUrl} alt={item.name || "待上传主播照片"} />
+                  <label>主播姓名<input value={item.name} maxLength={80} onChange={(event) => setPending((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, name: event.target.value } : entry))} /></label>
+                  <small>{item.file.name} · {(item.file.size / 1024 / 1024).toFixed(1)} MB</small>
+                  <button type="button" className="avatar-remove-pending" aria-label={"移除 " + item.name} onClick={() => removePending(index)}>移除</button>
+                </div>
+              ))}
+            </div>
+            {replaceNames.length > 0 && (
+              <div className="avatar-replace-confirm" role="alert">
+                <div><strong>有 {replaceNames.length} 位主播已经有头像</strong><span>{replaceNames.join("、")}。替换后，所有使用这些主播的排班页面都会显示新头像。</span></div>
+                <div className="avatar-confirm-actions">
+                  <button type="button" className="avatar-secondary-button" onClick={() => setReplaceNames([])}>返回检查</button>
+                  <button type="button" className="button-primary avatar-choose-button" disabled={busy || invalidFiles.length > 0} onClick={() => submitUpload(true)}>{busy ? "正在保存…" : "确认替换并保存"}</button>
+                </div>
+              </div>
+            )}
+            <div className="avatar-upload-actions">
+              {invalidFiles.length > 0 && <span className="avatar-invalid-hint">请检查文件格式和单张大小。</span>}
+              <button type="button" className="button-primary avatar-choose-button" disabled={busy || invalidFiles.length > 0 || pending.some((item) => !item.name.trim())} onClick={() => submitUpload(false)}>{busy ? "正在保存…" : "上传到头像库"}</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {message && <div className={"form-message" + (message.includes("失败") || message.includes("请") ? " form-error" : " form-success")} role="status">{message}</div>}
+
+      {data?.conflicts?.length > 0 && (
+        <aside className="avatar-conflict-note">
+          <strong>有 {data.conflicts.length} 位主播存在不同的历史照片</strong>
+          <span>{data.conflicts.map((item) => item.name + "（" + item.photoCount + " 张）").join("、")}。上传并确认统一头像后，所有排班页面将使用头像库中的照片。</span>
+        </aside>
+      )}
+
+      <div className="avatar-library-toolbar">
+        <div><span className="section-kicker">HOST DIRECTORY</span><h2>主播头像库</h2><p>管理员可以随时查看、放大预览和更换头像。</p></div>
+        <label className="avatar-search">搜索主播<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入主播姓名" /></label>
+      </div>
+      <div className="avatar-stats">
+        <div><span>主播总数</span><strong>{data?.summary?.total ?? "—"}</strong></div>
+        <div><span>已添加头像</span><strong>{data?.summary?.withPhoto ?? "—"}</strong></div>
+        <div><span>待补充头像</span><strong>{data?.summary?.missingPhoto ?? "—"}</strong></div>
+      </div>
+      {data ? (
+        visibleProfiles.length ? (
+          <div className="avatar-profile-grid">
+            {visibleProfiles.map((profile) => (
+              <article className="avatar-profile-card" key={profile.id}>
+                <button type="button" className="avatar-profile-image" onClick={() => profile.photoUrl && setViewing(profile)} disabled={!profile.photoUrl} aria-label={"预览 " + profile.name + " 的头像"}>
+                  {profile.photoUrl ? <img src={profile.photoUrl} alt={profile.name + " 的头像"} /> : <span>暂无头像</span>}
+                  {profile.photoUrl && <i>放大预览</i>}
+                </button>
+                <div className="avatar-profile-info">
+                  <strong>{profile.name}</strong>
+                  <span>{profile.usedSlots} 个排班使用</span>
+                  <small>{profile.hasPhoto ? "更新于 " + new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt)) : "等待上传头像"}</small>
+                </div>
+                <div className="avatar-profile-actions">
+                  <button type="button" className="avatar-secondary-button" onClick={() => { setReplaceName(profile.name); fileInput.current?.click(); }}>更换头像</button>
+                  {profile.hasPhoto && <button type="button" className="avatar-text-button danger" disabled={removingId === profile.id} onClick={() => removeAvatar(profile)}>{removingId === profile.id ? "处理中…" : "移除"}</button>}
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : <div className="avatar-empty">{search ? "没有找到匹配的主播。" : "头像库还没有主播照片。可先批量选择照片上传。"} </div>
+      ) : <div className="avatar-empty">正在读取头像库…</div>}
+
+      {viewing && (
+        <div className="avatar-preview-overlay" role="presentation" onClick={() => setViewing(null)}>
+          <div className="avatar-preview-dialog" role="dialog" aria-modal="true" aria-label={viewing.name + " 头像预览"} onClick={(event) => event.stopPropagation()}>
+            <button type="button" className="avatar-preview-close" aria-label="关闭预览" onClick={() => setViewing(null)}>×</button>
+            <img src={viewing.photoUrl} alt={viewing.name + " 的头像"} />
+            <strong>{viewing.name}</strong>
+            <span>{viewing.usedSlots} 个排班使用</span>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
+  const [activeTab, setActiveTab] = useState("schedule");
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
@@ -240,7 +484,12 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           <h1>排班信息管理</h1>
           <p>每个工作表对应一个直播间。上传完整工作簿后，系统会先校验所有工作表，再一次性更新展示数据。<a className="template-link" href="/live-room-schedule-template.xlsx" download>下载空白模板</a></p>
         </section>
-        <section className="admin-card">
+        <div className="admin-tabs" role="tablist" aria-label="管理内容">
+          <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
+          <button type="button" role="tab" aria-selected={activeTab === "avatars"} className={activeTab === "avatars" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("avatars")}>主播头像库</button>
+        </div>
+        {activeTab === "schedule" ? <>
+        <section className="admin-card" role="tabpanel">
           <div className="admin-card-heading">
             <div className="admin-icon">↥</div>
             <div><h2>导入直播间排班</h2><p>支持 Excel 工作簿（.xlsx）和嵌入式 JPG、PNG 主播照片</p></div>
@@ -259,7 +508,8 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           {problems.length > 0 && <div className="issue-list"><h3>需要修正的内容 <span>{problems.length}</span></h3>{problems.map((issue, index) => <div className="issue-row" key={`${issue.sheet}-${issue.row}-${index}`}><span>{issue.sheet || "工作簿"}</span><span>{issue.row ? `第 ${issue.row} 行 · ` : ""}{issue.field}</span><strong>{issue.message}</strong></div>)}</div>}
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
-        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片添加方式</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。照片请用 Excel「插入 → 图片」嵌入工作簿，并把图片左上角放在对应排班行的 G 列（每场一张，JPG/PNG，单张不超过 8 MB）。系统会按图片所在行自动识别；请勿使用网络图片链接。</p></div></aside>
+        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。主播照片可在“主播头像库”集中维护；排班 Excel 中已有的行内照片仍会兼容显示。新主播首次导入时，如果每场照片一致，系统会自动收录到头像库。</p></div></aside>
+        </> : <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
     </div>

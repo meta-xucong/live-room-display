@@ -41,6 +41,11 @@ db.exec(`
     products_json TEXT NOT NULL DEFAULT '[]', sales_target_cents INTEGER,
     notes TEXT NOT NULL DEFAULT '', photo_type TEXT, photo_blob BLOB
   );
+  CREATE TABLE IF NOT EXISTS host_avatars (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
+    photo_type TEXT, photo_blob BLOB, photo_hash TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   INSERT OR IGNORE INTO app_state(key, value) VALUES ('data_updated_at', '');
 `);
@@ -53,6 +58,8 @@ const MIME = {
 };
 const sessions = db.prepare("SELECT s.token_hash,s.csrf_token,s.expires_at,u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.enabled=1");
 const integrationTokens = db.prepare("SELECT id,name FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL");
+const hostAvatarByNameKey = db.prepare("SELECT id,name,photo_type,updated_at FROM host_avatars WHERE name_key=?");
+const hostAvatarById = db.prepare("SELECT id,name,photo_type,photo_blob,updated_at FROM host_avatars WHERE id=?");
 const failures = new Map();
 const uploadWindows = new Map();
 const integrationWindows = new Map();
@@ -83,6 +90,48 @@ function cookieValue(header, name) {
 function hashToken(token) {
   return createHash("sha256").update(token).digest("hex");
 }
+
+function hostNameKey(name) {
+  return String(name ?? "").normalize("NFKC").trim().replace(/\s+/g, "").toLocaleLowerCase("zh-CN");
+}
+
+function imageTypeForBytes(bytes) {
+  const buffer = Buffer.from(bytes ?? []);
+  if (buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
+  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  return "";
+}
+
+function seedUniqueHostAvatars(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const name = String(item.host ?? "").trim();
+    const nameKey = hostNameKey(name);
+    const bytes = item.photo?.bytes ?? item.photo_blob;
+    const type = item.photo?.contentType ?? item.photo_type ?? imageTypeForBytes(bytes);
+    if (!nameKey) continue;
+    if (!groups.has(nameKey)) groups.set(nameKey, { name, photos: new Map() });
+    if (bytes && type) {
+      const photoHash = createHash("sha256").update(bytes).digest("hex");
+      groups.get(nameKey).photos.set(photoHash, { type, bytes, photoHash });
+    }
+  }
+  const now = Date.now();
+  const insert = db.prepare(`INSERT OR IGNORE INTO host_avatars(
+    id,name,name_key,photo_type,photo_blob,photo_hash,created_at,updated_at
+  ) VALUES (?,?,?,?,?,?,?,?)`);
+  for (const [nameKey, group] of groups) {
+    const photo = group.photos.size === 1 ? group.photos.values().next().value : null;
+    insert.run(randomBytes(16).toString("hex"), group.name, nameKey, photo?.type ?? null, photo?.bytes ?? null, photo?.photoHash ?? null, now, now);
+  }
+}
+
+function migrateLegacyHostAvatars() {
+  const scheduleHosts = db.prepare("SELECT host,photo_type,photo_blob FROM slots WHERE host<>''").all();
+  if (scheduleHosts.length) seedUniqueHostAvatars(scheduleHosts);
+}
+
+migrateLegacyHostAvatars();
 
 function authenticateIntegrationToken(authorization) {
   const match = authorization.match(/^Bearer\s+(lrd_live_[A-Za-z0-9_-]{43})$/);
@@ -184,6 +233,55 @@ async function readUpload(request) {
     cursor = next;
   }
   throw Object.assign(new Error("没有找到待上传的工作簿"), { status: 400 });
+}
+
+async function readAvatarUpload(request) {
+  const contentType = request.headers["content-type"] ?? "";
+  const boundaryMatch = contentType.match(/multipart\/form-data\s*;\s*boundary=(?:"([^"]+)"|([^;\s]+))/i);
+  if (!boundaryMatch) throw Object.assign(new Error("请通过表单上传主播照片"), { status: 400 });
+  const boundary = Buffer.from(`--${boundaryMatch[1] ?? boundaryMatch[2]}`);
+  const body = await readBody(request, 30 * 1024 * 1024);
+  const files = [];
+  let names = [];
+  let replaceExisting = false;
+  let cursor = 0;
+  while (true) {
+    const start = body.indexOf(boundary, cursor);
+    if (start < 0) break;
+    const headerStart = start + boundary.length + 2;
+    if (body.subarray(start + boundary.length, start + boundary.length + 2).equals(Buffer.from("--"))) break;
+    const headerEnd = body.indexOf(Buffer.from("\r\n\r\n"), headerStart);
+    if (headerEnd < 0) break;
+    const headers = body.subarray(headerStart, headerEnd).toString("latin1");
+    const disposition = headers.match(/content-disposition:\s*form-data;([^\r\n]+)/i)?.[1] ?? "";
+    const next = body.indexOf(boundary, headerEnd + 4);
+    if (next < 0) break;
+    const dataEnd = next >= 2 && body.subarray(next - 2, next).toString() === "\r\n" ? next - 2 : next;
+    const name = disposition.match(/(?:^|;)\s*name="([^"]+)"/i)?.[1];
+    const filename = disposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1] ?? "";
+    const data = body.subarray(headerEnd + 4, dataEnd);
+    if (name === "photos" && filename) files.push({ filename, bytes: Buffer.from(data) });
+    else if (name === "names") {
+      try { names = JSON.parse(data.toString("utf8")); } catch { throw Object.assign(new Error("主播姓名清单格式错误"), { status: 400 }); }
+    } else if (name === "replaceExisting") replaceExisting = data.toString("utf8") === "true";
+    cursor = next;
+  }
+  if (!files.length) throw Object.assign(new Error("请选择至少一张照片"), { status: 400 });
+  if (files.length > 20) throw Object.assign(new Error("一次最多上传 20 张照片"), { status: 413 });
+  if (!Array.isArray(names) || names.length !== files.length) throw Object.assign(new Error("每张照片都需要对应的主播姓名"), { status: 400 });
+  const prepared = files.map((file, index) => {
+    const name = String(names[index] ?? "").normalize("NFKC").trim();
+    if (!name || name.length > 80 || /[\r\n]/.test(name)) throw Object.assign(new Error(`第 ${index + 1} 张照片的主播姓名无效`), { status: 422 });
+    if (!/\.(?:jpe?g|png)$/i.test(file.filename)) throw Object.assign(new Error(`“${name}”的照片请使用 JPG 或 PNG 文件`), { status: 415 });
+    if (!file.bytes.length || file.bytes.length > 8 * 1024 * 1024) throw Object.assign(new Error(`“${name}”的照片为空或超过 8 MB`), { status: file.bytes.length ? 413 : 400 });
+    const photoType = imageTypeForBytes(file.bytes);
+    if (!photoType) throw Object.assign(new Error(`“${name}”的文件内容不是有效的 JPG 或 PNG 图片`), { status: 415 });
+    return { name, nameKey: hostNameKey(name), photoType, bytes: file.bytes, photoHash: createHash("sha256").update(file.bytes).digest("hex") };
+  });
+  if (new Set(prepared.map((item) => item.nameKey)).size !== prepared.length) {
+    throw Object.assign(new Error("本次上传中有重复的主播姓名，请合并为一张头像后再上传"), { status: 422 });
+  }
+  return { prepared, replaceExisting };
 }
 
 function excelDate(value) {
@@ -410,8 +508,8 @@ function validateFixedScheduleText(text) {
   const result = validateWorkbook([parsed.sheet]);
   const warnings = result.warnings.filter((warning) => warning.field !== "主播照片");
   warnings.push({
-    sheet: parsed.sheet.name, row: "", field: "主播照片",
-    message: "文本接口不上传照片；相同时段和主播的既有照片会保留，新增或更换主播请通过 Excel 上传照片",
+    sheet: parsed.sheet.name, row: "", field: "主播头像",
+    message: "系统会按主播姓名匹配头像库；未匹配到的主播会在预览中提示管理员补充头像",
   });
   return { ...parsed, result, warnings };
 }
@@ -431,13 +529,43 @@ function currentShanghaiDay() {
 
 function publicSlot(slot) {
   const products = JSON.parse(slot.products_json);
+  const avatar = hostAvatarByNameKey.get(hostNameKey(slot.host));
+  const photo = avatar
+    ? (avatar.photo_type ? `/api/v1/host-avatars/${encodeURIComponent(avatar.id)}/media?v=${avatar.updated_at}` : null)
+    : (slot.photo_type ? `/api/v1/media/${encodeURIComponent(slot.id)}` : null);
   return {
     id: slot.id, date: slot.date, start: slot.start_time, end: slot.end_time,
     director: slot.director, host: slot.host, assistant: slot.assistant,
     featuredProducts: products, salesTarget: salesDisplay(slot.sales_target_cents),
-    photo: slot.photo_type ? `/api/v1/media/${encodeURIComponent(slot.id)}` : null,
+    photo,
     startsAt: slot.starts_at, endsAt: slot.ends_at,
   };
+}
+
+function avatarLibraryPayload() {
+  const usage = new Map();
+  for (const row of db.prepare("SELECT host,COUNT(*) AS count FROM slots WHERE host<>'' GROUP BY host").all()) {
+    const key = hostNameKey(row.host);
+    usage.set(key, (usage.get(key) ?? 0) + row.count);
+  }
+  const profiles = db.prepare("SELECT id,name,photo_type,updated_at FROM host_avatars ORDER BY name COLLATE NOCASE").all().map((profile) => ({
+    id: profile.id, name: profile.name, hasPhoto: Boolean(profile.photo_type),
+    photoUrl: profile.photo_type ? `/api/v1/host-avatars/${encodeURIComponent(profile.id)}/media?v=${profile.updated_at}` : null,
+    updatedAt: new Date(profile.updated_at).toISOString(), usedSlots: usage.get(hostNameKey(profile.name)) ?? 0,
+  }));
+  const legacyGroups = new Map();
+  for (const row of db.prepare("SELECT host,photo_blob FROM slots WHERE host<>'' AND photo_blob IS NOT NULL").all()) {
+    const nameKey = hostNameKey(row.host);
+    const photoHash = createHash("sha256").update(row.photo_blob).digest("hex");
+    if (!legacyGroups.has(nameKey)) legacyGroups.set(nameKey, { name: row.host, photos: new Set() });
+    legacyGroups.get(nameKey).photos.add(photoHash);
+  }
+  const conflicts = [...legacyGroups.entries()].flatMap(([nameKey, group]) => {
+    const avatar = hostAvatarByNameKey.get(nameKey);
+    return group.photos.size > 1 && !avatar?.photo_type ? [{ name: group.name, photoCount: group.photos.size }] : [];
+  });
+  const withPhoto = profiles.filter((profile) => profile.hasPhoto).length;
+  return { profiles, conflicts, summary: { total: profiles.length, withPhoto, missingPhoto: profiles.length - withPhoto } };
 }
 
 const mcpTools = [
@@ -451,7 +579,7 @@ const mcpTools = [
   {
     name: "get_room_schedule",
     title: "查看当日排班",
-    description: "查看指定直播间某一天的完整排班。日期必须由用户提供或确认。只读。",
+    description: "查看指定直播间某一天的完整排班和每个时段的头像状态。主播头像会按姓名从头像库匹配。日期必须由用户提供或确认。只读。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "date"],
       properties: {
@@ -479,7 +607,7 @@ const mcpTools = [
             properties: {
               start: { type: "string", description: "开始时间，24 小时制，例如 07:00" },
               end: { type: "string", description: "结束时间，24 小时制，例如 11:00" },
-              director: { type: "string" }, host: { type: "string" }, assistant: { type: "string" },
+              director: { type: "string" }, host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" }, assistant: { type: "string" },
               featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
               salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
               notes: { type: "string" },
@@ -527,15 +655,30 @@ function mcpPreviewFor(parsed) {
     throw cause;
   }
   const replacingSlots = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
-  return {
-    roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-    replacingSlots, scheduleCount: slots.length,
-    schedule: slots.map((slot) => ({
+  const scheduleRows = slots.map((slot, index) => {
+    const avatar = slot.host ? hostAvatarByNameKey.get(hostNameKey(slot.host)) : null;
+    const previous = db.prepare("SELECT photo_blob FROM slots WHERE room_code=? AND date=? AND start_time=? AND end_time=? AND host=?")
+      .get(parsed.roomCode, parsed.date, slot.start, slot.end, slot.host);
+    const hasAvatar = avatar ? Boolean(avatar.photo_type) : Boolean(previous?.photo_blob);
+    return {
       start: slot.start, end: slot.end, director: slot.director, host: slot.host,
       assistant: slot.assistant, featuredProducts: slot.products,
       salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
-    })),
-    warnings: parsed.warnings,
+      hasAvatar, avatarSource: avatar?.photo_type ? "头像库" : hasAvatar ? "本场已有照片" : "未配置",
+      row: index + 4,
+    };
+  });
+  return {
+    roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+    replacingSlots, scheduleCount: slots.length,
+    schedule: scheduleRows.map(({ row, ...slot }) => slot),
+    warnings: [
+      ...parsed.warnings.filter((warning) => warning.field !== "主播头像"),
+      ...scheduleRows.filter((slot) => !slot.hasAvatar).map((slot) => ({
+        sheet: `API-${parsed.roomCode}`, row: slot.row, field: "主播头像",
+        message: slot.host ? `头像库中没有“${slot.host}”的头像，管理员可在主播头像库上传` : "本时段未填写主播，无法关联头像",
+      })),
+    ],
   };
 }
 
@@ -652,11 +795,15 @@ async function callMcpTool(name, args, token) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("日期格式应为 YYYY-MM-DD");
     const room = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
     if (!room) throw new Error(`直播间编号 ${roomCode} 不存在，请先查看直播间列表`);
-    const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((slot) => ({
-      start: slot.start_time, end: slot.end_time, director: slot.director, host: slot.host, assistant: slot.assistant,
-      featuredProducts: JSON.parse(slot.products_json), salesTarget: salesDisplay(slot.sales_target_cents),
-      notes: slot.notes, hasPhoto: Boolean(slot.photo_blob),
-    }));
+    const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((slot) => {
+      const avatar = slot.host ? hostAvatarByNameKey.get(hostNameKey(slot.host)) : null;
+      const hasPhoto = avatar ? Boolean(avatar.photo_type) : Boolean(slot.photo_blob);
+      return {
+        start: slot.start_time, end: slot.end_time, director: slot.director, host: slot.host, assistant: slot.assistant,
+        featuredProducts: JSON.parse(slot.products_json), salesTarget: salesDisplay(slot.sales_target_cents),
+        notes: slot.notes, hasPhoto, avatarSource: avatar?.photo_type ? "头像库" : hasPhoto ? "本场已有照片" : "未配置",
+      };
+    });
     return mcpToolResult({ room, date, schedule });
   }
   if (name === "preview_schedule_update") {
@@ -758,7 +905,7 @@ async function handleMcpRequest(request, response) {
   if (modern && message.method === "server/discover") {
     return mcpRpcResponse(response, id, {
       supportedVersions: ["2026-07-28"], capabilities: { tools: {} },
-      instructions: "用自然语言协助用户查看与更新直播间排班。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
+      instructions: "用自然语言协助用户查看与更新直播间排班。主播头像由系统按姓名从头像库自动匹配；预览中的头像缺失警告需告知用户。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
     }, true, true);
   }
   if (message.method === "initialize" && !modern) {
@@ -769,7 +916,7 @@ async function handleMcpRequest(request, response) {
       protocolVersion: supported.includes(requested) ? requested : "2025-11-25",
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "live-room-display", version: "1.0.0" },
-      instructions: "用自然语言协助用户查看与更新直播间排班。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
+      instructions: "用自然语言协助用户查看与更新直播间排班。主播头像由系统按姓名从头像库自动匹配；预览中的头像缺失警告需告知用户。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
     });
   }
   if (!modern && message.method === "ping") return mcpRpcResponse(response, id, {});
@@ -850,6 +997,76 @@ async function handle(request, response) {
     return response.end(slot.photo_blob);
   }
 
+  const avatarMediaMatch = pathname.match(/^\/api\/v1\/host-avatars\/([a-f\d]{32})\/media$/i);
+  if (request.method === "GET" && avatarMediaMatch) {
+    if (!requireUser(request, response)) return;
+    const avatar = hostAvatarById.get(avatarMediaMatch[1]);
+    if (!avatar?.photo_blob) return error(response, 404, "MEDIA_NOT_FOUND", "主播头像不存在");
+    response.writeHead(200, { "content-type": avatar.photo_type, "cache-control": "private, max-age=300", "x-content-type-options": "nosniff" });
+    return response.end(avatar.photo_blob);
+  }
+
+  if (request.method === "GET" && pathname === "/api/v1/admin/host-avatars") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    return json(response, 200, avatarLibraryPayload());
+  }
+
+  if (request.method === "POST" && pathname === "/api/v1/admin/host-avatars") {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    const uploadWindow = uploadWindows.get(`avatars:${user.id}`);
+    if (uploadWindow && uploadWindow.until > Date.now() && uploadWindow.count >= 8) {
+      return error(response, 429, "UPLOAD_RATE_LIMIT", "头像上传次数过多，请稍后再试");
+    }
+    uploadWindows.set(`avatars:${user.id}`, uploadWindow?.until > Date.now()
+      ? { count: uploadWindow.count + 1, until: uploadWindow.until }
+      : { count: 1, until: Date.now() + 10 * 60_000 });
+    let upload;
+    try { upload = await readAvatarUpload(request); } catch (cause) {
+      return error(response, cause.status ?? 400, "AVATAR_UPLOAD_INVALID", cause.message);
+    }
+    const existing = upload.prepared.filter((item) => hostAvatarByNameKey.get(item.nameKey)?.photo_type);
+    if (existing.length && !upload.replaceExisting) {
+      return error(response, 409, "AVATAR_REPLACEMENT_CONFIRMATION_REQUIRED", "部分主播已有头像，请确认是否替换", existing.map((item) => ({ name: item.name })));
+    }
+    const now = Date.now();
+    const createdCount = upload.prepared.filter((item) => !hostAvatarByNameKey.get(item.nameKey)?.photo_type).length;
+    const updatedCount = upload.prepared.length - createdCount;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const saveAvatar = db.prepare(`INSERT INTO host_avatars(
+        id,name,name_key,photo_type,photo_blob,photo_hash,created_at,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(name_key) DO UPDATE SET
+        name=excluded.name,photo_type=excluded.photo_type,photo_blob=excluded.photo_blob,
+        photo_hash=excluded.photo_hash,updated_at=excluded.updated_at`);
+      for (const item of upload.prepared) {
+        saveAvatar.run(randomBytes(16).toString("hex"), item.name, item.nameKey, item.photoType, item.bytes, item.photoHash, now, now);
+      }
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(new Date(now).toISOString());
+      db.exec("COMMIT");
+    } catch (cause) {
+      try { db.exec("ROLLBACK"); } catch {}
+      console.error("主播头像库更新失败:", cause.message);
+      return error(response, 500, "AVATAR_SAVE_FAILED", "头像保存失败，现有头像保持不变");
+    }
+    return json(response, 200, { ok: true, createdCount, updatedCount, dataUpdatedAt: new Date(now).toISOString(), ...avatarLibraryPayload() });
+  }
+
+  const adminAvatarMatch = pathname.match(/^\/api\/v1\/admin\/host-avatars\/([a-f\d]{32})$/i);
+  if (request.method === "DELETE" && adminAvatarMatch) {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    const avatar = hostAvatarById.get(adminAvatarMatch[1]);
+    if (!avatar) return error(response, 404, "AVATAR_NOT_FOUND", "没有找到这位主播");
+    const now = Date.now();
+    db.prepare("UPDATE host_avatars SET photo_type=NULL,photo_blob=NULL,photo_hash=NULL,updated_at=? WHERE id=?").run(now, avatar.id);
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(new Date(now).toISOString());
+    return json(response, 200, { ok: true, dataUpdatedAt: new Date(now).toISOString(), ...avatarLibraryPayload() });
+  }
+
   if (request.method === "GET" && pathname === "/api/v1/rooms") {
     if (!requireUser(request, response)) return;
     return json(response, 200, { rooms: db.prepare("SELECT code,name,sort_order AS sortOrder FROM rooms ORDER BY sort_order").all() });
@@ -920,20 +1137,12 @@ async function handle(request, response) {
         scheduleCount: slots.length, errors: boundaryConflicts, warnings: parsed.warnings,
       });
     }
+    const schedulePreview = mcpPreviewFor(parsed);
     const existingCount = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
     if (pathname.endsWith("/preview")) {
       return json(response, 200, {
         ok: true,
-        preview: {
-          roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-          replacingSlots: existingCount, scheduleCount: slots.length,
-          schedule: slots.map((slot) => ({
-            start: slot.start, end: slot.end, director: slot.director, host: slot.host,
-            assistant: slot.assistant, featuredProducts: slot.products,
-            salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
-          })),
-          warnings: parsed.warnings,
-        },
+        preview: { ...schedulePreview, replacingSlots: existingCount },
       });
     }
     if (input.confirmReplace !== true) {
@@ -970,6 +1179,7 @@ async function handle(request, response) {
           slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
+      seedUniqueHostAvatars(slots.map((slot) => ({ host: slot.host })));
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.exec("COMMIT");
     } catch (cause) {
@@ -979,7 +1189,7 @@ async function handle(request, response) {
     }
     return json(response, 200, {
       ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-      scheduleCount: slots.length, preservedPhotos, warnings: parsed.warnings, dataUpdatedAt: updateAt,
+      scheduleCount: slots.length, preservedPhotos, warnings: schedulePreview.warnings, dataUpdatedAt: updateAt,
     });
   }
 
@@ -1030,6 +1240,7 @@ async function handle(request, response) {
           );
         }
       });
+      seedUniqueHostAvatars(result.rooms.flatMap((room) => room.slots));
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.exec("COMMIT");
     } catch (cause) {
