@@ -10,4 +10,6 @@
 
 修改排班时，助手会先展示完整预览，并等待你明确确认后才提交。
 
+员工排班文案模板见[普通员工 MCP 排班文案模板](https://github.com/meta-xucong/live-room-display/blob/main/docs/%E6%99%AE%E9%80%9A%E5%91%98%E5%B7%A5-MCP%E6%8E%92%E7%8F%AD%E5%86%99%E5%85%A5%E7%A4%BA%E4%BE%8B.md)。头像按姓名匹配；同名人员使用双方约定的括号备注，备注会显示在直播间页面。
+
 密钥创建与撤销说明见项目的 `docs/mcp-connectors.md`。

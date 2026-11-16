@@ -12,6 +12,7 @@ description: Use the live room display MCP tools to view rooms and schedules or 
 - 需要确认编号时先调用 `list_rooms`。
 - 查看某日安排时调用 `get_room_schedule`。日期不明确就先询问，不能猜测。
 - 工具返回头像是否存在及来源，但不读取或上传照片。排班中的主播姓名会自动匹配系统头像库。
+- 同名主播不能只按裸姓名区分。若用户提供括号备注（如“张敏（A组）”），排班和头像库必须保持完整写法一致；备注会显示在展示页。不能自行添加备注。
 
 ## 修改排班
 

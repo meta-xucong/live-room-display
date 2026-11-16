@@ -45,6 +45,7 @@ npm run start
 - `docs/harness-api.md`：自然语言转固定格式文本及 API 调用流程。
 - `docs/harness-openapi.yaml`：Harness 可导入的 OpenAPI 描述。
 - `docs/mcp-connectors.md`：MCP 服务、密钥和 Codex/WorkBuddy 连接器的配置说明。
+- `docs/普通员工-MCP排班写入示例.md`：员工可直接复制的排班文案模板和头像匹配说明。
 - `integrations/`：Codex 插件与 WorkBuddy Connector 导入包源文件。
 
 `src/rooms.json` 和单文件 HTML 导出演示只含合成样例；正式网页读取已登录用户可访问的服务器数据。
