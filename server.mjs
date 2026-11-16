@@ -25,6 +25,11 @@ db.exec(`
     id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
   );
+  CREATE TABLE IF NOT EXISTS mcp_previews (
+    id TEXT PRIMARY KEY, token_id TEXT NOT NULL REFERENCES api_tokens(id) ON DELETE CASCADE,
+    schedule_text TEXT NOT NULL, data_updated_at TEXT NOT NULL,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS rooms (
     code TEXT PRIMARY KEY, name TEXT NOT NULL, sheet_name TEXT NOT NULL, sort_order INTEGER NOT NULL
   );
@@ -53,14 +58,18 @@ const uploadWindows = new Map();
 const integrationWindows = new Map();
 const cookieName = "lrd_session";
 const cookieSecure = process.env.NODE_ENV === "production" && process.env.SECURE_COOKIES !== "false";
+const previewCleanup = setInterval(() => {
+  try { db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(Date.now()); } catch {}
+}, 60_000);
+previewCleanup.unref();
 
 function json(response, status, value, extraHeaders = {}) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...extraHeaders });
   response.end(JSON.stringify(value));
 }
 
-function error(response, status, code, message, details = []) {
-  json(response, status, { error: { code, message, details } });
+function error(response, status, code, message, details = [], extraHeaders = {}) {
+  json(response, status, { error: { code, message, details } }, extraHeaders);
 }
 
 function cookieValue(header, name) {
@@ -75,29 +84,26 @@ function hashToken(token) {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function requireIntegrationToken(request, response) {
-  const authorization = request.headers.authorization ?? "";
+function authenticateIntegrationToken(authorization) {
   const match = authorization.match(/^Bearer\s+(lrd_live_[A-Za-z0-9_-]{43})$/);
-  if (!match) {
-    error(response, 401, "API_TOKEN_REQUIRED", "请提供有效的 Bearer API 密钥");
-    return null;
-  }
+  if (!match) return { status: 401, code: "API_TOKEN_REQUIRED", message: "请提供有效的 Bearer API 密钥" };
   const token = integrationTokens.get(hashToken(match[1]));
-  if (!token) {
-    error(response, 401, "API_TOKEN_INVALID", "API 密钥无效或已撤销");
-    return null;
-  }
+  if (!token) return { status: 401, code: "API_TOKEN_INVALID", message: "API 密钥无效或已撤销" };
   const now = Date.now();
   const window = integrationWindows.get(token.id);
-  if (window && window.until > now && window.count >= 30) {
-    error(response, 429, "API_RATE_LIMIT", "接口调用过于频繁，请稍后重试");
-    return null;
-  }
+  if (window && window.until > now && window.count >= 30) return { status: 429, code: "API_RATE_LIMIT", message: "接口调用过于频繁，请稍后重试" };
   integrationWindows.set(token.id, window?.until > now
     ? { count: window.count + 1, until: window.until }
     : { count: 1, until: now + 10 * 60_000 });
   db.prepare("UPDATE api_tokens SET last_used_at=? WHERE id=?").run(now, token.id);
-  return token;
+  return { token };
+}
+
+function requireIntegrationToken(request, response) {
+  const result = authenticateIntegrationToken(request.headers.authorization ?? "");
+  if (result.token) return result.token;
+  error(response, result.status, result.code, result.message);
+  return null;
 }
 
 function userFor(request) {
@@ -434,6 +440,360 @@ function publicSlot(slot) {
   };
 }
 
+const mcpTools = [
+  {
+    name: "list_rooms",
+    title: "查看直播间",
+    description: "列出已录入的直播间编号和名称，先用它确认用户说的是哪个直播间。只读。",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { title: "查看直播间", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "get_room_schedule",
+    title: "查看当日排班",
+    description: "查看指定直播间某一天的完整排班。日期必须由用户提供或确认。只读。",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["roomCode", "date"],
+      properties: {
+        roomCode: { type: "string", description: "直播间编号，先通过 list_rooms 确认" },
+        date: { type: "string", description: "排班日期，格式 YYYY-MM-DD" },
+      },
+    },
+    annotations: { title: "查看当日排班", readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "preview_schedule_update",
+    title: "预览排班修改",
+    description: "按自然语言整理好的直播间和排班内容生成预览，不会写入数据。必须先展示预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["roomCode", "date", "slots"],
+      properties: {
+        roomCode: { type: "string", description: "直播间编号" },
+        roomName: { type: "string", description: "新增直播间时必填；已有直播间会使用系统中的名称" },
+        date: { type: "string", description: "排班日期，格式 YYYY-MM-DD" },
+        slots: {
+          type: "array", minItems: 1, maxItems: 100,
+          description: "该直播间该日期的全部时段；提交会替换这一天的完整排班",
+          items: {
+            type: "object", additionalProperties: false, required: ["start", "end"],
+            properties: {
+              start: { type: "string", description: "开始时间，24 小时制，例如 07:00" },
+              end: { type: "string", description: "结束时间，24 小时制，例如 11:00" },
+              director: { type: "string" }, host: { type: "string" }, assistant: { type: "string" },
+              featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
+              salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
+              notes: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+    annotations: { title: "预览排班修改", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: "commit_schedule_update",
+    title: "确认并提交排班",
+    description: "提交 preview_schedule_update 返回的预览编号。仅当用户在看到目标直播间、日期、替换时段数和完整排班预览后明确同意，才能调用。一次性预览编号 10 分钟有效；期间任何排班数据更新都会使其失效。",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["previewId"],
+      properties: { previewId: { type: "string", description: "预览工具返回的一次性编号" } },
+    },
+    annotations: { title: "确认并提交排班", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+];
+
+function updatedAtValue() {
+  return db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
+}
+
+function mcpPreviewFor(parsed) {
+  const slots = parsed.result.rooms[0].slots;
+  if (parsed.result.errors.length) {
+    const cause = new Error("排班内容未通过校验，请根据错误修正后重新预览");
+    cause.details = parsed.result.errors;
+    throw cause;
+  }
+  const adjacentSlots = db.prepare("SELECT date,start_time,end_time,starts_at,ends_at FROM slots WHERE room_code=? AND date IN (?,?)")
+    .all(parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1));
+  const conflicts = slots.flatMap((slot, index) => adjacentSlots
+    .filter((existing) => slot.startAt < existing.ends_at && existing.starts_at < slot.endAt)
+    .map((existing) => ({
+      sheet: parsed.sheet.name, row: index + 4, field: "排班时间",
+      message: `与相邻日期 ${existing.date} ${existing.start_time}-${existing.end_time} 的现有排班重叠`,
+    })));
+  if (conflicts.length) {
+    const cause = new Error("排班与相邻日期的跨日时段冲突，请先处理冲突后重新预览");
+    cause.details = conflicts;
+    throw cause;
+  }
+  const replacingSlots = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
+  return {
+    roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+    replacingSlots, scheduleCount: slots.length,
+    schedule: slots.map((slot) => ({
+      start: slot.start, end: slot.end, director: slot.director, host: slot.host,
+      assistant: slot.assistant, featuredProducts: slot.products,
+      salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
+    })),
+    warnings: parsed.warnings,
+  };
+}
+
+function cleanMcpField(value, label, maxLength = 500) {
+  const text = String(value ?? "").trim();
+  if (text.length > maxLength || /[\r\n]/.test(text)) throw new Error(`${label}不能超过 ${maxLength} 个字符，也不能包含换行`);
+  return text;
+}
+
+function fixedScheduleTextFromMcp(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("请提供排班内容");
+  const roomCode = cleanMcpField(args.roomCode, "直播间编号", 40);
+  const date = cleanMcpField(args.date, "日期", 10);
+  if (!roomCode) throw new Error("请先确认直播间编号");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("请提供有效排班日期，格式为 YYYY-MM-DD");
+  if (!Array.isArray(args.slots) || args.slots.length < 1 || args.slots.length > 100) throw new Error("请提供 1 至 100 个时段，并包含这一天的全部排班");
+  const existingRoom = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
+  const roomName = existingRoom?.name ?? cleanMcpField(args.roomName, "直播间名称", 120);
+  if (!roomName) throw new Error("新增直播间时请补充直播间名称");
+  const lines = [`直播间编号：${roomCode}`, `直播间名称：${roomName}`, `排班日期：${date}`];
+  for (const [index, slot] of args.slots.entries()) {
+    if (!slot || typeof slot !== "object" || Array.isArray(slot)) throw new Error(`第 ${index + 1} 个时段格式不正确`);
+    const start = excelTime(slot.start);
+    const end = excelTime(slot.end);
+    if (!start || !end) throw new Error(`第 ${index + 1} 个时段的开始或结束时间无效`);
+    const products = slot.featuredProducts ?? [];
+    if (!Array.isArray(products) || products.length > 30) throw new Error(`第 ${index + 1} 个时段的商品列表格式不正确`);
+    const productText = products.map((product) => cleanMcpField(product, "商品名称", 200)).filter(Boolean).join("；");
+    const rawSalesTarget = slot.salesTarget == null ? "" : slot.salesTarget;
+    if (!["string", "number"].includes(typeof rawSalesTarget)) throw new Error(`第 ${index + 1} 个时段的目标销售额格式不正确`);
+    const salesTarget = cleanMcpField(rawSalesTarget, "目标销售额", 32);
+    lines.push("---", `时段：${start}-${end}`,
+      `导演：${cleanMcpField(slot.director, "导演", 80)}`,
+      `主播：${cleanMcpField(slot.host, "主播", 80)}`,
+      `助播：${cleanMcpField(slot.assistant, "助播", 80)}`,
+      `主推商品：${productText}`, `目标销售额：${salesTarget}`,
+      `备注：${cleanMcpField(slot.notes, "备注", 500)}`);
+  }
+  return lines.join("\n");
+}
+
+function mcpToolResult(value, isError = false) {
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return {
+    content: [{ type: "text", text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function mcpToolFailure(cause) {
+  return mcpToolResult({ error: cause.message, details: cause.details ?? [] }, true);
+}
+
+function commitMcpPreview(previewId, tokenId) {
+  if (!/^[a-f\d]{48}$/i.test(previewId)) throw new Error("预览编号无效，请重新预览");
+  const now = Date.now();
+  const row = db.prepare("SELECT * FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(previewId, tokenId, now);
+  if (!row) throw new Error("预览编号不存在、已使用或已过期，请重新预览");
+  if (row.data_updated_at !== updatedAtValue()) throw new Error("预览后排班数据有更新，为避免覆盖新内容，请重新预览");
+  const parsed = validateFixedScheduleText(row.schedule_text);
+  const preview = mcpPreviewFor(parsed);
+  let preservedPhotos = 0;
+  const updateAt = new Date().toISOString();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const currentTicket = db.prepare("SELECT id FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(previewId, tokenId, Date.now());
+    if (!currentTicket || row.data_updated_at !== updatedAtValue()) throw new Error("预览已失效，请重新预览");
+    const existingRoom = db.prepare("SELECT sort_order FROM rooms WHERE code=?").get(parsed.roomCode);
+    const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
+    const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
+    if (existingRoom) {
+      db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?").run(parsed.roomName, "MCP 自然语言更新", parsed.roomCode);
+    } else {
+      const order = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
+      db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(parsed.roomCode, parsed.roomName, "MCP 自然语言更新", order);
+    }
+    db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+    const insertSlot = db.prepare(`INSERT INTO slots(
+      id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
+      products_json,sales_target_cents,notes,photo_type,photo_blob
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const slot of parsed.result.rooms[0].slots) {
+      const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
+      if (previous?.photo_blob) preservedPhotos += 1;
+      insertSlot.run(
+        previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
+        slot.director, slot.host, slot.assistant, JSON.stringify(slot.products),
+        slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
+      );
+    }
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
+    db.prepare("DELETE FROM mcp_previews WHERE id=?").run(previewId);
+    db.exec("COMMIT");
+  } catch (cause) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw new Error(cause.message === "预览已失效，请重新预览" ? cause.message : "提交失败，排班数据没有完成修改");
+  }
+  return {
+    ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+    scheduleCount: preview.scheduleCount, preservedPhotos, warnings: parsed.warnings, dataUpdatedAt: updateAt,
+  };
+}
+
+async function callMcpTool(name, args, token) {
+  if (name === "list_rooms") {
+    const rooms = db.prepare(`SELECT r.code,r.name,r.sort_order AS sortOrder,
+      (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount
+      FROM rooms r ORDER BY r.sort_order`).all();
+    return mcpToolResult({ rooms });
+  }
+  if (name === "get_room_schedule") {
+    const roomCode = cleanMcpField(args?.roomCode, "直播间编号", 40);
+    const date = cleanMcpField(args?.date, "日期", 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("日期格式应为 YYYY-MM-DD");
+    const room = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
+    if (!room) throw new Error(`直播间编号 ${roomCode} 不存在，请先查看直播间列表`);
+    const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((slot) => ({
+      start: slot.start_time, end: slot.end_time, director: slot.director, host: slot.host, assistant: slot.assistant,
+      featuredProducts: JSON.parse(slot.products_json), salesTarget: salesDisplay(slot.sales_target_cents),
+      notes: slot.notes, hasPhoto: Boolean(slot.photo_blob),
+    }));
+    return mcpToolResult({ room, date, schedule });
+  }
+  if (name === "preview_schedule_update") {
+    const scheduleText = fixedScheduleTextFromMcp(args);
+    const parsed = validateFixedScheduleText(scheduleText);
+    const preview = mcpPreviewFor(parsed);
+    const now = Date.now();
+    db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(now);
+    db.prepare("DELETE FROM mcp_previews WHERE token_id=? AND id IN (SELECT id FROM mcp_previews WHERE token_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 20)").run(token.id, token.id);
+    const previewId = randomBytes(24).toString("hex");
+    const expiresAt = now + 10 * 60_000;
+    db.prepare("INSERT INTO mcp_previews(id,token_id,schedule_text,data_updated_at,created_at,expires_at) VALUES (?,?,?,?,?,?)")
+      .run(previewId, token.id, scheduleText, updatedAtValue(), now, expiresAt);
+    return mcpToolResult({ previewId, expiresAt: new Date(expiresAt).toISOString(), preview });
+  }
+  if (name === "commit_schedule_update") {
+    return mcpToolResult(commitMcpPreview(cleanMcpField(args?.previewId, "预览编号", 48), token.id));
+  }
+  throw Object.assign(new Error(`未知工具：${name}`), { rpcCode: -32602 });
+}
+
+function mcpRpcResponse(response, id, result, modern = false, cacheable = false) {
+  const payload = modern ? {
+    ...result,
+    resultType: "complete",
+    _meta: { "io.modelcontextprotocol/serverInfo": { name: "live-room-display", version: "1.0.0" } },
+    ...(cacheable ? { ttlMs: 0, cacheScope: "private" } : {}),
+  } : result;
+  return json(response, 200, { jsonrpc: "2.0", id, result: payload });
+}
+
+function decodeMcpHeaderValue(value) {
+  const match = String(value ?? "").match(/^=\?base64\?([A-Za-z0-9+/]*={0,2})\?=$/);
+  if (!match) return String(value ?? "");
+  const decoded = Buffer.from(match[1], "base64");
+  if (decoded.toString("base64") !== match[1]) return "\u0000";
+  return decoded.toString("utf8");
+}
+
+async function handleMcpRequest(request, response) {
+  if (request.method !== "POST") {
+    response.writeHead(405, { allow: "POST", "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    return response.end(JSON.stringify({ error: "MCP endpoint accepts POST requests only" }));
+  }
+  const origin = request.headers.origin;
+  if (origin) {
+    let originHost = "";
+    try { originHost = new URL(origin).host; } catch {}
+    const allowed = new Set([request.headers.host, ...(process.env.MCP_ALLOWED_ORIGINS ?? "").split(",").map((value) => {
+      try { return new URL(value.trim()).host; } catch { return ""; }
+    })].filter(Boolean));
+    if (!allowed.has(originHost)) return error(response, 403, "ORIGIN_REJECTED", "请求来源不允许");
+  }
+  if (!/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
+    return error(response, 415, "UNSUPPORTED_MEDIA_TYPE", "MCP 请求必须使用 application/json");
+  }
+  const authentication = authenticateIntegrationToken(request.headers.authorization ?? "");
+  if (!authentication.token) {
+    return error(response, authentication.status, authentication.code, authentication.message, [], { "www-authenticate": "Bearer" });
+  }
+  let message;
+  try { message = await readJson(request); } catch (cause) {
+    return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+  }
+  if (!message || typeof message !== "object" || Array.isArray(message) || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+    return json(response, 400, { jsonrpc: "2.0", id: message?.id ?? null, error: { code: -32600, message: "Invalid JSON-RPC request" } });
+  }
+  const requestMeta = message.params?._meta;
+  const requestedModernVersion = requestMeta?.["io.modelcontextprotocol/protocolVersion"];
+  const modern = typeof requestedModernVersion === "string";
+  if (!modern && request.headers["mcp-protocol-version"] === "2026-07-28") {
+    return json(response, 400, { jsonrpc: "2.0", id: message.id ?? null, error: { code: -32020, message: "Header mismatch: the modern protocol version must also appear in request metadata" } });
+  }
+  if (modern) {
+    const id = message.id ?? null;
+    const protocolHeader = request.headers["mcp-protocol-version"] ?? "";
+    const methodHeader = request.headers["mcp-method"] ?? "";
+    const nameHeader = decodeMcpHeaderValue(request.headers["mcp-name"] ?? "");
+    const expectedName = ["tools/call", "resources/read", "prompts/get"].includes(message.method)
+      ? message.params?.name ?? message.params?.uri ?? "" : "";
+    const headerMismatch = protocolHeader !== requestedModernVersion || methodHeader !== message.method ||
+      (expectedName && nameHeader !== expectedName) || (!expectedName && nameHeader);
+    if (headerMismatch) {
+      return json(response, 400, { jsonrpc: "2.0", id, error: { code: -32020, message: "Header mismatch: MCP request headers must match the request body" } });
+    }
+    if (requestedModernVersion !== "2026-07-28") {
+      return json(response, 400, { jsonrpc: "2.0", id, error: {
+        code: -32022, message: "Unsupported protocol version",
+        data: { supported: ["2026-07-28"], requested: requestedModernVersion },
+      } });
+    }
+  }
+  const id = message.id;
+  const isNotification = id === undefined;
+  if (isNotification && message.method.startsWith("notifications/")) {
+    response.writeHead(202, { "cache-control": "no-store" });
+    return response.end();
+  }
+  if (modern && message.method === "server/discover") {
+    return mcpRpcResponse(response, id, {
+      supportedVersions: ["2026-07-28"], capabilities: { tools: {} },
+      instructions: "用自然语言协助用户查看与更新直播间排班。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
+    }, true, true);
+  }
+  if (message.method === "initialize" && !modern) {
+    const supported = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+    const requested = message.params?.protocolVersion;
+    if (typeof requested !== "string") return json(response, 400, { jsonrpc: "2.0", id: id ?? null, error: { code: -32602, message: "protocolVersion is required" } });
+    return mcpRpcResponse(response, id, {
+      protocolVersion: supported.includes(requested) ? requested : "2025-11-25",
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: "live-room-display", version: "1.0.0" },
+      instructions: "用自然语言协助用户查看与更新直播间排班。修改时先调用预览工具并把目标直播间、日期、替换数量和完整时段摘要展示给用户；只有用户明确确认后才提交。信息缺失时先询问，不得猜测。",
+    });
+  }
+  if (!modern && message.method === "ping") return mcpRpcResponse(response, id, {});
+  if (message.method === "tools/list") return mcpRpcResponse(response, id, { tools: mcpTools }, modern, true);
+  if (message.method === "tools/call") {
+    const name = message.params?.name;
+    if (typeof name !== "string" || !mcpTools.some((tool) => tool.name === name)) {
+      return json(response, 200, { jsonrpc: "2.0", id: id ?? null, error: { code: -32602, message: "Unknown tool" } });
+    }
+    try {
+      const result = await callMcpTool(name, message.params?.arguments ?? {}, authentication.token);
+      return mcpRpcResponse(response, id, result, modern);
+    } catch (cause) {
+      if (cause.rpcCode) return json(response, 200, { jsonrpc: "2.0", id: id ?? null, error: { code: cause.rpcCode, message: cause.message } });
+      return mcpRpcResponse(response, id, mcpToolFailure(cause), modern);
+    }
+  }
+  if (isNotification) {
+    response.writeHead(202, { "cache-control": "no-store" });
+    return response.end();
+  }
+  return json(response, modern ? 404 : 200, { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+}
+
 async function handle(request, response) {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   const pathname = decodeURIComponent(url.pathname);
@@ -622,6 +982,8 @@ async function handle(request, response) {
       scheduleCount: slots.length, preservedPhotos, warnings: parsed.warnings, dataUpdatedAt: updateAt,
     });
   }
+
+  if (pathname === "/mcp") return handleMcpRequest(request, response);
 
   if (request.method === "POST" && pathname === "/api/v1/admin/schedule-upload") {
     const user = requireUser(request, response, "admin");

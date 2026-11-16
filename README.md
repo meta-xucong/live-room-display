@@ -2,7 +2,7 @@
 
 面向直播间门口电子屏的登录式网页程序。管理员上传包含多个工作表的 `.xlsx` 排班工作簿；每个工作表对应一个直播间。普通用户登录后选择直播间，页面按排班时间自动更新岗位、主播照片、主推商品和目标销售额。
 
-当前版本包含前端展示、登录与角色权限、Excel 工作簿校验与原子更新、受登录保护的主播照片读取、按上海时区自动切换，以及供 Codex、WorkBuddy 等 Harness 调用的固定格式文本 API。生产入口为 `https://douyin.sohodigital.top`。
+当前版本包含前端展示、登录与角色权限、Excel 工作簿校验与原子更新、受登录保护的主播照片读取、按上海时区自动切换，以及供 Codex、WorkBuddy 等 Harness 调用的自然语言 MCP 服务和固定格式文本 API。生产入口为 `https://douyin.sohodigital.top`。
 
 ## 本地运行
 
@@ -44,5 +44,7 @@ npm run start
 - `docs/后端开发文档.md`：已落地实现、接口与部署说明。
 - `docs/harness-api.md`：自然语言转固定格式文本及 API 调用流程。
 - `docs/harness-openapi.yaml`：Harness 可导入的 OpenAPI 描述。
+- `docs/mcp-connectors.md`：MCP 服务、密钥和 Codex/WorkBuddy 连接器的配置说明。
+- `integrations/`：Codex 插件与 WorkBuddy Connector 导入包源文件。
 
 `src/rooms.json` 和单文件 HTML 导出演示只含合成样例；正式网页读取已登录用户可访问的服务器数据。
