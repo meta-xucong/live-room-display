@@ -31,14 +31,14 @@ API 密钥以 SHA-256 摘要存储在服务端 SQLite 中；响应只在创建�
 
 ## 前端生成密钥并配置 Harness
 
-日常操作不需要 SSH 登录服务器。管理员在网页生成密钥，Codex 由助手直接完成本机配置，WorkBuddy 则在连接器凭证框中配置；之后员工可直接用自然语言录入排班。
+日常操作不需要 SSH 登录服务器。管理员在网页生成密钥后，可把部署文档和密钥发给 Codex 或 WorkBuddy 的私密配置会话，由助手直接完成本机配置；之后员工可直接用自然语言录入排班。
 
 ### 管理员：在网页生成密钥
 
 1. 打开[直播间信息牌](https://douyin.sohodigital.top)，使用管理员账号登录。
 2. 进入顶部的“**MCP 密钥**”选项卡。
 3. 输入用途名称，例如“Codex - 小王”或“WorkBuddy - 小王”，点击“生成密钥”。建议每个 Harness 安装分别生成一把，方便单独撤销。
-4. 点击“复制密钥”。完整密钥以 `lrd_live_` 开头，只在创建成功后显示这一次；Codex 密钥交给私密配置会话中的助手安装，WorkBuddy 密钥交给连接器管理员配置。
+4. 点击“复制密钥”。完整密钥以 `lrd_live_` 开头，只在创建成功后显示这一次；将对应密钥交给私密配置会话中的助手安装，或按组织市场发布流程交给 Connector 管理员配置。
 
 密钥列表只显示名称、创建时间、最近使用时间和状态，不会再次显示完整密钥。若复制前关闭或刷新页面，或之后找不到已保存的密钥，请撤销旧密钥并重新生成。发现泄露时也应立即撤销。
 
@@ -50,17 +50,19 @@ Codex 的插件安装页只负责安装插件，不提供 API Key 输入框。�
 
 建议让助手直接执行，不需要用户手动输入命令。配置完成后完全退出并重启 Codex 一次，再新建聊天发送“查看直播间”验证连接。之后可直接在排班对话中使用；更新排班仍会先显示完整预览，并等待用户明确确认。
 
-### WorkBuddy：安装并连接
+### WorkBuddy：一步安装并连接
 
-1. 下载[WorkBuddy Connector 包](../integrations/dist/live-room-schedule-workbuddy.zip)，在 WorkBuddy Connector 管理页面导入或发布该连接器。
-2. 添加连接时，在“**直播间信息牌 API 密钥**”密码框粘贴管理员刚生成的 WorkBuddy 密钥，并保存连接。
-3. 发送“查看直播间”确认连接成功。如果组织没有本地导入权限，请让 Connector 管理员代为导入或发布。
+收到本文档（或本仓库）和用户在私密配置会话中提供的 WorkBuddy API 密钥后，助手应直接运行 `integrations/workbuddy-connector/Install-WorkBuddy.ps1`，不要要求用户手动导入 Connector 包或寻找密码框。如果会话里只有 GitHub 文档链接，助手应自行获取仓库中的 WorkBuddy 安装脚本或安装包再执行。
+
+安装器会将 `soho-live-room` MCP 服务合并进当前 Windows 用户的 WorkBuddy 配置 `%USERPROFILE%\.workbuddy\mcp.json`，保留已有 MCP 配置，并安装排班技能。API 密钥保存在这个本机配置文件的 `Authorization` 请求头中；它不会写入仓库、脚本或安装包。助手不得在回复、命令参数或输出中复述密钥。配置后新建聊天发送“查看直播间”；如果工具未出现，再完全退出并重启 WorkBuddy。
+
+此安装方式直接配置当前用户的 WorkBuddy，不需要 Connector 市场发布。若要提供给组织内其他用户安装，Connector 包仍需由管理员提交 WorkBuddy 审核并发布；这是 WorkBuddy 的市场分发流程。
 
 ### 员工：用自然语言写入排班
 
 连接只需配置一次。此后员工在已连接的 Harness 对话中，提供直播间、日期和当天完整时段安排；助手会先展示将要替换的排班预览，员工核对并明确回复确认后才写入系统。可直接使用[普通员工排班文案模板](./普通员工-MCP排班写入示例.md)。
 
-API 密钥只用于配置 Harness：Codex 用户可在私密配置会话中连同本文档交给助手安装，WorkBuddy 用户则填入连接器的密码框。不要把密钥发到普通排班对话、群聊或公开文档中。密钥持有人可以通过 MCP 访问排班并提交更新；如果员工不再需要访问，请管理员在“MCP 密钥”选项卡撤销对应密钥。撤销即时生效且无法恢复，之后需要重新生成并配置。
+API 密钥只用于配置 Harness：Codex 或 WorkBuddy 用户可在私密配置会话中连同本文档交给助手安装；市场版 WorkBuddy Connector 使用连接器提供的密码表单。不要把密钥发到普通排班对话、群聊或公开文档中。密钥持有人可以通过 MCP 访问排班并提交更新；如果员工不再需要访问，请管理员在“MCP 密钥”选项卡撤销对应密钥。撤销即时生效且无法恢复，之后需要重新生成并配置。
 
 ## 通过命令行创建和撤销密钥
 
@@ -76,7 +78,7 @@ runuser -u live-room-display -- env DATA_DIR=/var/lib/live-room-display \
   /opt/nodejs/current/bin/node scripts/create-api-token.mjs --name "WorkBuddy MCP"
 ```
 
-命令会输出一次性密钥。Codex 密钥交给私密配置会话中的助手安装；WorkBuddy 密钥由管理员粘贴到连接器密码框。不要提交到 Git、写入普通配置文件或粘贴到普通排班对话中。
+命令会输出一次性密钥。将密钥交给私密配置会话中的助手安装；不要提交到 Git、粘贴到普通排班对话中或公开分享。
 
 撤销密钥：
 
@@ -85,13 +87,9 @@ runuser -u live-room-display -- env DATA_DIR=/var/lib/live-room-display \
   /opt/nodejs/current/bin/node scripts/revoke-api-token.mjs --id <密钥ID>
 ```
 
-## WorkBuddy 安装
+## WorkBuddy 市场版 Connector
 
-1. 下载仓库的 `integrations/dist/live-room-schedule-workbuddy.zip`，交给 WorkBuddy Connector 管理员导入或发布。
-2. 点击连接，在“直播间信息牌 API 密钥”字段粘贴 `WorkBuddy MCP` 密钥。
-3. 连接成功后，可直接自然语言查看或整理排班。
-
-如果组织尚未启用本地 Connector 导入，可先将 `integrations/workbuddy-connector/` 提交给 WorkBuddy Connector 管理员发布到组织内。配置字段遵照 WorkBuddy 连接器规范；本项目尚未代为提交到 WorkBuddy Marketplace。
+如需在 WorkBuddy Connector 市场中供组织成员发现和安装，下载 `integrations/dist/live-room-schedule-workbuddy.zip` 并提交 WorkBuddy 审核。审核通过后由管理员发布；用户安装后在 Connector 提供的密码表单中填写专用密钥。此流程与上面的个人本机一步安装不同。
 
 ## MCP 请求兼容
 

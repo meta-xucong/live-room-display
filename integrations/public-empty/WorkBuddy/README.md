@@ -1,6 +1,18 @@
-# WorkBuddy Connector
+# WorkBuddy MCP Connector
 
-这是 WorkBuddy MCP Connector 的提交包，使用静态 API 密钥认证。连接地址已预填；首次连接时，在密码框粘贴管理员为 WorkBuddy 单独创建的密钥，然后保存连接即可。
+WorkBuddy 排班 MCP 有两种配置方式：个人本机一键安装，或作为 Connector 提交市场供组织成员安装。
+
+## 个人本机一键安装
+
+把本文档（或仓库链接）和管理员生成的 WorkBuddy API 密钥发给 WorkBuddy 的私密配置会话，请助手直接运行 `Install-WorkBuddy.ps1`。如果会话里只有链接，助手应自行获取并解压 WorkBuddy 安装包。
+
+安装器会将 MCP 服务写入当前 Windows 用户的 `%USERPROFILE%\.workbuddy\mcp.json`，保留文件中的其他服务，并安装排班技能。API 密钥写入本机配置文件的 `Authorization` 请求头，不会写入仓库或安装包。不要将密钥复制到普通排班对话、命令参数、GitHub 或回复中。
+
+安装后新建聊天并发送“查看直播间”。如果 MCP 工具未出现，再完全退出并重启 WorkBuddy。
+
+## 市场版 Connector
+
+此目录同时包含标准 WorkBuddy Connector 包。它使用 WorkBuddy 的 API Key 密码表单（`token-schema.json`）；连接地址和认证占位符见 `mcp.json`。组织管理员可将安装包提交 WorkBuddy 审核，通过后发布到 Connector 市场。
 
 使用“查看直播间”确认连接。修改排班时先看完整预览，只有明确确认后才提交。
 
@@ -8,4 +20,4 @@
 
 密钥创建与撤销说明见项目的 `docs/mcp-connectors.md`。
 
-此包尚未提交至 WorkBuddy 官方 Connector Marketplace。组织若未启用本地 Connector 导入，可由 Connector 管理员按官方流程发布或导入此包。
+WorkBuddy 官方流程要求 Connector 包经审核后才能在市场发布。个人本机一键安装不需要市场审核。

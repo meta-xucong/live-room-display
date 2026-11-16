@@ -1,6 +1,12 @@
 ---
 name: live-room-schedule
+display_name: 直播间排班助手
+display_name_en: Live Room Schedule Assistant
 description: Use the live room display MCP tools to view rooms and schedules or update a room's complete day schedule from natural language.
+description_zh: 使用自然语言查看直播间和排班，更新前先预览并等待用户确认。
+description_en: View live rooms and schedules, and preview schedule updates before explicit confirmation.
+version: 1.0.0
+author: Soho Digital
 ---
 
 # 直播间排班助手
