@@ -21,6 +21,10 @@ db.exec(`
     token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL, expires_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER
+  );
   CREATE TABLE IF NOT EXISTS rooms (
     code TEXT PRIMARY KEY, name TEXT NOT NULL, sheet_name TEXT NOT NULL, sort_order INTEGER NOT NULL
   );
@@ -43,8 +47,10 @@ const MIME = {
   ".ico": "image/x-icon", ".woff2": "font/woff2", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
 const sessions = db.prepare("SELECT s.token_hash,s.csrf_token,s.expires_at,u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.enabled=1");
+const integrationTokens = db.prepare("SELECT id,name FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL");
 const failures = new Map();
 const uploadWindows = new Map();
+const integrationWindows = new Map();
 const cookieName = "lrd_session";
 const cookieSecure = process.env.NODE_ENV === "production" && process.env.SECURE_COOKIES !== "false";
 
@@ -67,6 +73,31 @@ function cookieValue(header, name) {
 
 function hashToken(token) {
   return createHash("sha256").update(token).digest("hex");
+}
+
+function requireIntegrationToken(request, response) {
+  const authorization = request.headers.authorization ?? "";
+  const match = authorization.match(/^Bearer\s+(lrd_live_[A-Za-z0-9_-]{43})$/);
+  if (!match) {
+    error(response, 401, "API_TOKEN_REQUIRED", "请提供有效的 Bearer API 密钥");
+    return null;
+  }
+  const token = integrationTokens.get(hashToken(match[1]));
+  if (!token) {
+    error(response, 401, "API_TOKEN_INVALID", "API 密钥无效或已撤销");
+    return null;
+  }
+  const now = Date.now();
+  const window = integrationWindows.get(token.id);
+  if (window && window.until > now && window.count >= 30) {
+    error(response, 429, "API_RATE_LIMIT", "接口调用过于频繁，请稍后重试");
+    return null;
+  }
+  integrationWindows.set(token.id, window?.until > now
+    ? { count: window.count + 1, until: window.until }
+    : { count: 1, until: now + 10 * 60_000 });
+  db.prepare("UPDATE api_tokens SET last_used_at=? WHERE id=?").run(now, token.id);
+  return token;
 }
 
 function userFor(request) {
@@ -298,6 +329,93 @@ function validateWorkbook(sheets) {
   return { rooms, errors, warnings };
 }
 
+function fixedTextError(message, field = "格式", row = "") {
+  const cause = new Error(message);
+  cause.details = [{ sheet: "文本输入", row, field, message }];
+  throw cause;
+}
+
+function parseFixedFields(section, blockNumber, allowed, required) {
+  const fields = new Map();
+  for (const [index, rawLine] of section.split("\n").entries()) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^([^：:]+)[：:](.*)$/);
+    if (!match) fixedTextError("每行请按“字段：内容”填写", "格式", index + 1);
+    const key = match[1].trim();
+    if (!allowed.includes(key)) fixedTextError(`不支持字段“${key}”`, key, index + 1);
+    if (fields.has(key)) fixedTextError(`字段“${key}”重复填写`, key, index + 1);
+    fields.set(key, match[2].trim());
+  }
+  for (const key of required) {
+    if (!fields.has(key)) fixedTextError(`第 ${blockNumber} 段缺少“${key}”字段`, key, blockNumber);
+  }
+  return fields;
+}
+
+function parseFixedScheduleText(input) {
+  const text = String(input ?? "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").trim();
+  if (!text) fixedTextError("请提供排班文本");
+  if (text.length > 60_000) fixedTextError("排班文本不能超过 60,000 个字符");
+  const sections = text.split(/^[ \t]*---[ \t]*$/m);
+  while (sections.length && !sections.at(-1).trim()) sections.pop();
+  if (sections.length < 2) fixedTextError("请先填写直播间信息，再用单独一行“---”分隔排班时段");
+  if (sections.length > 101) fixedTextError("一次最多提交 100 个排班时段");
+
+  const metadata = parseFixedFields(
+    sections[0], 1,
+    ["直播间编号", "直播间名称", "排班日期"],
+    ["直播间编号", "直播间名称", "排班日期"],
+  );
+  const roomCode = metadata.get("直播间编号");
+  const roomName = metadata.get("直播间名称");
+  const dateInput = metadata.get("排班日期");
+  const date = excelDate(dateInput);
+  if (!roomCode || roomCode.length > 40) fixedTextError("直播间编号不能为空且不能超过 40 个字符", "直播间编号", 1);
+  if (!roomName || roomName.length > 120) fixedTextError("直播间名称不能为空且不能超过 120 个字符", "直播间名称", 1);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateInput) || date !== dateInput) fixedTextError("排班日期请按 YYYY-MM-DD 填写有效日期", "排班日期", 1);
+
+  const slotFields = ["时段", "导演", "主播", "助播", "主推商品", "目标销售额", "备注"];
+  const headers = ["日期", "开始时间", "结束时间", "导演", "主播", "助播", "主播照片", "主推商品", "目标销售额", "备注"];
+  const rows = new Map([
+    [1, new Map([["B", { value: roomName }], ["E", { value: roomCode }]])],
+    [3, new Map(headers.map((label, index) => [String.fromCharCode(65 + index), { value: label }]))],
+  ]);
+
+  sections.slice(1).forEach((section, index) => {
+    const rowNumber = index + 4;
+    const fields = parseFixedFields(section, index + 2, slotFields, slotFields);
+    const period = fields.get("时段");
+    const range = period.match(/^(\d{1,2}:\d{2})\s*(?:-|–|—|至|到)\s*(\d{1,2}:\d{2})$/);
+    if (!range) fixedTextError("时段请按“07:00-11:00”填写", "时段", rowNumber);
+    const products = fields.get("主推商品").replace(/[；;、]/g, "\n");
+    const values = [date, range[1], range[2], fields.get("导演"), fields.get("主播"), fields.get("助播"), "", products, fields.get("目标销售额"), fields.get("备注")];
+    rows.set(rowNumber, new Map(values.map((value, column) => [String.fromCharCode(65 + column), { value }])));
+  });
+
+  return {
+    roomCode, roomName, date,
+    sheet: { name: `API-${roomCode}`, rows, images: new Map() },
+  };
+}
+
+function validateFixedScheduleText(text) {
+  const parsed = parseFixedScheduleText(text);
+  const result = validateWorkbook([parsed.sheet]);
+  const warnings = result.warnings.filter((warning) => warning.field !== "主播照片");
+  warnings.push({
+    sheet: parsed.sheet.name, row: "", field: "主播照片",
+    message: "文本接口不上传照片；相同时段和主播的既有照片会保留，新增或更换主播请通过 Excel 上传照片",
+  });
+  return { ...parsed, result, warnings };
+}
+
+function calendarDayOffset(date, offset) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + offset);
+  return value.toISOString().slice(0, 10);
+}
+
 function currentShanghaiDay() {
   const today = shanghaiDate(new Date());
   const yesterday = new Date(`${today}T00:00:00+08:00`);
@@ -402,6 +520,107 @@ async function handle(request, response) {
     if (!room) return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(room.code, date).map(publicSlot);
     return json(response, 200, { date, schedule });
+  }
+
+  if (request.method === "POST" && ["/api/v1/integrations/schedule-text/preview", "/api/v1/integrations/schedule-text/commit"].includes(pathname)) {
+    const token = requireIntegrationToken(request, response);
+    if (!token) return;
+    let input;
+    try { input = await readJson(request); } catch (cause) {
+      return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input)) return error(response, 400, "INVALID_REQUEST", "请求正文必须是 JSON 对象");
+    if (typeof input.text !== "string") return error(response, 400, "TEXT_REQUIRED", "请在 text 字段中提供排班文本");
+
+    let parsed;
+    try { parsed = validateFixedScheduleText(input.text); } catch (cause) {
+      return error(response, 422, "TEXT_FORMAT_INVALID", cause.message, cause.details ?? []);
+    }
+    const { result } = parsed;
+    const slotCount = result.rooms.reduce((count, room) => count + room.slots.length, 0);
+    if (result.errors.length) {
+      return json(response, 422, {
+        ok: false, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+        scheduleCount: slotCount, errors: result.errors, warnings: parsed.warnings,
+      });
+    }
+
+    const slots = result.rooms[0].slots;
+    const adjacentSlots = db.prepare("SELECT date,start_time,end_time,starts_at,ends_at FROM slots WHERE room_code=? AND date IN (?,?)")
+      .all(parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1));
+    const boundaryConflicts = slots.flatMap((slot, index) => adjacentSlots
+      .filter((existing) => slot.startAt < existing.ends_at && existing.starts_at < slot.endAt)
+      .map((existing) => ({
+        sheet: parsed.sheet.name, row: index + 4, field: "排班时间",
+        message: `与相邻日期 ${existing.date} ${existing.start_time}-${existing.end_time} 的现有排班重叠`,
+      })));
+    if (boundaryConflicts.length) {
+      return json(response, 422, {
+        ok: false, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+        scheduleCount: slots.length, errors: boundaryConflicts, warnings: parsed.warnings,
+      });
+    }
+    const existingCount = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
+    if (pathname.endsWith("/preview")) {
+      return json(response, 200, {
+        ok: true,
+        preview: {
+          roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+          replacingSlots: existingCount, scheduleCount: slots.length,
+          schedule: slots.map((slot) => ({
+            start: slot.start, end: slot.end, director: slot.director, host: slot.host,
+            assistant: slot.assistant, featuredProducts: slot.products,
+            salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
+          })),
+          warnings: parsed.warnings,
+        },
+      });
+    }
+    if (input.confirmReplace !== true) {
+      return error(response, 409, "REPLACEMENT_CONFIRMATION_REQUIRED", "提交前请先预览内容，并在用户确认后设置 confirmReplace=true");
+    }
+
+    const existingRoom = db.prepare("SELECT sort_order FROM rooms WHERE code=?").get(parsed.roomCode);
+    const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
+    const previousByKey = new Map(previousSlots.map((slot) => [
+      `${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`,
+      slot,
+    ]));
+    let preservedPhotos = 0;
+    const updateAt = new Date().toISOString();
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      if (existingRoom) {
+        db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?").run(parsed.roomName, "API 文本更新", parsed.roomCode);
+      } else {
+        const order = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
+        db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(parsed.roomCode, parsed.roomName, "API 文本更新", order);
+      }
+      db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+      const insertSlot = db.prepare(`INSERT INTO slots(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
+        products_json,sales_target_cents,notes,photo_type,photo_blob
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const slot of slots) {
+        const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
+        if (previous?.photo_blob) preservedPhotos += 1;
+        insertSlot.run(
+          previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
+          slot.director, slot.host, slot.assistant, JSON.stringify(slot.products),
+          slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
+        );
+      }
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
+      db.exec("COMMIT");
+    } catch (cause) {
+      try { db.exec("ROLLBACK"); } catch {}
+      console.error("API 排班更新失败:", cause.message);
+      return error(response, 500, "SCHEDULE_UPDATE_FAILED", "更新失败，现有排班数据已保留");
+    }
+    return json(response, 200, {
+      ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
+      scheduleCount: slots.length, preservedPhotos, warnings: parsed.warnings, dataUpdatedAt: updateAt,
+    });
   }
 
   if (request.method === "POST" && pathname === "/api/v1/admin/schedule-upload") {

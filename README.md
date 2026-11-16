@@ -2,7 +2,7 @@
 
 面向直播间门口电子屏的登录式网页程序。管理员上传包含多个工作表的 `.xlsx` 排班工作簿；每个工作表对应一个直播间。普通用户登录后选择直播间，页面按排班时间自动更新岗位、主播照片、主推商品和目标销售额。
 
-第一版包含前端展示、登录与角色权限、管理员工作台、Excel 工作簿校验与原子更新、受登录保护的主播照片读取，以及按上海时区自动切换。当前已部署至临时测试环境（Node.js 24、Nginx 与 Cloudflare Quick Tunnel）；正式域名和长期生产配置尚未完成。
+当前版本包含前端展示、登录与角色权限、Excel 工作簿校验与原子更新、受登录保护的主播照片读取、按上海时区自动切换，以及供 Codex、WorkBuddy 等 Harness 调用的固定格式文本 API。生产入口为 `https://douyin.sohodigital.top`。
 
 ## 本地运行
 
@@ -39,7 +39,10 @@ npm run start
 - `server.mjs`：登录会话、角色鉴权、展示接口、图片访问、上传处理和 SQLite 持久化。
 - `server/xlsx.mjs`：`.xlsx` 工作簿、工作表和锚定照片读取及限制。
 - `scripts/create-user.mjs`：在部署环境中创建管理员或普通用户账号。
+- `scripts/create-api-token.mjs` / `scripts/revoke-api-token.mjs`：创建或撤销 Harness API 密钥。
 - `docs/功能蓝图.md`：产品角色、Excel 约定和业务规则。
 - `docs/后端开发文档.md`：已落地实现、接口与部署说明。
+- `docs/harness-api.md`：自然语言转固定格式文本及 API 调用流程。
+- `docs/harness-openapi.yaml`：Harness 可导入的 OpenAPI 描述。
 
 `src/rooms.json` 和单文件 HTML 导出演示只含合成样例；正式网页读取已登录用户可访问的服务器数据。

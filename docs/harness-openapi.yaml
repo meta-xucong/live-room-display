@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: 直播间信息牌 Harness API
+  version: 1.0.0
+  description: 通过固定格式文本预览并更新一个直播间某一天的完整排班。
+servers:
+  - url: https://douyin.sohodigital.top
+security:
+  - BearerToken: []
+paths:
+  /api/v1/integrations/schedule-text/preview:
+    post:
+      operationId: previewRoomScheduleText
+      summary: 校验并预览排班文本
+      description: 不写入数据。返回目标直播间、日期、替换数量、排班内容和警告。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleTextRequest'
+      responses:
+        '200':
+          description: 预览成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreviewResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/integrations/schedule-text/commit:
+    post:
+      operationId: commitRoomScheduleText
+      summary: 提交已确认的排班文本
+      description: confirmReplace 必须为 true；仅替换该直播间该日期的排班。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleTextCommitRequest'
+      responses:
+        '200':
+          description: 排班已更新
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, roomCode, roomName, date, scheduleCount, preservedPhotos, dataUpdatedAt]
+                properties:
+                  ok: { type: boolean, const: true }
+                  roomCode: { type: string }
+                  roomName: { type: string }
+                  date: { type: string, format: date }
+                  scheduleCount: { type: integer }
+                  preservedPhotos: { type: integer }
+                  dataUpdatedAt: { type: string, format: date-time }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: 未显式确认替换
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+components:
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: lrd_live_<random>
+  schemas:
+    ScheduleTextRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 60000
+          description: 按接入指南中的中文字段模板填写，最多 100 个时段。
+    ScheduleTextCommitRequest:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleTextRequest'
+        - type: object
+          required: [confirmReplace]
+          properties:
+            confirmReplace:
+              type: boolean
+              const: true
+    PreviewResponse:
+      type: object
+      required: [ok, preview]
+      properties:
+        ok: { type: boolean, const: true }
+        preview:
+          type: object
+          required: [roomCode, roomName, date, replacingSlots, scheduleCount, schedule, warnings]
+          properties:
+            roomCode: { type: string }
+            roomName: { type: string }
+            date: { type: string, format: date }
+            replacingSlots: { type: integer }
+            scheduleCount: { type: integer }
+            schedule:
+              type: array
+              items:
+                type: object
+                properties:
+                  start: { type: string }
+                  end: { type: string }
+                  director: { type: string }
+                  host: { type: string }
+                  assistant: { type: string }
+                  featuredProducts: { type: array, items: { type: string } }
+                  salesTarget: { type: string }
+                  notes: { type: string }
+            warnings:
+              type: array
+              items: { type: object }
+  responses:
+    Unauthorized:
+      description: API 密钥无效或已撤销
+    ValidationFailed:
+      description: 文本格式或排班字段校验失败
+    RateLimited:
+      description: 单把密钥 10 分钟内调用次数过多
