@@ -72,7 +72,7 @@ function getProgram(room, timestamp) {
     : next?.startAt ?? null;
   return {
     current, next, display: current ?? next,
-    today: (room.schedule ?? []).filter((item) => item.date === today),
+    today: sessions.filter((item) => item.date === today),
     nextChangeAt,
   };
 }
@@ -1004,6 +1004,9 @@ export function App() {
     return { ...selected, schedule: displayData?.room?.id === roomId ? displayData.schedule : [] };
   }, [rooms, roomId, displayData]);
   const program = useMemo(() => getProgram(room, timestamp), [room, timestamp]);
+  const endedToday = program.today.filter((item) => item.endAt <= timestamp);
+  const upcomingToday = program.today.filter((item) => item.endAt > timestamp);
+  const endedScheduleKey = endedToday.map((item) => item.id ?? `${item.date}-${item.start}-${item.end}`).join("|");
   const displayed = program.display;
   const isLive = Boolean(program.current);
   const nowDate = new Date(timestamp);
@@ -1052,7 +1055,7 @@ export function App() {
             </div>
             {program.today.length ? (
               <ol className="schedule-list">
-                {program.today.map((item, index) => {
+                {upcomingToday.map((item, index) => {
                   const active = program.current?.id === item.id;
                   const next = program.next?.id === item.id;
                   return (
@@ -1063,6 +1066,22 @@ export function App() {
                     </li>
                   );
                 })}
+                {endedToday.length > 0 && (
+                  <li className="schedule-ended-group" key={`ended-${endedScheduleKey}`}>
+                    <details className="schedule-ended">
+                      <summary><span>已结束</span><span className="schedule-ended-count">{endedToday.length} 场</span></summary>
+                      <ol className="schedule-ended-list">
+                        {endedToday.map((item, index) => (
+                          <li className="schedule-item schedule-finished" key={item.id ?? `${item.date}-${item.start}-${item.end}-${index}`}>
+                            <span className="schedule-marker" />
+                            <div className="schedule-copy"><div className="schedule-time">{formatRange(item)}</div><div className="schedule-host">{item.host || "主播待安排"}</div></div>
+                            <span className="schedule-state">已结束</span>
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
+                  </li>
+                )}
               </ol>
             ) : (
               <div className="empty-schedule">{rooms.length ? "所选直播间今日暂无排班。" : "管理员尚未上传直播间排班。"}</div>

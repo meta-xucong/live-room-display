@@ -100,12 +100,21 @@ button { cursor: pointer; }
 .button-quiet:hover { background: #f8f4ec; }
 .live-actions { margin-top: 16px; }
 
-.schedule-card { height: auto; min-height: 0; display: flex; flex-direction: column; padding-bottom: 12px; }
+.schedule-card { height: 100%; min-height: 0; overflow: hidden; display: flex; flex-direction: column; padding-bottom: 12px; }
 .schedule-heading { align-items: center; margin-bottom: 7px; }
-.schedule-list { list-style: none; margin: 0; padding: 0; max-height: 272px; overflow-y: auto; }
-.schedule-card .schedule-list { min-height: 0; max-height: none; flex: 1; }
+.schedule-list { list-style: none; min-height: 0; margin: 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; }
+.schedule-card .schedule-list { max-height: none; flex: 1 1 0; }
 .schedule-item { position: relative; display: grid; grid-template-columns: 12px 1fr auto; align-items: center; gap: 8px; min-height: 51px; padding: 7px 8px; border-bottom: 1px solid #f0ebe3; border-radius: 5px; }
 .schedule-item:last-child { border-bottom-color: transparent; }
+.schedule-ended-group { padding-top: 5px; }
+.schedule-ended summary { display: flex; align-items: center; gap: 7px; min-height: 35px; padding: 0 9px; border: 1px solid rgba(142, 128, 108, .16); border-radius: 6px; background: rgba(245, 241, 233, .65); color: #626b78; font-size: 10px; cursor: pointer; list-style: none; }
+.schedule-ended summary::-webkit-details-marker { display: none; }
+.schedule-ended summary::before { content: "+"; width: 12px; color: #626b78; font-size: 14px; text-align: center; }
+.schedule-ended[open] summary::before { content: "−"; }
+.schedule-ended-count { margin-left: auto; color: #626b78; font-variant-numeric: tabular-nums; }
+.schedule-ended-list { list-style: none; margin: 3px 0 0; padding: 0 0 0 9px; }
+.schedule-finished { min-height: 46px; }
+.schedule-finished .schedule-time, .schedule-finished .schedule-host, .schedule-finished .schedule-state { color: #626b78; }
 .schedule-marker { width: 7px; height: 7px; border: 1.5px solid #c1b39e; border-radius: 50%; }
 .schedule-active { background: #f5efe4; }
 .schedule-active .schedule-marker { border-color: #ac8b55; background: #c8aa75; }
@@ -181,7 +190,8 @@ button { cursor: pointer; }
   .room-selector-inline select { flex: 1; width: auto; min-width: 0; }
   .workspace { width: calc(100% - 24px); height: auto; min-height: 0; gap: 12px; margin: 12px auto 24px; }
   .control-column { grid-template-columns: 1fr; grid-template-rows: none; grid-auto-rows: auto; gap: 10px; }
-  .clock-card, .schedule-card { height: auto; min-height: 280px; }
+  .clock-card { height: auto; min-height: 280px; }
+  .schedule-card { height: 326px; min-height: 326px; }
   .display-stage { grid-row: auto; min-height: 630px; aspect-ratio: auto; padding: 18px; grid-template-rows: 26px minmax(0, 1fr) auto; row-gap: 8px; }
   .stage-main { grid-template-columns: minmax(0, 1fr) 104px; grid-template-rows: auto 72px; align-content: center; align-items: center; gap: 8px 10px; padding: 4px 0; }
   .stage-copy { grid-template-rows: auto auto; align-content: center; gap: 4px; }
@@ -721,6 +731,12 @@ body { background: #edf2f7; }
 }
 :root[data-theme="dark"] .theme-toggle:hover { border-color: rgba(216, 182, 93, .58); background: rgba(216, 182, 93, .1); }
 :root[data-theme="dark"] .schedule-item { border-bottom-color: rgba(219, 227, 237, .09); }
+:root[data-theme="dark"] .schedule-ended summary { border-color: rgba(219, 227, 237, .12); background: rgba(255, 255, 255, .035); color: #aeb9c7; }
+:root[data-theme="dark"] .schedule-ended summary::before,
+:root[data-theme="dark"] .schedule-ended-count { color: #9aa7b6; }
+:root[data-theme="dark"] .schedule-finished .schedule-time,
+:root[data-theme="dark"] .schedule-finished .schedule-host,
+:root[data-theme="dark"] .schedule-finished .schedule-state { color: #8995a4; }
 :root[data-theme="dark"] .schedule-active { background: rgba(216, 182, 93, .11); }
 :root[data-theme="dark"] .schedule-marker { border-color: #697789; }
 :root[data-theme="dark"] .schedule-active .schedule-marker { border-color: var(--gold); background: var(--gold); }
