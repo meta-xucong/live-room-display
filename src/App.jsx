@@ -800,33 +800,45 @@ function AdminScheduleLibrary({ csrfToken }) {
 function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [activeTab, setActiveTab] = useState("schedule");
   const [file, setFile] = useState(null);
+  const [uploadMode, setUploadMode] = useState("single");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
+  const [preview, setPreview] = useState(null);
   const [message, setMessage] = useState("");
-  async function upload(event) {
-    event.preventDefault();
+  async function upload(action, event) {
+    event?.preventDefault();
     if (!file || busy) return;
     setBusy(true);
     setMessage("");
     setResult(null);
     const form = new FormData();
     form.append("file", file);
+    const params = new URLSearchParams({ action, mode: uploadMode });
+    if (action === "commit" && typeof preview?.dataUpdatedAt === "string") params.set("expectedDataUpdatedAt", preview.dataUpdatedAt);
     try {
-      const response = await fetch("/api/v1/admin/schedule-upload", {
+      const response = await fetch(`/api/v1/admin/schedule-upload?${params}`, {
         method: "POST", credentials: "same-origin", headers: { "x-csrf-token": csrfToken }, body: form,
       });
       const body = await response.json();
       setResult(body);
-      if (response.ok) setMessage("工作簿已更新，展示页将在 30 秒内同步新排班。");
-      else if (body.error) setMessage(body.error.message);
-      else setMessage(`发现 ${body.errors?.length ?? 0} 项需要修正，现有数据未更改。`);
+      if (response.ok && action === "preview") {
+        setPreview(body);
+        setMessage("预览已生成，当前数据未更改。核对后点击“确认并更新”。");
+      } else if (response.ok) {
+        setPreview(null);
+        setMessage(`已更新 ${body.roomCount} 个工作表中的 ${body.scheduleCount} 场排班；未包含的直播间和日期保持不变。展示页将在 30 秒内同步。`);
+      } else {
+        setPreview(null);
+        setMessage(body.error?.message ?? `发现 ${body.errors?.length ?? 0} 项需要修正，现有数据未更改。`);
+      }
     } catch {
+      setPreview(null);
       setMessage("上传未完成，请检查网络连接后重试。现有数据保持不变。");
     } finally {
       setBusy(false);
     }
   }
-  const problems = result?.errors ?? [];
+  const problems = result?.errors ?? result?.error?.details ?? [];
   const warnings = result?.warnings ?? [];
   return (
     <div className="admin-shell">
@@ -843,7 +855,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <section className="admin-hero">
           <div className="section-kicker">DATA MANAGEMENT</div>
           <h1>排班信息管理</h1>
-          <p>每个工作表对应一个直播间。上传完整工作簿后，系统会先校验所有工作表，再一次性更新展示数据。<a className="template-link" href="/live-room-schedule-template.xlsx" download>下载空白模板</a></p>
+          <p>支持单个直播间工作表或 27 个直播间总表。只更新文件中出现的直播间和排班日期；其他日期及直播间保持不变。<a className="template-link" href="/live-room-schedule-template.xlsx" download>下载空白模板</a></p>
         </section>
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
@@ -855,23 +867,51 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <section className="admin-card" role="tabpanel">
           <div className="admin-card-heading">
             <div className="admin-icon">↥</div>
-            <div><h2>导入直播间排班</h2><p>支持 Excel 工作簿（.xlsx）和嵌入式 JPG、PNG 主播照片</p></div>
+            <div><h2>导入直播间排班</h2><p>支持 .xlsx 工作簿和嵌入式 JPG、PNG 主播照片；提交前会显示变更预览</p></div>
           </div>
-          <form className="upload-form" onSubmit={upload}>
+          <div className="upload-mode-picker" role="radiogroup" aria-label="上传范围">
+            <label className={uploadMode === "single" ? "selected" : ""}>
+              <input type="radio" name="uploadMode" value="single" checked={uploadMode === "single"} disabled={busy} onChange={() => { setUploadMode("single"); setPreview(null); setResult(null); setMessage(""); }} />
+              <span><strong>单个直播间</strong><small>工作簿只放 1 个工作表</small></span>
+            </label>
+            <label className={uploadMode === "master" ? "selected" : ""}>
+              <input type="radio" name="uploadMode" value="master" checked={uploadMode === "master"} disabled={busy} onChange={() => { setUploadMode("master"); setPreview(null); setResult(null); setMessage(""); }} />
+              <span><strong>27 个直播间总表</strong><small>工作簿必须包含 27 个工作表</small></span>
+            </label>
+          </div>
+          <form className="upload-form" onSubmit={(event) => upload("preview", event)}>
             <label className={`upload-dropzone${file ? " upload-selected" : ""}`} htmlFor="workbook-file">
               <span className="upload-glyph">⌁</span>
               <strong>{file ? file.name : "选择排班工作簿"}</strong>
               <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换` : "点击选择 .xlsx 文件，文件最大 30 MB"}</small>
-              <input id="workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
+              <input id="workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={busy} onChange={(event) => { setFile(event.target.files?.[0] ?? null); setPreview(null); setResult(null); setMessage(""); }} />
             </label>
-            <button className="button-primary upload-button" type="submit" disabled={!file || busy}>{busy ? "正在校验并导入…" : "校验并更新排班"}</button>
+            <button className="button-primary upload-button" type="submit" disabled={!file || busy}>{busy ? "正在校验工作簿…" : "校验并预览"}</button>
           </form>
           {message && <div className={`form-message${problems.length ? " form-error" : result?.ok ? " form-success" : ""}`} role="status">{message}</div>}
-          {result?.ok && <div className="import-summary"><span><strong>{result.roomCount}</strong> 个直播间</span><span><strong>{result.scheduleCount}</strong> 场排班</span><span>更新时间 <strong>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(result.dataUpdatedAt))}</strong></span></div>}
+          {preview && (
+            <section className="upload-preview" aria-label="排班导入预览">
+              <h3>导入预览（尚未写入）</h3>
+              <div className="import-summary"><span><strong>{preview.roomCount}</strong> 个工作表</span><span><strong>{preview.addedRoomCount}</strong> 个新增直播间</span><span><strong>{preview.dateCount}</strong> 个排班日期</span><span><strong>{preview.scheduleCount}</strong> 场排班</span><span>更新后共 <strong>{preview.totalRoomCount}</strong> 个直播间</span></div>
+              <p>只有上面列出的直播间和日期会更新；未列出的现有直播间及日期保持不变。</p>
+              <ul className="upload-preview-list">{preview.rooms.map((room) => (
+                <li key={room.code}>
+                  <strong>{room.code} · {room.name}</strong>
+                  <span>{room.action}{room.nameChanged ? ` · 名称由“${room.previousName}”改为“${room.name}”` : ""} · {room.dateCount ? `${room.dateCount} 个日期、${room.scheduleCount} 场` : room.action === "新增" ? "新增空排班直播间" : "不改动现有排班"}</span>
+                  {room.dates.length > 0 && <small>{room.dates.map((date) => `${date.date}（${date.replacingSlots} → ${date.scheduleCount} 场）`).join("；")}</small>}
+                </li>
+              ))}</ul>
+              <div className="upload-preview-actions">
+                <button className="button-primary upload-button" type="button" disabled={busy} onClick={() => upload("commit")}>{busy ? "正在更新…" : "确认并更新"}</button>
+                <button className="avatar-secondary-button" type="button" disabled={busy} onClick={() => { setPreview(null); setResult(null); setMessage("已取消本次导入。"); }}>取消</button>
+              </div>
+            </section>
+          )}
+          {result?.ok && !preview && <div className="import-summary"><span><strong>{result.roomCount}</strong> 个工作表已更新</span><span><strong>{result.totalRoomCount}</strong> 个直播间</span><span><strong>{result.scheduleCount}</strong> 场排班</span><span>更新时间 <strong>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(result.dataUpdatedAt))}</strong></span></div>}
           {problems.length > 0 && <div className="issue-list"><h3>需要修正的内容 <span>{problems.length}</span></h3>{problems.map((issue, index) => <div className="issue-row" key={`${issue.sheet}-${issue.row}-${index}`}><span>{issue.sheet || "工作簿"}</span><span>{issue.row ? `第 ${issue.row} 行 · ` : ""}{issue.field}</span><strong>{issue.message}</strong></div>)}</div>}
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
-        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿任一直播间存在错误时，本次导入不会改变正在展示的数据。主播照片可在“主播头像库”集中维护；排班 Excel 中已有的行内照片仍会兼容显示。新主播首次导入时，如果每场照片一致，系统会自动收录到头像库。</p></div></aside>
+        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿中出现排班记录的日期会替换该直播间当天的完整时段；未出现的日期不变。任何工作表校验失败都会阻止整次提交。主播照片可在“主播头像库”集中维护；相同时段和主播未重新附图时会保留原照片。</p></div></aside>
         </> : activeTab === "records" ? <AdminScheduleLibrary csrfToken={csrfToken} /> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>

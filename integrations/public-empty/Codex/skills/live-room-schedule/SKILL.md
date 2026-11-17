@@ -1,6 +1,6 @@
 ---
 name: live-room-schedule
-description: Use the live room display MCP tools to view rooms and schedules or update a room's complete day schedule from natural language.
+description: Use the live room display MCP tools to view rooms and schedules or update one room's complete day or multi-day schedules from natural language.
 ---
 
 # 直播间排班助手
@@ -16,11 +16,11 @@ description: Use the live room display MCP tools to view rooms and schedules or 
 
 ## 修改排班
 
-1. 一个请求针对一个直播间和一个日期，并且需要包含这一天的全部时段，因为提交会替换该直播间该日期的完整排班。
+1. 一个请求只处理一个直播间。单日更新必须包含这一天的全部时段；同一直播间多日更新时，每个日期也必须包含当天全部时段。MCP 不接收 Excel 附件；应将用户提供的排班整理为工具所需的结构化数据。
 2. 缺少直播间编号、日期或任何时段边界时，先用普通语言向用户询问。可按上海时区将“今天/明天”等明确相对日期换算为日期，并在预览中展示；不得推断、补造时段或人员。
 3. 把主推商品拆分为商品名称列表；保留用户给出的目标销售额、岗位人员和备注。
-4. 调用 `preview_schedule_update`，向用户清楚列出直播间、日期、将替换的时段数、每个时段的岗位人员、商品和目标销售额，以及校验警告。
-5. 等待用户明确确认。只有用户明确表示同意这份已展示的预览后，才调用 `commit_schedule_update`，并且只传入刚才返回的 `previewId`。
+4. 单日调用 `preview_schedule_update`；同一直播间多日调用 `preview_room_schedules_update`。向用户逐日列出直播间、日期、将替换的时段数、完整排班及校验警告。
+5. 等待用户明确确认整份预览。只有用户明确同意后，才调用 `commit_schedule_update`，并且只传入刚才返回的 `previewId`。
 6. 预览编号仅对创建它的凭证有效，10 分钟后过期；任何排班数据更新都会让它失效。失效时重新预览并再次取得用户确认。
 7. 提交后报告更新结果。如果用户需要新增或更换主播头像，提示管理员在网页的“主播头像库”上传或更换；后续排班按主播姓名自动关联头像。
 
