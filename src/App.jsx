@@ -49,6 +49,14 @@ function atTime(date, time) {
   return new Date(`${date}T${time}:00+08:00`).getTime();
 }
 
+function scheduleHasEnded(group, slot, timestamp) {
+  const startAt = atTime(group.date, slot.start);
+  let endAt = atTime(group.date, slot.end);
+  if (!Number.isFinite(startAt) || !Number.isFinite(endAt)) return false;
+  if (endAt <= startAt) endAt += 24 * 60 * 60 * 1000;
+  return endAt <= timestamp;
+}
+
 function getProgram(room, timestamp) {
   if (!room) return { current: null, next: null, display: null, today: [], nextChangeAt: null };
   const today = dateKey(new Date(timestamp));
@@ -574,6 +582,7 @@ function McpKeyManager({ csrfToken }) {
 
 function AdminScheduleLibrary({ csrfToken }) {
   const [data, setData] = useState(null);
+  const [now, setNow] = useState(() => Date.now());
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [roomFilter, setRoomFilter] = useState("all");
@@ -599,7 +608,17 @@ function AdminScheduleLibrary({ csrfToken }) {
 
   useEffect(() => { loadSchedules(); }, [loadSchedules]);
 
-  const visibleGroups = useMemo(() => {
+  useEffect(() => {
+    const updateNow = () => setNow(Date.now());
+    const interval = window.setInterval(updateNow, 15_000);
+    document.addEventListener("visibilitychange", updateNow);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", updateNow);
+    };
+  }, []);
+
+  const filteredGroups = useMemo(() => {
     const query = search.trim().toLocaleLowerCase("zh-CN");
     return (data?.groups ?? []).flatMap((group) => {
       if (roomFilter !== "all" && group.roomCode !== roomFilter) return [];
@@ -611,6 +630,20 @@ function AdminScheduleLibrary({ csrfToken }) {
       return slots.length ? [{ ...group, slots }] : [];
     });
   }, [data, dateFilter, roomFilter, search]);
+
+  const { activeGroups, archivedGroups } = useMemo(() => filteredGroups.reduce((result, group) => {
+    const activeSlots = [];
+    const archivedSlots = [];
+    for (const slot of group.slots) {
+      (scheduleHasEnded(group, slot, now) ? archivedSlots : activeSlots).push(slot);
+    }
+    if (activeSlots.length) result.activeGroups.push({ ...group, slots: activeSlots });
+    if (archivedSlots.length) result.archivedGroups.push({ ...group, slots: archivedSlots });
+    return result;
+  }, { activeGroups: [], archivedGroups: [] }), [filteredGroups, now]);
+
+  const filteredCount = filteredGroups.reduce((count, group) => count + group.slots.length, 0);
+  const archivedCount = archivedGroups.reduce((count, group) => count + group.slots.length, 0);
 
   function beginEdit(group, slot) {
     const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
@@ -630,6 +663,47 @@ function AdminScheduleLibrary({ csrfToken }) {
 
   function updateEdit(field, value) {
     setEditValues((current) => ({ ...current, [field]: value }));
+  }
+
+  function renderGroup(group) {
+    return (
+      <article className="schedule-group" key={`${group.roomCode}-${group.date}`}>
+        <header className="schedule-group-heading"><div><h3>{group.roomName}</h3><time>{group.date}</time></div><span>{group.slots.length} 场</span></header>
+        <div className="schedule-table-wrap">
+          <table className="schedule-table">
+            <thead><tr><th>时段</th><th>导演</th><th>主播</th><th>助播</th><th>主推商品</th><th>目标销售额</th><th>头像</th><th>备注</th><th>操作</th></tr></thead>
+            <tbody>{group.slots.map((slot) => {
+              const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
+              const isEditing = editing?.key === key;
+              return isEditing ? (
+                <tr className="schedule-edit-row" key={slot.id}>
+                  <td colSpan="9">
+                    <form className="schedule-edit-form" onSubmit={(event) => saveEdit(event, group, slot)}>
+                      <label>开始时间<input type="time" value={editValues.start} onChange={(event) => updateEdit("start", event.target.value)} required /></label>
+                      <label>结束时间<input type="time" value={editValues.end} onChange={(event) => updateEdit("end", event.target.value)} required /></label>
+                      <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
+                      <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
+                      <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
+                      <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
+                      <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
+                      <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
+                      <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>
+                    </form>
+                  </td>
+                </tr>
+              ) : (
+                <tr key={slot.id}>
+                  <td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
+                  <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td>{slot.salesTarget || "—"}</td>
+                  <td><span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span></td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
+                  <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        </div>
+      </article>
+    );
   }
 
   function cancelEdit() {
@@ -700,52 +774,25 @@ function AdminScheduleLibrary({ csrfToken }) {
         <label>直播间<select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}><option value="all">全部直播间</option>{(data?.rooms ?? []).map((room) => <option key={room.code} value={room.code}>{room.name}</option>)}</select></label>
         <label>排班日期<input type="date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} /></label>
         <label className="schedule-search">搜索主播、商品或备注<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入关键词" /></label>
-        <div className="schedule-library-count">{loading ? "读取中…" : `共 ${data?.scheduleCount ?? 0} 场 · 当前显示 ${visibleGroups.reduce((count, group) => count + group.slots.length, 0)} 场`}</div>
+        <div className="schedule-library-count">{loading && !data ? "读取中…" : `共 ${data?.scheduleCount ?? 0} 场 · 当前筛选 ${filteredCount} 场 · 已归档 ${archivedCount} 场`}</div>
       </div>
 
       {message && <div className={`form-message${messageType === "error" ? " form-error" : " form-success"}`} role={messageType === "error" ? "alert" : "status"}>{message}</div>}
       {loadError && <div className="form-message form-error" role="alert">读取排班失败：{loadError}</div>}
       {loading && !data ? <div className="schedule-library-empty">正在读取已录入的排班…</div> : null}
-      {!loading && !loadError && visibleGroups.length === 0 && <div className="schedule-library-empty">没有符合条件的排班记录。</div>}
+      {!loading && !loadError && filteredCount === 0 && <div className="schedule-library-empty">没有符合条件的排班记录。</div>}
+      {!loading && !loadError && filteredCount > 0 && activeGroups.length === 0 && <div className="schedule-library-empty">当前筛选下的排班都已归档，请展开下方“已归档”查看。</div>}
 
-      {visibleGroups.map((group) => (
-        <article className="schedule-group" key={`${group.roomCode}-${group.date}`}>
-          <header className="schedule-group-heading"><div><h3>{group.roomName}</h3><time>{group.date}</time></div><span>{group.slots.length} 场</span></header>
-          <div className="schedule-table-wrap">
-            <table className="schedule-table">
-              <thead><tr><th>时段</th><th>导演</th><th>主播</th><th>助播</th><th>主推商品</th><th>目标销售额</th><th>头像</th><th>备注</th><th>操作</th></tr></thead>
-              <tbody>{group.slots.map((slot) => {
-                const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
-                const isEditing = editing?.key === key;
-                return isEditing ? (
-                  <tr className="schedule-edit-row" key={slot.id}>
-                    <td colSpan="9">
-                      <form className="schedule-edit-form" onSubmit={(event) => saveEdit(event, group, slot)}>
-                        <label>开始时间<input type="time" value={editValues.start} onChange={(event) => updateEdit("start", event.target.value)} required /></label>
-                        <label>结束时间<input type="time" value={editValues.end} onChange={(event) => updateEdit("end", event.target.value)} required /></label>
-                        <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
-                        <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
-                        <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
-                        <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
-                        <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
-                        <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
-                        <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>
-                      </form>
-                    </td>
-                  </tr>
-                ) : (
-                  <tr key={slot.id}>
-                    <td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
-                    <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td>{slot.salesTarget || "—"}</td>
-                    <td><span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span></td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
-                    <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
-                  </tr>
-                );
-              })}</tbody>
-            </table>
+      {activeGroups.map(renderGroup)}
+
+      {!loading && !loadError && data && (
+        <details className="schedule-archive">
+          <summary><span className="schedule-archive-title">已归档</span><span className="schedule-archive-count">{archivedCount} 场</span></summary>
+          <div className="schedule-archive-content">
+            {archivedGroups.length ? archivedGroups.map(renderGroup) : <div className="schedule-archive-empty">当前筛选下没有已结束的排班。</div>}
           </div>
-        </article>
-      ))}
+        </details>
+      )}
     </section>
   );
 }
@@ -1004,9 +1051,6 @@ export function App() {
     return { ...selected, schedule: displayData?.room?.id === roomId ? displayData.schedule : [] };
   }, [rooms, roomId, displayData]);
   const program = useMemo(() => getProgram(room, timestamp), [room, timestamp]);
-  const endedToday = program.today.filter((item) => item.endAt <= timestamp);
-  const upcomingToday = program.today.filter((item) => item.endAt > timestamp);
-  const endedScheduleKey = endedToday.map((item) => item.id ?? `${item.date}-${item.start}-${item.end}`).join("|");
   const displayed = program.display;
   const isLive = Boolean(program.current);
   const nowDate = new Date(timestamp);
@@ -1055,7 +1099,7 @@ export function App() {
             </div>
             {program.today.length ? (
               <ol className="schedule-list">
-                {upcomingToday.map((item, index) => {
+                {program.today.map((item, index) => {
                   const active = program.current?.id === item.id;
                   const next = program.next?.id === item.id;
                   return (
@@ -1066,22 +1110,6 @@ export function App() {
                     </li>
                   );
                 })}
-                {endedToday.length > 0 && (
-                  <li className="schedule-ended-group" key={`ended-${endedScheduleKey}`}>
-                    <details className="schedule-ended">
-                      <summary><span>已结束</span><span className="schedule-ended-count">{endedToday.length} 场</span></summary>
-                      <ol className="schedule-ended-list">
-                        {endedToday.map((item, index) => (
-                          <li className="schedule-item schedule-finished" key={item.id ?? `${item.date}-${item.start}-${item.end}-${index}`}>
-                            <span className="schedule-marker" />
-                            <div className="schedule-copy"><div className="schedule-time">{formatRange(item)}</div><div className="schedule-host">{item.host || "主播待安排"}</div></div>
-                            <span className="schedule-state">已结束</span>
-                          </li>
-                        ))}
-                      </ol>
-                    </details>
-                  </li>
-                )}
               </ol>
             ) : (
               <div className="empty-schedule">{rooms.length ? "所选直播间今日暂无排班。" : "管理员尚未上传直播间排班。"}</div>
