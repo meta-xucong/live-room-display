@@ -40,12 +40,12 @@
     return result.getTime();
   }
 
-  function getProgram(room, timestamp) {
+  function getProgram(items, timestamp) {
     const todayKey = dateKey(new Date(timestamp));
     const yesterdayDate = new Date(timestamp);
     yesterdayDate.setDate(yesterdayDate.getDate() - 1);
     const yesterdayKey = dateKey(yesterdayDate);
-    const sessions = room.schedule
+    const sessions = (items ?? [])
       .filter((item) => item.date === todayKey || item.date === yesterdayKey)
       .map((item) => {
         const startAt = atTime(item.date, item.start);
@@ -60,7 +60,7 @@
       current,
       next,
       display: current ?? next,
-      today: room.schedule.filter((item) => item.date === todayKey),
+      today: sessions.filter((item) => item.date === todayKey),
       nextChangeAt: current ? Math.min(current.endAt, next?.startAt ?? current.endAt) : next?.startAt ?? null,
     };
   }
@@ -81,8 +81,8 @@
     return item ? `${item.start}–${item.end}` : "—";
   }
 
-  function roleCard(label, name, featured) {
-    return `<section class="role-card${featured ? " role-card-featured" : ""}"><div class="role-label">${label}</div><div class="role-name">${escapeHtml(name || "待安排")}</div></section>`;
+  function roleCard(label, name, featured, time) {
+    return `<section class="role-card${featured ? " role-card-featured" : ""}"><div class="role-label">${label}</div><div class="role-name">${escapeHtml(name || "待安排")}</div><div class="role-time">${escapeHtml(time || "")}</div></section>`;
   }
 
   function merchandisingInfo(products, salesTarget) {
@@ -97,19 +97,21 @@
     const room = rooms.find((item) => item.id === state.roomId) ?? rooms[0];
     if (!room) return;
     const timestamp = state.clockMode === "live" ? state.realTime : new Date(state.previewAt).getTime();
-    const program = getProgram(room, timestamp);
+    const program = getProgram(room.schedule, timestamp);
+    const directorProgram = getProgram(room.directorShifts, timestamp);
     const displayed = program.display;
+    const displayedDirector = directorProgram.display;
     const isLive = Boolean(program.current);
     const nowDate = new Date(timestamp);
-    const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : "暂无排班";
+    const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : displayedDirector ? "导演已排班" : "暂无排班";
     const options = rooms.map((item) => `<option value="${escapeHtml(item.id)}"${item.id === room.id ? " selected" : ""}>${escapeHtml(item.id)}号直播间 · ${escapeHtml(item.name)}</option>`).join("");
     const scheduleRows = program.today.map((item) => {
       const active = program.current?.date === item.date && program.current?.start === item.start && program.current?.end === item.end;
       const next = program.next?.date === item.date && program.next?.start === item.start && program.next?.end === item.end;
       return `<li class="schedule-item${active ? " schedule-active" : ""}${next ? " schedule-next" : ""}"><span class="schedule-marker"></span><div class="schedule-copy"><div class="schedule-time">${escapeHtml(formatRange(item))}</div><div class="schedule-host">${escapeHtml(item.host || "主播待安排")}</div></div><span class="schedule-state">${active ? "当前" : next ? "下一场" : ""}</span></li>`;
     }).join("");
-    const roles = displayed
-      ? `<div class="role-grid">${roleCard("导演", displayed.director, false)}${roleCard("主播", displayed.host, true)}${roleCard("助播", displayed.assistant, false)}</div>`
+    const roles = displayed || displayedDirector
+      ? `<div class="role-grid">${roleCard("导演", displayedDirector?.director, false, displayedDirector ? `${directorProgram.current ? "当前" : "下一场"} · ${formatRange(displayedDirector)}` : "暂无导演排班")}${roleCard("主播", displayed?.host, true, displayed ? `${program.current ? "当前" : "下一场"} · ${formatRange(displayed)}` : "暂无主播排班")}${roleCard("助播", displayed?.assistant, false, displayed ? formatRange(displayed) : "随主播排班")}</div>`
       : `<div class="no-session">当前没有可展示的排班</div>`;
     const merchandise = merchandisingInfo(displayed?.featuredProducts, displayed?.salesTarget);
     const portrait = displayed?.photo
@@ -124,11 +126,11 @@
       <main class="workspace">
         <aside class="control-column">
           <section class="control-card clock-card"><div class="section-heading"><div><div class="section-kicker">CLOCK</div><h2>时间预览</h2></div><span class="mode-pill${state.clockMode === "live" ? " mode-live" : ""}">${state.clockMode === "live" ? "实时" : "演示"}</span></div><div class="clock-current">${formatClock(nowDate)}</div><div class="clock-date">${formatDate(nowDate)}</div>${clockControls}</section>
-          <section class="control-card schedule-card"><div class="section-heading schedule-heading"><div><div class="section-kicker">TODAY</div><h2>当日排班</h2></div><span class="schedule-count">${program.today.length} 场</span></div>${program.today.length ? `<ol class="schedule-list">${scheduleRows}</ol>` : `<div class="empty-schedule">所选日期没有排班。</div>`}</section>
+          <section class="control-card schedule-card"><div class="section-heading schedule-heading"><div><div class="section-kicker">TODAY</div><h2>主播排班</h2></div><span class="schedule-count">${program.today.length} 场</span></div>${program.today.length ? `<ol class="schedule-list">${scheduleRows}</ol>` : `<div class="empty-schedule">所选日期没有主播排班。</div>`}</section>
         </aside>
         <section class="display-stage" aria-label="直播间门口电子屏预览">
           <div class="stage-topline"><span>直播间现场信息</span><span class="live-pill${isLive ? " live-pill-on" : " live-pill-next"}"><span class="live-dot"></span>${statusText}</span></div>
-          <div class="stage-main"><div class="stage-copy"><div class="room-heading"><div class="room-id-line">${escapeHtml(room.id)}<span>号直播间</span></div><h1>${escapeHtml(room.name)}</h1></div><div class="stage-period"><div class="stage-date">${formatDate(nowDate)}</div><div class="time-strip"><span class="time-strip-label">${isLive ? "当前时段" : displayed ? "即将开始" : "排班时段"}</span><span class="time-strip-range">${escapeHtml(formatRange(displayed))}</span></div></div></div><div class="portrait-frame">${portrait}</div>${roles}</div>
+          <div class="stage-main"><div class="stage-copy"><div class="room-heading"><div class="room-id-line">${escapeHtml(room.id)}<span>号直播间</span></div><h1>${escapeHtml(room.name)}</h1></div><div class="stage-period"><div class="stage-date">${formatDate(nowDate)}</div><div class="time-strip"><span class="time-strip-label">${isLive ? "主播时段" : displayed ? "下一主播时段" : "主播排班"}</span><span class="time-strip-range">${escapeHtml(formatRange(displayed))}</span></div></div></div><div class="portrait-frame">${portrait}</div>${roles}</div>
           ${merchandise}
         </section>
       </main>

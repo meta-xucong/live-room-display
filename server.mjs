@@ -41,6 +41,13 @@ db.exec(`
     products_json TEXT NOT NULL DEFAULT '[]', sales_target_cents INTEGER,
     notes TEXT NOT NULL DEFAULT '', photo_type TEXT, photo_blob BLOB
   );
+  CREATE TABLE IF NOT EXISTS director_shifts (
+    id TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
+    date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+    starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
+    director TEXT NOT NULL DEFAULT ''
+  );
+  CREATE INDEX IF NOT EXISTS director_shifts_room_date_start ON director_shifts(room_code,date,starts_at);
   CREATE TABLE IF NOT EXISTS host_avatars (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
     photo_type TEXT, photo_blob BLOB, photo_hash TEXT,
@@ -57,6 +64,7 @@ const MIME = {
   ".ico": "image/x-icon", ".woff2": "font/woff2", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
 const MASTER_ROOM_COUNT = 27;
+const NUMBERED_ROOM_CODES = Array.from({ length: MASTER_ROOM_COUNT }, (_, index) => String(index + 1).padStart(2, "0"));
 const MCP_ROOM_BATCH_PREVIEW_PREFIX = "mcp-room-schedules-v1\n";
 const sessions = db.prepare("SELECT s.token_hash,s.csrf_token,s.expires_at,u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.enabled=1");
 const integrationTokens = db.prepare("SELECT id,name FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL");
@@ -134,6 +142,54 @@ function migrateLegacyHostAvatars() {
 }
 
 migrateLegacyHostAvatars();
+
+function migrateLegacyDirectorShifts() {
+  if (db.prepare("SELECT value FROM app_state WHERE key='independent_director_shifts_v1'").get()) return;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!db.prepare("SELECT value FROM app_state WHERE key='independent_director_shifts_v1'").get()) {
+      const rows = db.prepare(`SELECT room_code,date,start_time,end_time,starts_at,ends_at,director
+        FROM slots WHERE TRIM(director)<>'' ORDER BY room_code,date,starts_at`).all();
+      const insert = db.prepare(`INSERT INTO director_shifts(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director
+      ) VALUES (?,?,?,?,?,?,?,?)`);
+      const grouped = new Map();
+      for (const row of rows) {
+        const key = `${row.room_code}\u0000${row.date}\u0000${row.director}`;
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(row);
+      }
+      for (const shifts of grouped.values()) {
+        shifts.sort((a, b) => a.starts_at - b.starts_at);
+        const merged = [];
+        for (const shift of shifts) {
+          const previous = merged.at(-1);
+          if (previous && shift.starts_at <= previous.ends_at) {
+            if (shift.ends_at > previous.ends_at) {
+              previous.ends_at = shift.ends_at;
+              previous.end_time = shift.end_time;
+            }
+          } else merged.push({ ...shift });
+        }
+        for (const shift of merged) insert.run(
+          randomBytes(16).toString("hex"), shift.room_code, shift.date, shift.start_time, shift.end_time,
+          shift.starts_at, shift.ends_at, shift.director,
+        );
+      }
+      const currentVersion = db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
+      const updateAt = new Date(Math.max(Date.now(), (Date.parse(currentVersion) || 0) + 1)).toISOString();
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
+      db.prepare("INSERT INTO app_state(key,value) VALUES ('independent_director_shifts_v1',?)")
+        .run(new Date().toISOString());
+    }
+    db.exec("COMMIT");
+  } catch (cause) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw cause;
+  }
+}
+
+migrateLegacyDirectorShifts();
 
 function authenticateIntegrationToken(authorization) {
   const match = authorization.match(/^Bearer\s+(lrd_live_[A-Za-z0-9_-]{43})$/);
@@ -361,7 +417,7 @@ function salesDisplay(cents) {
   return `¥${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(yuan)}`;
 }
 
-function validateWorkbook(sheets) {
+function validateWorkbook(sheets, targetRoom = null) {
   const errors = [];
   const warnings = [];
   const rooms = [];
@@ -371,78 +427,105 @@ function validateWorkbook(sheets) {
   if (!sheets.length) return { rooms, errors: [{ sheet: "", row: "", field: "工作簿", message: "没有可读取的直播间工作表" }], warnings };
 
   for (const sheet of sheets) {
-    const name = String(cellValue(sheet, 1, "B") ?? "").trim();
-    const code = String(cellValue(sheet, 1, "E") ?? "").trim();
-    if (cellHasFormula(sheet, 1, "B") || !name) pushError(sheet.name, 1, "直播间名称", "请在 B1 填写直播间名称");
-    if (cellHasFormula(sheet, 1, "E") || !code) pushError(sheet.name, 1, "直播间编号", "请在 E1 填写直播间编号");
+    const name = targetRoom?.name ?? String(cellValue(sheet, 1, "B") ?? "").trim();
+    const code = targetRoom?.code ?? String(cellValue(sheet, 1, "E") ?? "").trim();
+    if (!targetRoom) {
+      if (cellHasFormula(sheet, 1, "B") || !name) pushError(sheet.name, 1, "直播间名称", "请在 B1 填写直播间名称");
+      if (cellHasFormula(sheet, 1, "E") || !code) pushError(sheet.name, 1, "直播间编号", "请在 E1 填写直播间编号");
+    }
     if (code && seenCodes.has(code)) pushError(sheet.name, 1, "直播间编号", `编号“${code}”重复`);
     if (code) seenCodes.add(code);
 
-    const headers = new Map();
-    for (const [column, cell] of sheet.rows.get(3) ?? []) {
-      const label = String(cell.value ?? "").trim();
-      if (label) headers.set(label, column);
-    }
-    const requiredHeaders = ["日期", "开始时间", "结束时间", "导演", "主播", "助播", "主播照片", "主推商品", "目标销售额", "备注"];
-    for (const label of requiredHeaders) {
-      if (!headers.has(label)) pushError(sheet.name, 3, label, `第 3 行缺少“${label}”列`);
-    }
-    const column = (label) => headers.get(label) ?? "";
-    const slots = [];
-    for (const [rowNumber, cells] of [...sheet.rows.entries()].filter(([row]) => row >= 4).sort(([a], [b]) => a - b)) {
-      const hasValues = [...cells.values()].some((cell) => String(cell.value ?? "").trim() !== "");
-      const rowImages = sheet.images.get(rowNumber) ?? [];
-      if (!hasValues && !rowImages.length) continue;
-      const read = (label) => column(label) ? cellValue(sheet, rowNumber, column(label)) : "";
-      for (const label of requiredHeaders) {
-        const col = column(label);
-        if (col && cellHasFormula(sheet, rowNumber, col)) pushError(sheet.name, rowNumber, label, "请使用固定值，不支持公式");
+    const directorHeaders = { A: "日期", B: "导演开始时间", C: "导演结束时间", D: "导演" };
+    const hostHeaders = {
+      F: "日期", G: "主播开始时间", H: "主播结束时间", I: "主播", J: "助播",
+      K: "主播照片", L: "主推商品", M: "目标销售额", N: "备注",
+    };
+    for (const [column, label] of Object.entries({ ...directorHeaders, ...hostHeaders })) {
+      if (String(cellValue(sheet, 3, column) ?? "").trim() !== label) {
+        pushError(sheet.name, 3, label, `第 3 行 ${column} 列应为“${label}”`);
       }
-      const date = excelDate(read("日期"));
-      const start = excelTime(read("开始时间"));
-      const end = excelTime(read("结束时间"));
-      if (!date) pushError(sheet.name, rowNumber, "日期", "请填写有效日期，例如 2026-11-10");
-      if (!start) pushError(sheet.name, rowNumber, "开始时间", "请填写有效时间，例如 07:00");
-      if (!end) pushError(sheet.name, rowNumber, "结束时间", "请填写有效时间，例如 11:00");
+    }
+
+    const directorShifts = [];
+    const hostShifts = [];
+    const formulasByColumn = {
+      A: "导演日期", B: "导演开始时间", C: "导演结束时间", D: "导演",
+      F: "主播日期", G: "主播开始时间", H: "主播结束时间", I: "主播", J: "助播",
+      L: "主推商品", M: "目标销售额", N: "备注",
+    };
+    const read = (rowNumber, column) => cellValue(sheet, rowNumber, column);
+    const validateRange = (rowNumber, role, dateValue, startValue, endValue) => {
+      const date = excelDate(dateValue);
+      const start = excelTime(startValue);
+      const end = excelTime(endValue);
+      if (!date) pushError(sheet.name, rowNumber, `${role}日期`, "请填写有效日期，例如 2026-11-18");
+      if (!start) pushError(sheet.name, rowNumber, `${role}开始时间`, "请填写有效时间，例如 07:00");
+      if (!end) pushError(sheet.name, rowNumber, `${role}结束时间`, "请填写有效时间，例如 11:00");
       const startAt = date && start ? Date.parse(`${date}T${start}:00+08:00`) : 0;
       let endAt = date && end ? Date.parse(`${date}T${end}:00+08:00`) : 0;
       if (date && start && end && endAt <= startAt) {
-        if (endAt === startAt) pushError(sheet.name, rowNumber, "结束时间", "开始和结束时间不能相同");
+        if (endAt === startAt) pushError(sheet.name, rowNumber, `${role}结束时间`, "开始和结束时间不能相同");
         else endAt += 86_400_000;
       }
-      const director = String(read("导演") ?? "").trim();
-      const host = String(read("主播") ?? "").trim();
-      const assistant = String(read("助播") ?? "").trim();
-      const products = String(read("主推商品") ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-      const salesTargetCents = parseMoney(read("目标销售额"));
-      if (Number.isNaN(salesTargetCents)) pushError(sheet.name, rowNumber, "目标销售额", "金额请填写数字、元或万元，例如 200000 或 20万");
-      if (!director) pushWarning(sheet.name, rowNumber, "导演", "未填写导演");
-      if (!host) pushWarning(sheet.name, rowNumber, "主播", "未填写主播");
-      if (!assistant) pushWarning(sheet.name, rowNumber, "助播", "未填写助播");
-      if (!rowImages.length) pushWarning(sheet.name, rowNumber, "主播照片", "未添加主播照片");
-      if (!products.length) pushWarning(sheet.name, rowNumber, "主推商品", "未填写主推商品");
-      if (salesTargetCents == null) pushWarning(sheet.name, rowNumber, "目标销售额", "未填写目标销售额");
-      if (rowImages.length > 1) pushError(sheet.name, rowNumber, "主播照片", "每场排班最多添加一张照片");
-      if (rowImages.some((image) => image.columnNumber !== 6)) pushError(sheet.name, rowNumber, "主播照片", "请将照片锚定在 G 列对应排班行");
-      const image = rowImages[0] ?? null;
-      if (date && start && end) {
-        slots.push({
-          id: randomBytes(16).toString("hex"), sourceRow: rowNumber, date, start, end, startAt, endAt,
-          director, host, assistant, products, salesTargetCents,
-          notes: String(read("备注") ?? "").trim(), photo: image,
+      return { date, start, end, startAt, endAt };
+    };
+
+    for (const [rowNumber, cells] of [...sheet.rows.entries()].filter(([row]) => row >= 4).sort(([a], [b]) => a - b)) {
+      const rowImages = sheet.images.get(rowNumber) ?? [];
+      const directorHasValues = ["A", "B", "C", "D"].some((column) => String(read(rowNumber, column) ?? "").trim() !== "");
+      const hostHasValues = ["F", "G", "H", "I", "J", "L", "M", "N"].some((column) => String(read(rowNumber, column) ?? "").trim() !== "");
+      if (!directorHasValues && !hostHasValues && !rowImages.length) continue;
+      for (const [column, label] of Object.entries(formulasByColumn)) {
+        if (cellHasFormula(sheet, rowNumber, column)) pushError(sheet.name, rowNumber, label, "请使用固定值，不支持公式");
+      }
+
+      if (directorHasValues) {
+        const range = validateRange(rowNumber, "导演", read(rowNumber, "A"), read(rowNumber, "B"), read(rowNumber, "C"));
+        const director = String(read(rowNumber, "D") ?? "").trim();
+        if (!director) pushWarning(sheet.name, rowNumber, "导演", "未填写导演");
+        if (range.date && range.start && range.end) directorShifts.push({
+          id: randomBytes(16).toString("hex"), sourceRow: rowNumber, ...range, director,
+        });
+      }
+
+      if (hostHasValues || rowImages.length) {
+        const range = validateRange(rowNumber, "主播", read(rowNumber, "F"), read(rowNumber, "G"), read(rowNumber, "H"));
+        const host = String(read(rowNumber, "I") ?? "").trim();
+        const assistant = String(read(rowNumber, "J") ?? "").trim();
+        const products = String(read(rowNumber, "L") ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+        const salesTargetCents = parseMoney(read(rowNumber, "M"));
+        if (Number.isNaN(salesTargetCents)) pushError(sheet.name, rowNumber, "目标销售额", "金额请填写数字、元或万元，例如 200000 或 20万");
+        if (!host) pushWarning(sheet.name, rowNumber, "主播", "未填写主播");
+        if (!assistant) pushWarning(sheet.name, rowNumber, "助播", "未填写助播");
+        if (!rowImages.length) pushWarning(sheet.name, rowNumber, "主播照片", "未添加主播照片");
+        if (!products.length) pushWarning(sheet.name, rowNumber, "主推商品", "未填写主推商品");
+        if (salesTargetCents == null) pushWarning(sheet.name, rowNumber, "目标销售额", "未填写目标销售额");
+        if (rowImages.length > 1) pushError(sheet.name, rowNumber, "主播照片", "每个主播时段最多添加一张照片");
+        if (rowImages.some((image) => image.columnNumber !== 10)) pushError(sheet.name, rowNumber, "主播照片", "请将照片锚定在 K 列对应主播排班行");
+        if (!hostHasValues && rowImages.length) pushError(sheet.name, rowNumber, "主播照片", "照片所在行没有主播排班信息");
+        if (range.date && range.start && range.end) hostShifts.push({
+          id: randomBytes(16).toString("hex"), sourceRow: rowNumber, ...range,
+          host, assistant, products, salesTargetCents,
+          notes: String(read(rowNumber, "N") ?? "").trim(), photo: rowImages[0] ?? null,
         });
       }
     }
-    slots.sort((a, b) => a.startAt - b.startAt);
-    for (let index = 1; index < slots.length; index += 1) {
-      if (slots[index].startAt < slots[index - 1].endAt) {
-        pushError(sheet.name, slots[index].sourceRow, "排班时间", "同一直播间的排班时间发生重叠");
+
+    for (const [shifts, role] of [[directorShifts, "导演"], [hostShifts, "主播"]]) {
+      shifts.sort((a, b) => a.startAt - b.startAt);
+      let furthestEnd = 0;
+      for (const shift of shifts) {
+        if (shift.startAt < furthestEnd) {
+          pushError(sheet.name, shift.sourceRow, `${role}排班时间`, `同一直播间的${role}排班时间发生重叠`);
+        }
+        furthestEnd = Math.max(furthestEnd, shift.endAt);
       }
     }
-    for (const [rowNumber, images] of sheet.images) {
+    for (const [rowNumber] of sheet.images) {
       if (rowNumber >= 4 && !sheet.rows.has(rowNumber)) pushError(sheet.name, rowNumber, "主播照片", "照片所在行没有排班单元格");
     }
-    if (name && code) rooms.push({ code, name, sheetName: sheet.name, slots });
+    if (name && code) rooms.push({ code, name, sheetName: sheet.name, directorShifts, hostShifts });
   }
   return { rooms, errors, warnings };
 }
@@ -460,17 +543,22 @@ function workbookImportErrors(workbook, result, mode) {
   }
 
   for (const room of result.rooms) {
-    const affectedDates = new Set(room.slots.map((slot) => slot.date));
+    const affectedDates = new Set([...room.directorShifts, ...room.hostShifts].map((shift) => shift.date));
     if (!affectedDates.size) continue;
-    const existing = db.prepare("SELECT date,start_time,end_time,starts_at,ends_at FROM slots WHERE room_code=?").all(room.code);
-    const untouched = existing.filter((slot) => !affectedDates.has(slot.date));
-    for (const slot of room.slots) {
-      for (const previous of untouched) {
-        if (slot.startAt < previous.ends_at && previous.starts_at < slot.endAt) {
-          errors.push({
-            sheet: room.sheetName, row: slot.sourceRow, field: "排班时间",
-            message: `与未更新的现有排班 ${previous.date} ${previous.start_time}-${previous.end_time} 重叠`,
-          });
+    for (const [incoming, table, role] of [
+      [room.directorShifts, "director_shifts", "导演"],
+      [room.hostShifts, "slots", "主播"],
+    ]) {
+      const existing = db.prepare(`SELECT date,start_time,end_time,starts_at,ends_at FROM ${table} WHERE room_code=?`).all(room.code);
+      const untouched = existing.filter((shift) => !affectedDates.has(shift.date));
+      for (const shift of incoming) {
+        for (const previous of untouched) {
+          if (shift.startAt < previous.ends_at && previous.starts_at < shift.endAt) {
+            errors.push({
+              sheet: room.sheetName, row: shift.sourceRow, field: `${role}排班时间`,
+              message: `与未更新的现有${role}排班 ${previous.date} ${previous.start_time}-${previous.end_time} 重叠`,
+            });
+          }
         }
       }
     }
@@ -482,14 +570,19 @@ function workbookImportSummary(result) {
   const existingRooms = db.prepare("SELECT code,name FROM rooms").all();
   const existingByCode = new Map(existingRooms.map((room) => [room.code, room]));
   const rooms = result.rooms.map((room) => {
-    const slotsByDate = new Map();
-    for (const slot of room.slots) {
-      slotsByDate.set(slot.date, (slotsByDate.get(slot.date) ?? 0) + 1);
+    const datesByKey = new Map();
+    for (const shift of room.directorShifts) {
+      if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShiftCount: 0, hostShiftCount: 0 });
+      datesByKey.get(shift.date).directorShiftCount += 1;
     }
-    const dates = [...slotsByDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, scheduleCount]) => ({
-      date,
-      scheduleCount,
+    for (const shift of room.hostShifts) {
+      if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShiftCount: 0, hostShiftCount: 0 });
+      datesByKey.get(shift.date).hostShiftCount += 1;
+    }
+    const dates = [...datesByKey.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, counts]) => ({
+      date, ...counts, scheduleCount: counts.hostShiftCount,
       replacingSlots: db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(room.code, date).count,
+      replacingDirectorShifts: db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?").get(room.code, date).count,
     }));
     return {
       code: room.code,
@@ -498,7 +591,8 @@ function workbookImportSummary(result) {
       previousName: existingByCode.get(room.code)?.name ?? null,
       nameChanged: Boolean(existingByCode.has(room.code) && existingByCode.get(room.code).name !== room.name),
       dateCount: dates.length,
-      scheduleCount: room.slots.length,
+      scheduleCount: room.hostShifts.length,
+      directorShiftCount: room.directorShifts.length,
       dates,
     };
   });
@@ -507,6 +601,7 @@ function workbookImportSummary(result) {
   return {
     roomCount: rooms.length,
     scheduleCount: rooms.reduce((count, room) => count + room.scheduleCount, 0),
+    directorShiftCount: rooms.reduce((count, room) => count + room.directorShiftCount, 0),
     dateCount: rooms.reduce((count, room) => count + room.dateCount, 0),
     addedRoomCount,
     updatedRoomCount: rooms.length - addedRoomCount,
@@ -546,8 +641,8 @@ function parseFixedScheduleText(input) {
   if (text.length > 60_000) fixedTextError("排班文本不能超过 60,000 个字符");
   const sections = text.split(/^[ \t]*---[ \t]*$/m);
   while (sections.length && !sections.at(-1).trim()) sections.pop();
-  if (sections.length < 2) fixedTextError("请先填写直播间信息，再用单独一行“---”分隔排班时段");
-  if (sections.length > 101) fixedTextError("一次最多提交 100 个排班时段");
+  if (sections.length < 2) fixedTextError("请先填写直播间信息，再分别填写导演排班和主播排班");
+  if (sections.length > 101) fixedTextError("一次最多提交 100 个导演或主播时段");
 
   const metadata = parseFixedFields(
     sections[0], 1,
@@ -562,22 +657,47 @@ function parseFixedScheduleText(input) {
   if (!roomName || roomName.length > 120) fixedTextError("直播间名称不能为空且不能超过 120 个字符", "直播间名称", 1);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateInput) || date !== dateInput) fixedTextError("排班日期请按 YYYY-MM-DD 填写有效日期", "排班日期", 1);
 
-  const slotFields = ["时段", "导演", "主播", "助播", "主推商品", "目标销售额", "备注"];
-  const headers = ["日期", "开始时间", "结束时间", "导演", "主播", "助播", "主播照片", "主推商品", "目标销售额", "备注"];
+  const directorHeaders = ["日期", "导演开始时间", "导演结束时间", "导演"];
+  const hostHeaders = ["日期", "主播开始时间", "主播结束时间", "主播", "助播", "主播照片", "主推商品", "目标销售额", "备注"];
+  const columns = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"];
+  const headerValues = [...directorHeaders, "", ...hostHeaders];
   const rows = new Map([
     [1, new Map([["B", { value: roomName }], ["E", { value: roomCode }]])],
-    [3, new Map(headers.map((label, index) => [String.fromCharCode(65 + index), { value: label }]))],
+    [3, new Map(headerValues.map((label, index) => [columns[index], { value: label }]))],
   ]);
+  const allowedFields = ["排班类型", "时段", "导演", "主播", "助播", "主推商品", "目标销售额", "备注"];
+  let directorRow = 4;
+  let hostRow = 4;
+  const writeRow = (rowNumber, rowValues) => {
+    const row = rows.get(rowNumber) ?? new Map();
+    for (const [column, value] of Object.entries(rowValues)) row.set(column, { value });
+    rows.set(rowNumber, row);
+  };
 
   sections.slice(1).forEach((section, index) => {
-    const rowNumber = index + 4;
-    const fields = parseFixedFields(section, index + 2, slotFields, slotFields);
+    const fields = parseFixedFields(section, index + 2, allowedFields, ["排班类型", "时段"]);
+    const role = fields.get("排班类型");
     const period = fields.get("时段");
     const range = period.match(/^(\d{1,2}:\d{2})\s*(?:-|–|—|至|到)\s*(\d{1,2}:\d{2})$/);
-    if (!range) fixedTextError("时段请按“07:00-11:00”填写", "时段", rowNumber);
+    if (!range) fixedTextError("时段请按“07:00-11:00”填写", "时段", index + 4);
+    if (role === "导演") {
+      if (!fields.has("导演")) fixedTextError(`第 ${index + 2} 段缺少“导演”字段`, "导演", index + 4);
+      if (["主播", "助播", "主推商品", "目标销售额", "备注"].some((key) => fields.has(key))) {
+        fixedTextError("导演排班段只填写导演姓名和时段", "排班类型", index + 4);
+      }
+      writeRow(directorRow++, { A: date, B: range[1], C: range[2], D: fields.get("导演") });
+      return;
+    }
+    if (role !== "主播") fixedTextError("排班类型请填写“导演”或“主播”", "排班类型", index + 4);
+    for (const key of ["主播", "助播", "主推商品", "目标销售额", "备注"]) {
+      if (!fields.has(key)) fixedTextError(`第 ${index + 2} 段缺少“${key}”字段`, key, index + 4);
+    }
+    if (fields.has("导演")) fixedTextError("主播排班段请勿填写导演；导演时间在独立排班段填写", "导演", index + 4);
     const products = fields.get("主推商品").replace(/[；;、]/g, "\n");
-    const values = [date, range[1], range[2], fields.get("导演"), fields.get("主播"), fields.get("助播"), "", products, fields.get("目标销售额"), fields.get("备注")];
-    rows.set(rowNumber, new Map(values.map((value, column) => [String.fromCharCode(65 + column), { value }])));
+    writeRow(hostRow++, {
+      F: date, G: range[1], H: range[2], I: fields.get("主播"), J: fields.get("助播"), K: "",
+      L: products, M: fields.get("目标销售额"), N: fields.get("备注"),
+    });
   });
 
   return {
@@ -618,10 +738,17 @@ function publicSlot(slot) {
     : (slot.photo_type ? `/api/v1/media/${encodeURIComponent(slot.id)}` : null);
   return {
     id: slot.id, date: slot.date, start: slot.start_time, end: slot.end_time,
-    director: slot.director, host: slot.host, assistant: slot.assistant,
+    host: slot.host, assistant: slot.assistant,
     featuredProducts: products, salesTarget: salesDisplay(slot.sales_target_cents),
     photo,
     startsAt: slot.starts_at, endsAt: slot.ends_at,
+  };
+}
+
+function publicDirectorShift(shift) {
+  return {
+    id: shift.id, date: shift.date, start: shift.start_time, end: shift.end_time,
+    director: shift.director, startsAt: shift.starts_at, endsAt: shift.ends_at,
   };
 }
 
@@ -656,22 +783,39 @@ function adminSchedulePayload() {
   const rows = db.prepare(`SELECT s.*,r.name AS room_name,r.sort_order AS room_sort_order
     FROM slots s JOIN rooms r ON r.code=s.room_code
     ORDER BY s.date DESC,r.sort_order,s.start_time`).all();
+  const directorRows = db.prepare(`SELECT d.*,r.name AS room_name,r.sort_order AS room_sort_order
+    FROM director_shifts d JOIN rooms r ON r.code=d.room_code
+    ORDER BY d.date DESC,r.sort_order,d.start_time`).all();
   const groups = new Map();
-  for (const row of rows) {
+  const groupFor = (row) => {
     const key = `${row.room_code}\u0000${row.date}`;
     if (!groups.has(key)) groups.set(key, {
       roomCode: row.room_code, roomName: row.room_name, date: row.date, slots: [],
     });
+    return groups.get(key);
+  };
+  for (const row of rows) {
     const avatar = row.host ? hostAvatarByNameKey.get(hostNameKey(row.host)) : null;
-    groups.get(key).slots.push({
-      id: row.id, start: row.start_time, end: row.end_time,
-      director: row.director, host: row.host, assistant: row.assistant,
+    groupFor(row).slots.push({
+      id: row.id, kind: "host", start: row.start_time, end: row.end_time,
+      host: row.host, assistant: row.assistant,
       featuredProducts: JSON.parse(row.products_json), salesTarget: salesDisplay(row.sales_target_cents), notes: row.notes,
       hasAvatar: avatar ? Boolean(avatar.photo_type) : Boolean(row.photo_type),
       avatarSource: avatar?.photo_type ? "头像库" : row.photo_type ? "本场照片" : "未配置",
     });
   }
-  return { rooms, groups: [...groups.values()], scheduleCount: rows.length, dataUpdatedAt: updatedAtValue() };
+  for (const row of directorRows) {
+    groupFor(row).slots.push({
+      id: row.id, kind: "director", start: row.start_time, end: row.end_time,
+      director: row.director, host: "", assistant: "", featuredProducts: [], salesTarget: "", notes: "",
+      hasAvatar: false, avatarSource: "未配置",
+    });
+  }
+  for (const group of groups.values()) group.slots.sort((a, b) => a.start.localeCompare(b.start) || a.kind.localeCompare(b.kind));
+  return {
+    rooms, groups: [...groups.values()], scheduleCount: rows.length,
+    directorShiftCount: directorRows.length, dataUpdatedAt: updatedAtValue(),
+  };
 }
 
 const mcpTools = [
@@ -685,7 +829,7 @@ const mcpTools = [
   {
     name: "get_room_schedule",
     title: "查看当日排班",
-    description: "查看指定直播间某一天的完整排班和每个时段的头像状态。主播头像会按姓名从头像库匹配。日期必须由用户提供或确认。只读。",
+    description: "查看指定直播间某一天独立的导演排班与主播排班。导演和主播时段不要求一一对应；助播跟随主播。主播头像会按姓名从头像库匹配。日期必须由用户提供或确认。只读。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "date"],
       properties: {
@@ -698,22 +842,35 @@ const mcpTools = [
   {
     name: "preview_schedule_update",
     title: "预览排班修改",
-    description: "预览一个直播间单个日期的完整排班，不会写入数据。同一直播间多日更新请调用 preview_room_schedules_update。必须先展示预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
+    description: "预览一个直播间单个日期的完整排班，不会写入数据。导演排班与主播排班分别填写、分别校验，不需要一一对应；助播跟随主播时段。同一直播间多日更新请调用 preview_room_schedules_update。必须先展示预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
     inputSchema: {
-      type: "object", additionalProperties: false, required: ["roomCode", "date", "slots"],
+      type: "object", additionalProperties: false, required: ["roomCode", "date", "directorShifts", "hostShifts"],
       properties: {
         roomCode: { type: "string", description: "直播间编号" },
         roomName: { type: "string", description: "新增直播间时必填；已有直播间会使用系统中的名称" },
         date: { type: "string", description: "排班日期，格式 YYYY-MM-DD" },
-        slots: {
-          type: "array", minItems: 1, maxItems: 100,
-          description: "该直播间该日期的全部时段；提交会替换这一天的完整排班",
+        directorShifts: {
+          type: "array", maxItems: 100,
+          description: "该日期完整的导演排班列表，与主播时段相互独立",
           items: {
-            type: "object", additionalProperties: false, required: ["start", "end"],
+            type: "object", additionalProperties: false, required: ["start", "end", "director"],
             properties: {
               start: { type: "string", description: "开始时间，24 小时制，例如 07:00" },
               end: { type: "string", description: "结束时间，24 小时制，例如 11:00" },
-              director: { type: "string" }, host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" }, assistant: { type: "string" },
+              director: { type: "string", description: "导演姓名" },
+            },
+          },
+        },
+        hostShifts: {
+          type: "array", maxItems: 100,
+          description: "该日期完整的主播排班列表；助播跟随主播时段",
+          items: {
+            type: "object", additionalProperties: false, required: ["start", "end", "host"],
+            properties: {
+              start: { type: "string", description: "主播开始时间，24 小时制" },
+              end: { type: "string", description: "主播结束时间，24 小时制" },
+              host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
+              assistant: { type: "string", description: "助播，随主播排班" },
               featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
               salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
               notes: { type: "string" },
@@ -727,7 +884,7 @@ const mcpTools = [
   {
     name: "preview_room_schedules_update",
     title: "预览单直播间多日期排班",
-    description: "一次整理一个直播间多个日期的完整排班。每个日期都必须包含当天全部时段。只预览不写入；必须先展示每一天的完整预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
+    description: "一次整理一个直播间多个日期的完整排班。每个日期分别包含完整的导演排班和主播排班；两类时段相互独立，助播跟随主播。只预览不写入；必须先展示每一天的完整预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "schedules"],
       properties: {
@@ -735,20 +892,33 @@ const mcpTools = [
         roomName: { type: "string", description: "新增直播间时必填；已有直播间会使用系统中的名称" },
         schedules: {
           type: "array", minItems: 1, maxItems: 100,
-          description: "该直播间要更新的日期列表；每个日期的 slots 必须提供当天完整时段，未列出的日期保持不变",
+          description: "该直播间要更新的日期列表；每个日期的 directorShifts 与 hostShifts 都是当天完整列表，未列出的日期保持不变",
           items: {
-            type: "object", additionalProperties: false, required: ["date", "slots"],
+            type: "object", additionalProperties: false, required: ["date", "directorShifts", "hostShifts"],
             properties: {
               date: { type: "string", description: "排班日期，格式 YYYY-MM-DD" },
-              slots: {
-                type: "array", minItems: 1, maxItems: 100,
-                description: "该日期的完整时段列表",
+              directorShifts: {
+                type: "array", maxItems: 100,
+                description: "该日期的完整导演排班列表",
                 items: {
-                  type: "object", additionalProperties: false, required: ["start", "end"],
+                  type: "object", additionalProperties: false, required: ["start", "end", "director"],
                   properties: {
                     start: { type: "string", description: "开始时间，24 小时制，例如 07:00" },
                     end: { type: "string", description: "结束时间，24 小时制，例如 11:00" },
-                    director: { type: "string" }, host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" }, assistant: { type: "string" },
+                    director: { type: "string", description: "导演姓名" },
+                  },
+                },
+              },
+              hostShifts: {
+                type: "array", maxItems: 100,
+                description: "该日期的完整主播排班列表；助播跟随主播时段",
+                items: {
+                  type: "object", additionalProperties: false, required: ["start", "end", "host"],
+                  properties: {
+                    start: { type: "string", description: "主播开始时间，24 小时制" },
+                    end: { type: "string", description: "主播结束时间，24 小时制" },
+                    host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
+                    assistant: { type: "string", description: "助播，随主播排班" },
                     featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
                     salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
                     notes: { type: "string" },
@@ -779,44 +949,62 @@ function updatedAtValue() {
 }
 
 function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
-  const slots = parsed.result.rooms[0].slots;
+  const roomSchedule = parsed.result.rooms[0];
+  const directorShifts = roomSchedule.directorShifts;
+  const hostShifts = roomSchedule.hostShifts;
   if (parsed.result.errors.length) {
     const cause = new Error("排班内容未通过校验，请根据错误修正后重新预览");
     cause.details = parsed.result.errors;
     throw cause;
   }
-  const adjacentSlots = db.prepare("SELECT date,start_time,end_time,starts_at,ends_at FROM slots WHERE room_code=? AND date IN (?,?)")
-    .all(parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1))
-    .filter((slot) => !replacedDates.has(slot.date));
-  const conflicts = slots.flatMap((slot, index) => adjacentSlots
-    .filter((existing) => slot.startAt < existing.ends_at && existing.starts_at < slot.endAt)
-    .map((existing) => ({
-      sheet: parsed.sheet.name, row: index + 4, field: "排班时间",
-      message: `与相邻日期 ${existing.date} ${existing.start_time}-${existing.end_time} 的现有排班重叠`,
-    })));
+  const conflicts = [];
+  for (const [shifts, table, role] of [
+    [directorShifts, "director_shifts", "导演"],
+    [hostShifts, "slots", "主播"],
+  ]) {
+    const adjacent = db.prepare(`SELECT date,start_time,end_time,starts_at,ends_at FROM ${table}
+      WHERE room_code=? AND date IN (?,?)`).all(
+      parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1),
+    ).filter((shift) => !replacedDates.has(shift.date));
+    for (const shift of shifts) {
+      for (const existing of adjacent) {
+        if (shift.startAt < existing.ends_at && existing.starts_at < shift.endAt) conflicts.push({
+          sheet: parsed.sheet.name, row: shift.sourceRow, field: `${role}排班时间`,
+          message: `与相邻日期 ${existing.date} 的现有${role}排班 ${existing.start_time}-${existing.end_time} 重叠`,
+        });
+      }
+    }
+  }
   if (conflicts.length) {
-    const cause = new Error("排班与相邻日期的跨日时段冲突，请先处理冲突后重新预览");
+    const cause = new Error("导演或主播排班与相邻日期的跨日时段冲突，请先处理冲突后重新预览");
     cause.details = conflicts;
     throw cause;
   }
   const replacingSlots = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
-  const scheduleRows = slots.map((slot, index) => {
+  const replacingDirectorShifts = db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
+  const scheduleRows = hostShifts.map((slot, index) => {
     const avatar = slot.host ? hostAvatarByNameKey.get(hostNameKey(slot.host)) : null;
     const previous = db.prepare("SELECT photo_blob FROM slots WHERE room_code=? AND date=? AND start_time=? AND end_time=? AND host=?")
       .get(parsed.roomCode, parsed.date, slot.start, slot.end, slot.host);
     const hasAvatar = avatar ? Boolean(avatar.photo_type) : Boolean(previous?.photo_blob);
     return {
-      start: slot.start, end: slot.end, director: slot.director, host: slot.host,
+      start: slot.start, end: slot.end, host: slot.host,
       assistant: slot.assistant, featuredProducts: slot.products,
       salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
       hasAvatar, avatarSource: avatar?.photo_type ? "头像库" : hasAvatar ? "本场已有照片" : "未配置",
       row: index + 4,
     };
   });
+  const directorRows = directorShifts.map((shift) => ({
+    start: shift.start, end: shift.end, director: shift.director,
+  }));
   return {
     roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-    replacingSlots, scheduleCount: slots.length,
-    schedule: scheduleRows.map(({ row, ...slot }) => slot),
+    replacingSlots, replacingDirectorShifts,
+    scheduleCount: hostShifts.length, directorShiftCount: directorShifts.length,
+    assignmentCount: hostShifts.length + directorShifts.length,
+    directorShifts: directorRows,
+    hostShifts: scheduleRows.map(({ row, ...slot }) => slot),
     warnings: [
       ...parsed.warnings.filter((warning) => warning.field !== "主播头像"),
       ...scheduleRows.filter((slot) => !slot.hasAvatar).map((slot) => ({
@@ -839,28 +1027,36 @@ function fixedScheduleTextFromMcp(args) {
   const date = cleanMcpField(args.date, "日期", 10);
   if (!roomCode) throw new Error("请先确认直播间编号");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("请提供有效排班日期，格式为 YYYY-MM-DD");
-  if (!Array.isArray(args.slots) || args.slots.length < 1 || args.slots.length > 100) throw new Error("请提供 1 至 100 个时段，并包含这一天的全部排班");
+  if (!Array.isArray(args.directorShifts) || !Array.isArray(args.hostShifts)) throw new Error("请分别提供 directorShifts 和 hostShifts 两份完整排班");
+  const assignmentCount = args.directorShifts.length + args.hostShifts.length;
+  if (assignmentCount < 1 || assignmentCount > 100) throw new Error("导演和主播排班合计请提供 1 至 100 个时段");
   const existingRoom = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
   const roomName = existingRoom?.name ?? cleanMcpField(args.roomName, "直播间名称", 120);
   if (!roomName) throw new Error("新增直播间时请补充直播间名称");
   const lines = [`直播间编号：${roomCode}`, `直播间名称：${roomName}`, `排班日期：${date}`];
-  for (const [index, slot] of args.slots.entries()) {
-    if (!slot || typeof slot !== "object" || Array.isArray(slot)) throw new Error(`第 ${index + 1} 个时段格式不正确`);
-    const start = excelTime(slot.start);
-    const end = excelTime(slot.end);
-    if (!start || !end) throw new Error(`第 ${index + 1} 个时段的开始或结束时间无效`);
-    const products = slot.featuredProducts ?? [];
-    if (!Array.isArray(products) || products.length > 30) throw new Error(`第 ${index + 1} 个时段的商品列表格式不正确`);
+  for (const [index, shift] of args.directorShifts.entries()) {
+    if (!shift || typeof shift !== "object" || Array.isArray(shift)) throw new Error(`第 ${index + 1} 个导演时段格式不正确`);
+    const start = excelTime(shift.start);
+    const end = excelTime(shift.end);
+    if (!start || !end) throw new Error(`第 ${index + 1} 个导演时段的开始或结束时间无效`);
+    lines.push("---", "排班类型：导演", `时段：${start}-${end}`, `导演：${cleanMcpField(shift.director, "导演", 80)}`);
+  }
+  for (const [index, shift] of args.hostShifts.entries()) {
+    if (!shift || typeof shift !== "object" || Array.isArray(shift)) throw new Error(`第 ${index + 1} 个主播时段格式不正确`);
+    const start = excelTime(shift.start);
+    const end = excelTime(shift.end);
+    if (!start || !end) throw new Error(`第 ${index + 1} 个主播时段的开始或结束时间无效`);
+    const products = shift.featuredProducts ?? [];
+    if (!Array.isArray(products) || products.length > 30) throw new Error(`第 ${index + 1} 个主播时段的商品列表格式不正确`);
     const productText = products.map((product) => cleanMcpField(product, "商品名称", 200)).filter(Boolean).join("；");
-    const rawSalesTarget = slot.salesTarget == null ? "" : slot.salesTarget;
-    if (!["string", "number"].includes(typeof rawSalesTarget)) throw new Error(`第 ${index + 1} 个时段的目标销售额格式不正确`);
+    const rawSalesTarget = shift.salesTarget == null ? "" : shift.salesTarget;
+    if (!["string", "number"].includes(typeof rawSalesTarget)) throw new Error(`第 ${index + 1} 个主播时段的目标销售额格式不正确`);
     const salesTarget = cleanMcpField(rawSalesTarget, "目标销售额", 32);
-    lines.push("---", `时段：${start}-${end}`,
-      `导演：${cleanMcpField(slot.director, "导演", 80)}`,
-      `主播：${cleanMcpField(slot.host, "主播", 80)}`,
-      `助播：${cleanMcpField(slot.assistant, "助播", 80)}`,
+    lines.push("---", "排班类型：主播", `时段：${start}-${end}`,
+      `主播：${cleanMcpField(shift.host, "主播", 80)}`,
+      `助播：${cleanMcpField(shift.assistant, "助播", 80)}`,
       `主推商品：${productText}`, `目标销售额：${salesTarget}`,
-      `备注：${cleanMcpField(slot.notes, "备注", 500)}`);
+      `备注：${cleanMcpField(shift.notes, "备注", 500)}`);
   }
   return lines.join("\n");
 }
@@ -891,23 +1087,28 @@ function validateMcpRoomSchedulesPayload(payload) {
     return { date, text, parsed };
   }).sort((a, b) => a.date.localeCompare(b.date));
 
-  const incomingSlots = parsedSchedules.flatMap(({ date, parsed }) => parsed.result.rooms[0].slots.map((slot) => ({ ...slot, date })));
-  incomingSlots.sort((a, b) => a.startAt - b.startAt);
-  const active = [];
-  for (const slot of incomingSlots) {
-    for (let index = active.length - 1; index >= 0; index -= 1) {
-      if (active[index].endAt <= slot.startAt) active.splice(index, 1);
+  for (const [role, selectShifts] of [
+    ["导演", (parsed) => parsed.result.rooms[0].directorShifts],
+    ["主播", (parsed) => parsed.result.rooms[0].hostShifts],
+  ]) {
+    const incoming = parsedSchedules.flatMap(({ date, parsed }) => selectShifts(parsed).map((shift) => ({ ...shift, date })));
+    incoming.sort((a, b) => a.startAt - b.startAt);
+    const active = [];
+    for (const shift of incoming) {
+      for (let index = active.length - 1; index >= 0; index -= 1) {
+        if (active[index].endAt <= shift.startAt) active.splice(index, 1);
+      }
+      const conflict = active.find((previous) => previous.date !== shift.date);
+      if (conflict) {
+        const cause = new Error(`提交的多日期${role}排班存在跨日时段重叠`);
+        cause.details = [{
+          sheet: `API-${roomCode}`, row: shift.sourceRow, field: `${role}排班时间`,
+          message: `与 ${conflict.date} ${conflict.start}-${conflict.end} 重叠`,
+        }];
+        throw cause;
+      }
+      active.push(shift);
     }
-    const conflict = active.find((previous) => previous.date !== slot.date);
-    if (conflict) {
-      const cause = new Error("提交的多日期排班存在跨日时段重叠");
-      cause.details = [{
-        sheet: `API-${roomCode}`, row: slot.sourceRow, field: "排班时间",
-        message: `与 ${conflict.date} ${conflict.start}-${conflict.end} 重叠`,
-      }];
-      throw cause;
-    }
-    active.push(slot);
   }
 
   const replacedDates = new Set(seenDates);
@@ -921,7 +1122,11 @@ function validateMcpRoomSchedulesPayload(payload) {
       roomName,
       dateCount: dates.length,
       scheduleCount: dates.reduce((count, day) => count + day.scheduleCount, 0),
+      hostShiftCount: dates.reduce((count, day) => count + day.scheduleCount, 0),
+      directorShiftCount: dates.reduce((count, day) => count + day.directorShiftCount, 0),
+      assignmentCount: dates.reduce((count, day) => count + day.assignmentCount, 0),
       replacingSlots: dates.reduce((count, day) => count + day.replacingSlots, 0),
+      replacingDirectorShifts: dates.reduce((count, day) => count + day.replacingDirectorShifts, 0),
       dates,
       warnings: dates.flatMap((day) => day.warnings),
     },
@@ -939,7 +1144,14 @@ function buildMcpRoomSchedulesPayload(args) {
   if (!roomName) throw new Error("新增直播间时请补充直播间名称");
   const schedules = args.schedules.map((item) => {
     const date = cleanMcpField(item?.date, "日期", 10);
-    return { date, text: fixedScheduleTextFromMcp({ roomCode, roomName, date, slots: item?.slots }) };
+    return {
+      date,
+      text: fixedScheduleTextFromMcp({
+        roomCode, roomName, date,
+        directorShifts: item?.directorShifts,
+        hostShifts: item?.hostShifts,
+      }),
+    };
   });
   const payload = { roomCode, roomName, schedules };
   return { payload, ...validateMcpRoomSchedulesPayload(payload) };
@@ -983,12 +1195,17 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
       id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
       products_json,sales_target_cents,notes,photo_type,photo_blob
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insertDirector = db.prepare(`INSERT INTO director_shifts(
+      id,room_code,date,start_time,end_time,starts_at,ends_at,director
+    ) VALUES (?,?,?,?,?,?,?,?)`);
     for (const { date, parsed } of parsedSchedules) {
       const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(roomCode, date);
       const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
       db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(roomCode, date);
+      db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(roomCode, date);
       let dayPreservedPhotos = 0;
-      for (const slot of parsed.result.rooms[0].slots) {
+      const schedule = parsed.result.rooms[0];
+      for (const slot of schedule.hostShifts) {
         const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
         if (previous?.photo_blob) {
           preservedPhotos += 1;
@@ -996,13 +1213,16 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
         }
         insertSlot.run(
           previous?.id ?? slot.id, roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          slot.director, slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
           slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
+      for (const shift of schedule.directorShifts) insertDirector.run(
+        shift.id, roomCode, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director,
+      );
       preservedByDate.set(date, dayPreservedPhotos);
     }
-    seedUniqueHostAvatars(parsedSchedules.flatMap(({ parsed }) => parsed.result.rooms[0].slots));
+    seedUniqueHostAvatars(parsedSchedules.flatMap(({ parsed }) => parsed.result.rooms[0].hostShifts));
     db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
     db.prepare("DELETE FROM mcp_previews WHERE id=?").run(row.id);
     db.exec("COMMIT");
@@ -1016,11 +1236,17 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     roomName,
     dateCount: preview.dateCount,
     scheduleCount: preview.scheduleCount,
+    hostShiftCount: preview.hostShiftCount,
+    directorShiftCount: preview.directorShiftCount,
+    assignmentCount: preview.assignmentCount,
     preservedPhotos,
     dates: preview.dates.map((day) => ({
       date: day.date,
       replacingSlots: day.replacingSlots,
+      replacingDirectorShifts: day.replacingDirectorShifts,
       scheduleCount: day.scheduleCount,
+      directorShiftCount: day.directorShiftCount,
+      assignmentCount: day.assignmentCount,
       preservedPhotos: preservedByDate.get(day.date) ?? 0,
     })),
     warnings: preview.warnings,
@@ -1053,19 +1279,28 @@ function commitMcpPreview(previewId, tokenId) {
       db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(parsed.roomCode, parsed.roomName, "MCP 自然语言更新", order);
     }
     db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+    db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
     const insertSlot = db.prepare(`INSERT INTO slots(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
       products_json,sales_target_cents,notes,photo_type,photo_blob
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    for (const slot of parsed.result.rooms[0].slots) {
+    const insertDirector = db.prepare(`INSERT INTO director_shifts(
+      id,room_code,date,start_time,end_time,starts_at,ends_at,director
+    ) VALUES (?,?,?,?,?,?,?,?)`);
+    const schedule = parsed.result.rooms[0];
+    for (const slot of schedule.hostShifts) {
       const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
       if (previous?.photo_blob) preservedPhotos += 1;
       insertSlot.run(
         previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-        slot.director, slot.host, slot.assistant, JSON.stringify(slot.products),
+        "", slot.host, slot.assistant, JSON.stringify(slot.products),
         slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
       );
     }
+    for (const shift of schedule.directorShifts) insertDirector.run(
+      shift.id, parsed.roomCode, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director,
+    );
+    seedUniqueHostAvatars(schedule.hostShifts);
     db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
     db.prepare("DELETE FROM mcp_previews WHERE id=?").run(previewId);
     db.exec("COMMIT");
@@ -1075,14 +1310,16 @@ function commitMcpPreview(previewId, tokenId) {
   }
   return {
     ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-    scheduleCount: preview.scheduleCount, preservedPhotos, warnings: parsed.warnings, dataUpdatedAt: updateAt,
+    scheduleCount: preview.scheduleCount, directorShiftCount: preview.directorShiftCount,
+    assignmentCount: preview.assignmentCount, preservedPhotos, warnings: preview.warnings, dataUpdatedAt: updateAt,
   };
 }
 
 async function callMcpTool(name, args, token) {
   if (name === "list_rooms") {
     const rooms = db.prepare(`SELECT r.code,r.name,r.sort_order AS sortOrder,
-      (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount
+      (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
+      (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount
       FROM rooms r ORDER BY r.sort_order`).all();
     return mcpToolResult({ rooms });
   }
@@ -1092,16 +1329,19 @@ async function callMcpTool(name, args, token) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("日期格式应为 YYYY-MM-DD");
     const room = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
     if (!room) throw new Error(`直播间编号 ${roomCode} 不存在，请先查看直播间列表`);
-    const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((slot) => {
+    const hostShifts = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((slot) => {
       const avatar = slot.host ? hostAvatarByNameKey.get(hostNameKey(slot.host)) : null;
       const hasPhoto = avatar ? Boolean(avatar.photo_type) : Boolean(slot.photo_blob);
       return {
-        start: slot.start_time, end: slot.end_time, director: slot.director, host: slot.host, assistant: slot.assistant,
+        start: slot.start_time, end: slot.end_time, host: slot.host, assistant: slot.assistant,
         featuredProducts: JSON.parse(slot.products_json), salesTarget: salesDisplay(slot.sales_target_cents),
         notes: slot.notes, hasPhoto, avatarSource: avatar?.photo_type ? "头像库" : hasPhoto ? "本场已有照片" : "未配置",
       };
     });
-    return mcpToolResult({ room, date, schedule });
+    const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((shift) => ({
+      start: shift.start_time, end: shift.end_time, director: shift.director,
+    }));
+    return mcpToolResult({ room, date, directorShifts, hostShifts });
   }
   if (name === "preview_schedule_update") {
     const scheduleText = fixedScheduleTextFromMcp(args);
@@ -1337,33 +1577,34 @@ async function handle(request, response) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return error(response, 400, "INVALID_REQUEST", "请求正文必须是 JSON 对象");
     }
+    if (!Array.isArray(input.directorShifts) || !Array.isArray(input.hostShifts)) {
+      return error(response, 400, "INVALID_REQUEST", "必须分别提供完整的导演班次和主播场次列表");
+    }
     if (typeof input.dataUpdatedAt !== "string" || input.dataUpdatedAt !== updatedAtValue()) {
       return error(response, 409, "SCHEDULES_CHANGED", "排班数据已被其他操作更新，请刷新列表后重新修改");
     }
 
-    const originalNotes = Array.isArray(input.slots)
-      ? input.slots.map((slot) => typeof slot?.notes === "string" ? slot.notes.trim() : "")
-      : [];
+    const hostInput = Array.isArray(input.hostShifts) ? input.hostShifts : [];
+    const directorInput = Array.isArray(input.directorShifts) ? input.directorShifts : [];
+    const originalNotes = hostInput.map((slot) => typeof slot?.notes === "string" ? slot.notes.trim() : "");
+    const editPayload = {
+      ...input,
+      directorShifts: directorInput.map((shift) => ({ ...shift })),
+      hostShifts: hostInput.map((slot, index) => ({
+        ...slot,
+        // Keep multiline notes separate from the single-line schedule parser.
+        notes: originalNotes[index].replace(/\r\n?/g, " ").replace(/\n/g, " ").trim(),
+      })),
+    };
     if (originalNotes.some((notes) => notes.length > 500)) {
       return error(response, 422, "SCHEDULE_INVALID", "备注不能超过 500 个字符");
     }
-    const scheduleInput = {
-      roomCode: input.roomCode,
-      date: input.date,
-      slots: Array.isArray(input.slots)
-        ? input.slots.map((slot) => ({
-          ...slot,
-          // The shared schedule parser uses one-line text fields; retain the original
-          // multiline note separately and restore it when writing the validated rows.
-          notes: String(slot?.notes ?? "").replace(/\r\n?/g, " ").replace(/\n/g, " ").trim(),
-        }))
-        : input.slots,
-    };
     let parsed;
     let preview;
-    let sourceSlotByKey;
+    let sourceHostByKey;
+    let sourceDirectorByKey;
     try {
-      const scheduleText = fixedScheduleTextFromMcp(scheduleInput);
+      const scheduleText = fixedScheduleTextFromMcp(editPayload);
       parsed = validateFixedScheduleText(scheduleText);
       if (parsed.result.errors.length) {
         return json(response, 422, { error: { code: "SCHEDULE_INVALID", message: "排班内容未通过校验，请修正后重试", details: parsed.result.errors } });
@@ -1372,9 +1613,13 @@ async function handle(request, response) {
         return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
       }
       preview = mcpPreviewFor(parsed);
-      sourceSlotByKey = new Map(scheduleInput.slots.map((slot, index) => [
+      sourceHostByKey = new Map(editPayload.hostShifts.map((slot, index) => [
         `${excelTime(slot.start)}\u0000${excelTime(slot.end)}\u0000${String(slot.host ?? "").trim()}`,
         { id: slot.id, notes: originalNotes[index] ?? "" },
+      ]));
+      sourceDirectorByKey = new Map(editPayload.directorShifts.map((shift) => [
+        `${excelTime(shift.start)}\u0000${excelTime(shift.end)}\u0000${String(shift.director ?? "").trim()}`,
+        { id: shift.id },
       ]));
     } catch (cause) {
       return error(response, 422, "SCHEDULE_INVALID", cause.message, cause.details ?? []);
@@ -1386,27 +1631,46 @@ async function handle(request, response) {
       db.exec("BEGIN IMMEDIATE");
       if (input.dataUpdatedAt !== updatedAtValue()) throw new Error("SCHEDULES_CHANGED");
       const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
-      const previousByKey = new Map(previousSlots.map((slot) => [
+      const previousByHostKey = new Map(previousSlots.map((slot) => [
         `${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot,
       ]));
-      const previousById = new Map(previousSlots.map((slot) => [slot.id, slot]));
+      const previousSlotById = new Map(previousSlots.map((slot) => [slot.id, slot]));
+      const previousDirectors = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
+      const previousDirectorByKey = new Map(previousDirectors.map((shift) => [
+        `${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift,
+      ]));
+      const previousDirectorById = new Map(previousDirectors.map((shift) => [shift.id, shift]));
       db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+      db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       const insertSlot = db.prepare(`INSERT INTO slots(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
         products_json,sales_target_cents,notes,photo_type,photo_blob
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-      for (const slot of parsed.result.rooms[0].slots) {
-        const source = sourceSlotByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
-        const previousByOriginalId = source?.id ? previousById.get(source.id) : null;
-        const previous = (previousByOriginalId?.host === slot.host ? previousByOriginalId : null)
-          ?? previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
-        const id = previous?.id ?? previousByOriginalId?.id ?? slot.id;
+      const insertDirector = db.prepare(`INSERT INTO director_shifts(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director
+      ) VALUES (?,?,?,?,?,?,?,?)`);
+      const schedule = parsed.result.rooms[0];
+      for (const slot of schedule.hostShifts) {
+        const source = sourceHostByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
+        const priorById = source?.id ? previousSlotById.get(source.id) : null;
+        const previous = (priorById?.host === slot.host ? priorById : null)
+          ?? previousByHostKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
         insertSlot.run(
-          id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          slot.director, slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+          previous?.id ?? priorById?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
+          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
           source?.notes ?? slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
+      for (const shift of schedule.directorShifts) {
+        const source = sourceDirectorByKey.get(`${shift.start}\u0000${shift.end}\u0000${shift.director}`);
+        const priorById = source?.id ? previousDirectorById.get(source.id) : null;
+        const previous = (priorById?.director === shift.director ? priorById : null)
+          ?? previousDirectorByKey.get(`${shift.start}\u0000${shift.end}\u0000${shift.director}`);
+        insertDirector.run(
+          previous?.id ?? priorById?.id ?? shift.id, parsed.roomCode, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director,
+        );
+      }
+      seedUniqueHostAvatars(schedule.hostShifts);
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.exec("COMMIT");
     } catch (cause) {
@@ -1417,7 +1681,11 @@ async function handle(request, response) {
       console.error("网页排班修改失败:", cause.message);
       return error(response, 500, "SCHEDULE_SAVE_FAILED", "保存失败，原有排班数据保持不变");
     }
-    return json(response, 200, { ok: true, roomCode: parsed.roomCode, date: parsed.date, scheduleCount: preview.scheduleCount, dataUpdatedAt: updateAt });
+    return json(response, 200, {
+      ok: true, roomCode: parsed.roomCode, date: parsed.date,
+      scheduleCount: preview.scheduleCount, directorShiftCount: preview.directorShiftCount, dataUpdatedAt: updateAt,
+    });
+
   }
 
   if (request.method === "GET" && pathname === "/api/v1/admin/api-tokens") {
@@ -1533,11 +1801,12 @@ async function handle(request, response) {
     if (!room) return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
     const { today, yesterday } = currentShanghaiDay();
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date IN (?,?) ORDER BY starts_at").all(code, today, yesterday).map(publicSlot);
+    const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date IN (?,?) ORDER BY starts_at").all(code, today, yesterday).map(publicDirectorShift);
     const dataUpdatedAt = db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
-    const transitions = schedule.flatMap((slot) => [slot.startsAt, slot.endsAt]).filter((value) => value > Date.now());
+    const transitions = [...schedule, ...directorShifts].flatMap((shift) => [shift.startsAt, shift.endsAt]).filter((value) => value > Date.now());
     return json(response, 200, {
       dataUpdatedAt, serverNow: new Date().toISOString(), timeZone: "Asia/Shanghai",
-      room, schedule, nextTransitionAt: transitions.length ? Math.min(...transitions) : null,
+      room, schedule, directorShifts, nextTransitionAt: transitions.length ? Math.min(...transitions) : null,
     });
   }
 
@@ -1549,7 +1818,8 @@ async function handle(request, response) {
     const room = db.prepare("SELECT code FROM rooms WHERE code=?").get(scheduleMatch[1]);
     if (!room) return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(room.code, date).map(publicSlot);
-    return json(response, 200, { date, schedule });
+    const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=? ORDER BY starts_at").all(room.code, date).map(publicDirectorShift);
+    return json(response, 200, { date, schedule, directorShifts });
   }
 
   if (request.method === "POST" && ["/api/v1/integrations/schedule-text/preview", "/api/v1/integrations/schedule-text/commit"].includes(pathname)) {
@@ -1567,36 +1837,19 @@ async function handle(request, response) {
       return error(response, 422, "TEXT_FORMAT_INVALID", cause.message, cause.details ?? []);
     }
     const { result } = parsed;
-    const slotCount = result.rooms.reduce((count, room) => count + room.slots.length, 0);
+    const hostShiftCount = result.rooms.reduce((count, room) => count + room.hostShifts.length, 0);
+    const directorShiftCount = result.rooms.reduce((count, room) => count + room.directorShifts.length, 0);
     if (result.errors.length) {
       return json(response, 422, {
         ok: false, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-        scheduleCount: slotCount, errors: result.errors, warnings: parsed.warnings,
+        scheduleCount: hostShiftCount, directorShiftCount, errors: result.errors, warnings: parsed.warnings,
       });
     }
 
-    const slots = result.rooms[0].slots;
-    const adjacentSlots = db.prepare("SELECT date,start_time,end_time,starts_at,ends_at FROM slots WHERE room_code=? AND date IN (?,?)")
-      .all(parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1));
-    const boundaryConflicts = slots.flatMap((slot, index) => adjacentSlots
-      .filter((existing) => slot.startAt < existing.ends_at && existing.starts_at < slot.endAt)
-      .map((existing) => ({
-        sheet: parsed.sheet.name, row: index + 4, field: "排班时间",
-        message: `与相邻日期 ${existing.date} ${existing.start_time}-${existing.end_time} 的现有排班重叠`,
-      })));
-    if (boundaryConflicts.length) {
-      return json(response, 422, {
-        ok: false, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-        scheduleCount: slots.length, errors: boundaryConflicts, warnings: parsed.warnings,
-      });
-    }
+    const schedule = result.rooms[0];
     const schedulePreview = mcpPreviewFor(parsed);
-    const existingCount = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(parsed.roomCode, parsed.date).count;
     if (pathname.endsWith("/preview")) {
-      return json(response, 200, {
-        ok: true,
-        preview: { ...schedulePreview, replacingSlots: existingCount },
-      });
+      return json(response, 200, { ok: true, preview: schedulePreview });
     }
     if (input.confirmReplace !== true) {
       return error(response, 409, "REPLACEMENT_CONFIRMATION_REQUIRED", "提交前请先预览内容，并在用户确认后设置 confirmReplace=true");
@@ -1607,6 +1860,10 @@ async function handle(request, response) {
     const previousByKey = new Map(previousSlots.map((slot) => [
       `${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`,
       slot,
+    ]));
+    const previousDirectors = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
+    const previousDirectorByKey = new Map(previousDirectors.map((shift) => [
+      `${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift,
     ]));
     let preservedPhotos = 0;
     const updateAt = new Date().toISOString();
@@ -1619,20 +1876,28 @@ async function handle(request, response) {
         db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(parsed.roomCode, parsed.roomName, "API 文本更新", order);
       }
       db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
+      db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       const insertSlot = db.prepare(`INSERT INTO slots(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
         products_json,sales_target_cents,notes,photo_type,photo_blob
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-      for (const slot of slots) {
+      const insertDirector = db.prepare(`INSERT INTO director_shifts(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director
+      ) VALUES (?,?,?,?,?,?,?,?)`);
+      for (const slot of schedule.hostShifts) {
         const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
         if (previous?.photo_blob) preservedPhotos += 1;
         insertSlot.run(
           previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          slot.director, slot.host, slot.assistant, JSON.stringify(slot.products),
+          "", slot.host, slot.assistant, JSON.stringify(slot.products),
           slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
-      seedUniqueHostAvatars(slots.map((slot) => ({ host: slot.host })));
+      for (const shift of schedule.directorShifts) {
+        const previous = previousDirectorByKey.get(`${shift.start}\u0000${shift.end}\u0000${shift.director}`);
+        insertDirector.run(previous?.id ?? shift.id, parsed.roomCode, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director);
+      }
+      seedUniqueHostAvatars(schedule.hostShifts);
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.exec("COMMIT");
     } catch (cause) {
@@ -1642,11 +1907,18 @@ async function handle(request, response) {
     }
     return json(response, 200, {
       ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-      scheduleCount: slots.length, preservedPhotos, warnings: schedulePreview.warnings, dataUpdatedAt: updateAt,
+      scheduleCount: schedule.hostShifts.length, directorShiftCount: schedule.directorShifts.length,
+      preservedPhotos, warnings: schedulePreview.warnings, dataUpdatedAt: updateAt,
     });
   }
 
   if (pathname === "/mcp") return handleMcpRequest(request, response);
+
+  if (request.method === "GET" && pathname === "/api/v1/admin/schedule-upload/rooms") {
+    if (!requireUser(request, response, "admin")) return;
+    const names = new Map(db.prepare("SELECT code,name FROM rooms").all().map(({ code, name }) => [code, name]));
+    return json(response, 200, { rooms: NUMBERED_ROOM_CODES.map((code) => ({ code, name: names.get(code) ?? null })) });
+  }
 
   if (request.method === "POST" && pathname === "/api/v1/admin/schedule-upload") {
     const user = requireUser(request, response, "admin");
@@ -1656,6 +1928,10 @@ async function handle(request, response) {
     const mode = url.searchParams.get("mode");
     if (!['preview', 'commit'].includes(action) || !['single', 'master'].includes(mode)) {
       return error(response, 400, "UPLOAD_MODE_INVALID", "请指定单直播间或 27 间总表模式，并先预览再提交");
+    }
+    const targetCode = mode === "single" ? url.searchParams.get("roomCode") : null;
+    if (mode === "single" && !NUMBERED_ROOM_CODES.includes(targetCode)) {
+      return error(response, 400, "UPLOAD_ROOM_INVALID", "请在网页选择 01 至 27 号直播间");
     }
     const uploadWindow = uploadWindows.get(user.id);
     if (uploadWindow && uploadWindow.until > Date.now() && uploadWindow.count >= 8) {
@@ -1671,16 +1947,21 @@ async function handle(request, response) {
     } catch (cause) {
       return error(response, cause.status ?? 422, "WORKBOOK_READ_FAILED", cause.message, []);
     }
-    const result = validateWorkbook(workbook);
+    const targetRoom = targetCode ? {
+      code: targetCode,
+      name: db.prepare("SELECT name FROM rooms WHERE code=?").get(targetCode)?.name ?? `${targetCode}号直播间`,
+    } : null;
+    const result = validateWorkbook(workbook, targetRoom);
     const expectedDataUpdatedAt = url.searchParams.get("expectedDataUpdatedAt");
     if (action === "commit" && (expectedDataUpdatedAt === null || expectedDataUpdatedAt !== updatedAtValue())) {
       return error(response, 409, "SCHEDULES_CHANGED", "预览后排班数据有更新，请重新校验并预览");
     }
     result.errors.push(...workbookImportErrors(workbook, result, mode));
-    const slotCount = result.rooms.reduce((count, room) => count + room.slots.length, 0);
+    const slotCount = result.rooms.reduce((count, room) => count + room.hostShifts.length, 0);
+    const directorShiftCount = result.rooms.reduce((count, room) => count + room.directorShifts.length, 0);
     if (result.errors.length) {
       return json(response, 422, {
-        ok: false, roomCount: result.rooms.length, scheduleCount: slotCount, workbookSheetCount: workbook.length,
+        ok: false, roomCount: result.rooms.length, scheduleCount: slotCount, directorShiftCount, workbookSheetCount: workbook.length,
         errors: result.errors, warnings: result.warnings,
       });
     }
@@ -1702,29 +1983,39 @@ async function handle(request, response) {
         id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
         products_json,sales_target_cents,notes,photo_type,photo_blob
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      const insertDirector = db.prepare(`INSERT INTO director_shifts(
+        id,room_code,date,start_time,end_time,starts_at,ends_at,director
+      ) VALUES (?,?,?,?,?,?,?,?)`);
       for (const room of result.rooms) {
-        if (findRoom.get(room.code)) updateRoom.run(room.name, room.sheetName, room.code);
-        else insertRoom.run(room.code, room.name, room.sheetName, nextRoomOrder++);
-        const slotsByDate = new Map();
-        for (const slot of room.slots) {
-          if (!slotsByDate.has(slot.date)) slotsByDate.set(slot.date, []);
-          slotsByDate.get(slot.date).push(slot);
+        if (!findRoom.get(room.code)) insertRoom.run(room.code, room.name, room.sheetName, nextRoomOrder++);
+        else if (!targetRoom) updateRoom.run(room.name, room.sheetName, room.code);
+        const datesByKey = new Map();
+        for (const shift of [...room.directorShifts, ...room.hostShifts]) {
+          if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShifts: [], hostShifts: [] });
+          datesByKey.get(shift.date)["director" in shift ? "directorShifts" : "hostShifts"].push(shift);
         }
-        for (const [date, slots] of slotsByDate) {
+        for (const [date, shifts] of datesByKey) {
           const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(room.code, date);
           const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
+          const previousDirectors = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=?").all(room.code, date);
+          const previousDirectorByKey = new Map(previousDirectors.map((shift) => [`${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift]));
           db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(room.code, date);
-          for (const slot of slots) {
+          db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(room.code, date);
+          for (const slot of shifts.hostShifts) {
             const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
             insertSlot.run(
               previous?.id ?? slot.id, room.code, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-              slot.director, slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+              "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
               slot.notes, slot.photo?.contentType ?? previous?.photo_type ?? null, slot.photo?.bytes ?? previous?.photo_blob ?? null,
             );
           }
+          for (const shift of shifts.directorShifts) {
+            const previous = previousDirectorByKey.get(`${shift.start}\u0000${shift.end}\u0000${shift.director}`);
+            insertDirector.run(previous?.id ?? shift.id, room.code, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director);
+          }
         }
       }
-      seedUniqueHostAvatars(result.rooms.flatMap((room) => room.slots));
+      seedUniqueHostAvatars(result.rooms.flatMap((room) => room.hostShifts));
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.exec("COMMIT");
     } catch (cause) {
@@ -1736,6 +2027,7 @@ async function handle(request, response) {
     const totalRoomCount = db.prepare("SELECT COUNT(*) AS count FROM rooms").get().count;
     return json(response, 200, {
       ok: true, roomCount: result.rooms.length, totalRoomCount, scheduleCount: slotCount,
+      directorShiftCount,
       warnings: result.warnings, dataUpdatedAt: updateAt,
     });
   }

@@ -57,13 +57,12 @@ function scheduleHasEnded(group, slot, timestamp) {
   return endAt <= timestamp;
 }
 
-function getProgram(room, timestamp) {
-  if (!room) return { current: null, next: null, display: null, today: [], nextChangeAt: null };
+function getProgram(items, timestamp) {
   const today = dateKey(new Date(timestamp));
   const yesterdayDate = new Date(`${today}T00:00:00+08:00`);
   yesterdayDate.setUTCDate(yesterdayDate.getUTCDate() - 1);
   const yesterday = dateKey(yesterdayDate);
-  const sessions = (room.schedule ?? [])
+  const sessions = (items ?? [])
     .filter((item) => item.date === today || item.date === yesterday)
     .map((item) => {
       const startAt = Number(item.startsAt) || atTime(item.date, item.start);
@@ -102,11 +101,12 @@ function formatClock(date) {
   }).format(date);
 }
 
-function RoleCard({ label, value, featured = false }) {
+function RoleCard({ label, value, time, featured = false }) {
   return (
     <section className={`role-card${featured ? " role-card-featured" : ""}`}>
       <div className="role-label">{label}</div>
       <div className="role-name">{value || "待安排"}</div>
+      {time && <div className="role-time">{time}</div>}
     </section>
   );
 }
@@ -624,6 +624,7 @@ function AdminScheduleLibrary({ csrfToken }) {
       if (roomFilter !== "all" && group.roomCode !== roomFilter) return [];
       if (dateFilter && group.date !== dateFilter) return [];
       const slots = group.slots.filter((slot) => !query || [
+        slot.kind === "director" ? "导演排班" : "主播排班",
         slot.start, slot.end, slot.director, slot.host, slot.assistant, slot.salesTarget, slot.notes,
         ...slot.featuredProducts,
       ].some((value) => String(value ?? "").toLocaleLowerCase("zh-CN").includes(query)));
@@ -647,7 +648,7 @@ function AdminScheduleLibrary({ csrfToken }) {
 
   function beginEdit(group, slot) {
     const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
-    setEditing({ key, roomCode: group.roomCode, date: group.date, slotId: slot.id });
+    setEditing({ key, roomCode: group.roomCode, date: group.date, slotId: slot.id, kind: slot.kind });
     setEditValues({
       start: slot.start,
       end: slot.end,
@@ -668,34 +669,37 @@ function AdminScheduleLibrary({ csrfToken }) {
   function renderGroup(group) {
     return (
       <article className="schedule-group" key={`${group.roomCode}-${group.date}`}>
-        <header className="schedule-group-heading"><div><h3>{group.roomName}</h3><time>{group.date}</time></div><span>{group.slots.length} 场</span></header>
+        <header className="schedule-group-heading"><div><h3>{group.roomName}</h3><time>{group.date}</time></div><span>{group.slots.length} 条</span></header>
         <div className="schedule-table-wrap">
           <table className="schedule-table">
-            <thead><tr><th>时段</th><th>导演</th><th>主播</th><th>助播</th><th>主推商品</th><th>目标销售额</th><th>头像</th><th>备注</th><th>操作</th></tr></thead>
+            <thead><tr><th>类型</th><th>时段</th><th>导演</th><th>主播</th><th>助播</th><th>主推商品</th><th>目标销售额</th><th>头像</th><th>备注</th><th>操作</th></tr></thead>
             <tbody>{group.slots.map((slot) => {
               const key = `${group.roomCode}\u0000${group.date}\u0000${slot.id}`;
               const isEditing = editing?.key === key;
               return isEditing ? (
                 <tr className="schedule-edit-row" key={slot.id}>
-                  <td colSpan="9">
+                  <td colSpan="10">
                     <form className="schedule-edit-form" onSubmit={(event) => saveEdit(event, group, slot)}>
                       <label>开始时间<input type="time" value={editValues.start} onChange={(event) => updateEdit("start", event.target.value)} required /></label>
                       <label>结束时间<input type="time" value={editValues.end} onChange={(event) => updateEdit("end", event.target.value)} required /></label>
-                      <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
-                      <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
-                      <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
-                      <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
-                      <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
-                      <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
+                      {slot.kind === "director" ? (
+                        <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
+                      ) : <>
+                        <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
+                        <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
+                        <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
+                        <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
+                        <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
+                      </>}
                       <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>
                     </form>
                   </td>
                 </tr>
               ) : (
                 <tr key={slot.id}>
-                  <td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
+                  <td>{slot.kind === "director" ? "导演排班" : "主播排班"}</td><td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
                   <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td>{slot.salesTarget || "—"}</td>
-                  <td><span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span></td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
+                  <td>{slot.kind === "host" ? <span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span> : "—"}</td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
                   <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
                 </tr>
               );
@@ -716,20 +720,20 @@ function AdminScheduleLibrary({ csrfToken }) {
     if (saving || !editValues) return;
     setSaving(true);
     setMessage("");
-    const updatedSlot = {
-      ...slot,
-      start: editValues.start,
-      end: editValues.end,
-      director: editValues.director,
-      host: editValues.host,
-      assistant: editValues.assistant,
+    const updatedSlot = slot.kind === "director" ? {
+      ...slot, start: editValues.start, end: editValues.end, director: editValues.director,
+    } : {
+      ...slot, start: editValues.start, end: editValues.end, host: editValues.host, assistant: editValues.assistant,
       featuredProducts: editValues.products.split(/[\r\n;；、]+/).map((item) => item.trim()).filter(Boolean),
-      salesTarget: editValues.salesTarget,
-      notes: editValues.notes,
+      salesTarget: editValues.salesTarget, notes: editValues.notes,
     };
     // Filters can hide siblings, so submit the complete unfiltered day from the source payload.
     const completeGroup = data.groups.find((item) => item.roomCode === group.roomCode && item.date === group.date);
     const completeSlots = completeGroup.slots.map((item) => item.id === slot.id ? updatedSlot : item);
+    const directorShifts = completeSlots.filter((item) => item.kind === "director")
+      .map(({ id, start, end, director }) => ({ id, start, end, director }));
+    const hostShifts = completeSlots.filter((item) => item.kind === "host")
+      .map(({ id, start, end, host, assistant, featuredProducts, salesTarget, notes }) => ({ id, start, end, host, assistant, featuredProducts, salesTarget, notes }));
     try {
       await api("/api/v1/admin/schedules", {
         method: "PUT",
@@ -738,7 +742,8 @@ function AdminScheduleLibrary({ csrfToken }) {
           roomCode: group.roomCode,
           date: group.date,
           dataUpdatedAt: data.dataUpdatedAt,
-          slots: completeSlots,
+          directorShifts,
+          hostShifts,
         }),
       });
       await loadSchedules();
@@ -766,15 +771,15 @@ function AdminScheduleLibrary({ csrfToken }) {
   return (
     <section className="schedule-library" role="tabpanel" aria-label="已录入排班">
       <div className="schedule-library-toolbar">
-        <div><span className="section-kicker">SAVED SCHEDULES</span><h2>已录入排班</h2><p>查看已保存的直播间时段；发现错误可直接编辑对应场次。</p></div>
+        <div><span className="section-kicker">SAVED SCHEDULES</span><h2>已录入排班</h2><p>查看已保存的直播间排班；发现错误可分别编辑导演班次或主播场次。</p></div>
         <button className="avatar-secondary-button schedule-refresh-button" type="button" onClick={loadSchedules} disabled={loading}>{loading ? "正在刷新…" : "刷新列表"}</button>
       </div>
 
       <div className="schedule-library-filters">
         <label>直播间<select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}><option value="all">全部直播间</option>{(data?.rooms ?? []).map((room) => <option key={room.code} value={room.code}>{room.name}</option>)}</select></label>
         <label>排班日期<input type="date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} /></label>
-        <label className="schedule-search">搜索主播、商品或备注<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入关键词" /></label>
-        <div className="schedule-library-count">{loading && !data ? "读取中…" : `共 ${data?.scheduleCount ?? 0} 场 · 当前筛选 ${filteredCount} 场 · 已归档 ${archivedCount} 场`}</div>
+        <label className="schedule-search">搜索导演、主播、商品或备注<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入关键词" /></label>
+         <div className="schedule-library-count">{loading && !data ? "读取中…" : `主播 ${data?.scheduleCount ?? 0} 场 · 导演 ${data?.directorShiftCount ?? 0} 班 · 筛选 ${filteredCount} 条 · 已归档 ${archivedCount} 条`}</div>
       </div>
 
       {message && <div className={`form-message${messageType === "error" ? " form-error" : " form-success"}`} role={messageType === "error" ? "alert" : "status"}>{message}</div>}
@@ -787,7 +792,7 @@ function AdminScheduleLibrary({ csrfToken }) {
 
       {!loading && !loadError && data && (
         <details className="schedule-archive">
-          <summary><span className="schedule-archive-title">已归档</span><span className="schedule-archive-count">{archivedCount} 场</span></summary>
+          <summary><span className="schedule-archive-title">已归档</span><span className="schedule-archive-count">{archivedCount} 条</span></summary>
           <div className="schedule-archive-content">
             {archivedGroups.length ? archivedGroups.map(renderGroup) : <div className="schedule-archive-empty">当前筛选下没有已结束的排班。</div>}
           </div>
@@ -801,19 +806,50 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [activeTab, setActiveTab] = useState("schedule");
   const [file, setFile] = useState(null);
   const [uploadMode, setUploadMode] = useState("single");
+  const [uploadRooms, setUploadRooms] = useState(null);
+  const [uploadRoomsError, setUploadRoomsError] = useState(false);
+  const [uploadRoomCode, setUploadRoomCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
   const [preview, setPreview] = useState(null);
   const [message, setMessage] = useState("");
+  const singleUpload = uploadMode === "single";
+  const uploadReady = !singleUpload || Boolean(uploadRooms && uploadRoomCode);
+
+  useEffect(() => {
+    if (activeTab !== "schedule" || !singleUpload) return;
+    const request = new AbortController();
+    setUploadRoomsError(false);
+    api("/api/v1/admin/schedule-upload/rooms", { signal: request.signal })
+      .then(({ rooms }) => { if (!request.signal.aborted) setUploadRooms(rooms); })
+      .catch(() => { if (!request.signal.aborted) setUploadRoomsError(true); });
+    return () => request.abort();
+  }, [activeTab, singleUpload]);
+
+  function clearUploadPreview() {
+    setPreview(null);
+    setResult(null);
+    setMessage("");
+  }
+
+  function changeUploadMode(mode) {
+    setUploadMode(mode);
+    setUploadRoomCode("");
+    setFile(null);
+    clearUploadPreview();
+  }
+
   async function upload(action, event) {
     event?.preventDefault();
-    if (!file || busy) return;
+    if (!file || busy || !uploadReady) return;
+    if (action === "commit" && (!preview || (singleUpload && preview.rooms[0]?.code !== uploadRoomCode))) return;
     setBusy(true);
     setMessage("");
     setResult(null);
     const form = new FormData();
     form.append("file", file);
     const params = new URLSearchParams({ action, mode: uploadMode });
+    if (singleUpload) params.set("roomCode", uploadRoomCode);
     if (action === "commit" && typeof preview?.dataUpdatedAt === "string") params.set("expectedDataUpdatedAt", preview.dataUpdatedAt);
     try {
       const response = await fetch(`/api/v1/admin/schedule-upload?${params}`, {
@@ -826,7 +862,8 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         setMessage("预览已生成，当前数据未更改。核对后点击“确认并更新”。");
       } else if (response.ok) {
         setPreview(null);
-        setMessage(`已更新 ${body.roomCount} 个工作表中的 ${body.scheduleCount} 场排班；未包含的直播间和日期保持不变。展示页将在 30 秒内同步。`);
+        const target = singleUpload ? `${uploadRoomCode} 号直播间` : `${body.roomCount} 个工作表`;
+        setMessage(`已更新 ${target}：主播 ${body.scheduleCount} 场、导演 ${body.directorShiftCount} 班。展示页将在 30 秒内同步。`);
       } else {
         setPreview(null);
         setMessage(body.error?.message ?? `发现 ${body.errors?.length ?? 0} 项需要修正，现有数据未更改。`);
@@ -871,34 +908,47 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           </div>
           <div className="upload-mode-picker" role="radiogroup" aria-label="上传范围">
             <label className={uploadMode === "single" ? "selected" : ""}>
-              <input type="radio" name="uploadMode" value="single" checked={uploadMode === "single"} disabled={busy} onChange={() => { setUploadMode("single"); setPreview(null); setResult(null); setMessage(""); }} />
-              <span><strong>单个直播间</strong><small>工作簿只放 1 个工作表</small></span>
+              <input type="radio" name="uploadMode" value="single" checked={singleUpload} disabled={busy} onChange={() => changeUploadMode("single")} />
+              <span><strong>单个直播间</strong><small>选定直播间后上传 1 个工作表</small></span>
             </label>
             <label className={uploadMode === "master" ? "selected" : ""}>
-              <input type="radio" name="uploadMode" value="master" checked={uploadMode === "master"} disabled={busy} onChange={() => { setUploadMode("master"); setPreview(null); setResult(null); setMessage(""); }} />
+              <input type="radio" name="uploadMode" value="master" checked={!singleUpload} disabled={busy} onChange={() => changeUploadMode("master")} />
               <span><strong>27 个直播间总表</strong><small>工作簿必须包含 27 个工作表</small></span>
             </label>
           </div>
           <form className="upload-form" onSubmit={(event) => upload("preview", event)}>
+            {singleUpload && (
+              <label className="upload-room-picker">
+                <span>导入到直播间</span>
+                <select value={uploadRoomCode} required disabled={busy || !uploadRooms} aria-describedby="upload-room-hint"
+                  onChange={(event) => { setUploadRoomCode(event.target.value); setFile(null); clearUploadPreview(); }}>
+                  <option value="" disabled>{uploadRooms ? "请选择直播间" : uploadRoomsError ? "直播间读取失败，请刷新页面" : "正在读取直播间…"}</option>
+                  {uploadRooms?.map(({ code, name }) => (
+                    <option value={code} key={code}>{code} 号直播间{name && name !== `${code}号直播间` ? ` · ${name}` : ""}</option>
+                  ))}
+                </select>
+                <small id="upload-room-hint">排班将导入所选直播间，Excel 中的直播间名称和编号可留空。</small>
+              </label>
+            )}
             <label className={`upload-dropzone${file ? " upload-selected" : ""}`} htmlFor="workbook-file">
               <span className="upload-glyph">⌁</span>
               <strong>{file ? file.name : "选择排班工作簿"}</strong>
-              <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换` : "点击选择 .xlsx 文件，文件最大 30 MB"}</small>
-              <input id="workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={busy} onChange={(event) => { setFile(event.target.files?.[0] ?? null); setPreview(null); setResult(null); setMessage(""); }} />
+              <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换` : uploadReady ? "点击选择 .xlsx 文件，文件最大 30 MB" : "请先选择直播间"}</small>
+              <input key={`${uploadMode}:${uploadRoomCode}`} id="workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={busy || !uploadReady} onChange={(event) => { setFile(event.target.files?.[0] ?? null); clearUploadPreview(); }} />
             </label>
-            <button className="button-primary upload-button" type="submit" disabled={!file || busy}>{busy ? "正在校验工作簿…" : "校验并预览"}</button>
+            <button className="button-primary upload-button" type="submit" disabled={!uploadReady || !file || busy}>{busy ? "正在校验工作簿…" : "校验并预览"}</button>
           </form>
           {message && <div className={`form-message${problems.length ? " form-error" : result?.ok ? " form-success" : ""}`} role="status">{message}</div>}
           {preview && (
             <section className="upload-preview" aria-label="排班导入预览">
               <h3>导入预览（尚未写入）</h3>
-              <div className="import-summary"><span><strong>{preview.roomCount}</strong> 个工作表</span><span><strong>{preview.addedRoomCount}</strong> 个新增直播间</span><span><strong>{preview.dateCount}</strong> 个排班日期</span><span><strong>{preview.scheduleCount}</strong> 场排班</span><span>更新后共 <strong>{preview.totalRoomCount}</strong> 个直播间</span></div>
-              <p>只有上面列出的直播间和日期会更新；未列出的现有直播间及日期保持不变。</p>
+              <div className="import-summary"><span><strong>{preview.roomCount}</strong> 个工作表</span><span><strong>{preview.addedRoomCount}</strong> 个新增直播间</span><span><strong>{preview.dateCount}</strong> 个排班日期</span><span>主播 <strong>{preview.scheduleCount}</strong> 场</span><span>导演 <strong>{preview.directorShiftCount}</strong> 班</span><span>更新后共 <strong>{preview.totalRoomCount}</strong> 个直播间</span></div>
+              <p>列出的日期会同时整体替换当天导演和主播两张独立排班表；未列出的直播间及日期保持不变。</p>
               <ul className="upload-preview-list">{preview.rooms.map((room) => (
                 <li key={room.code}>
                   <strong>{room.code} · {room.name}</strong>
-                  <span>{room.action}{room.nameChanged ? ` · 名称由“${room.previousName}”改为“${room.name}”` : ""} · {room.dateCount ? `${room.dateCount} 个日期、${room.scheduleCount} 场` : room.action === "新增" ? "新增空排班直播间" : "不改动现有排班"}</span>
-                  {room.dates.length > 0 && <small>{room.dates.map((date) => `${date.date}（${date.replacingSlots} → ${date.scheduleCount} 场）`).join("；")}</small>}
+                  <span>{room.action}{room.nameChanged ? ` · 名称由“${room.previousName}”改为“${room.name}”` : ""} · {room.dateCount ? `${room.dateCount} 个日期、主播 ${room.scheduleCount} 场、导演 ${room.directorShiftCount} 班` : room.action === "新增" ? "新增空排班直播间" : "不改动现有排班"}</span>
+                  {room.dates.length > 0 && <small>{room.dates.map((date) => `${date.date}（主播 ${date.replacingSlots}→${date.hostShiftCount} 场，导演 ${date.replacingDirectorShifts}→${date.directorShiftCount} 班）`).join("；")}</small>}
                 </li>
               ))}</ul>
               <div className="upload-preview-actions">
@@ -907,11 +957,11 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
               </div>
             </section>
           )}
-          {result?.ok && !preview && <div className="import-summary"><span><strong>{result.roomCount}</strong> 个工作表已更新</span><span><strong>{result.totalRoomCount}</strong> 个直播间</span><span><strong>{result.scheduleCount}</strong> 场排班</span><span>更新时间 <strong>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(result.dataUpdatedAt))}</strong></span></div>}
+          {result?.ok && !preview && <div className="import-summary"><span><strong>{result.roomCount}</strong> 个工作表已更新</span><span><strong>{result.totalRoomCount}</strong> 个直播间</span><span>主播 <strong>{result.scheduleCount}</strong> 场</span><span>导演 <strong>{result.directorShiftCount}</strong> 班</span><span>更新时间 <strong>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(result.dataUpdatedAt))}</strong></span></div>}
           {problems.length > 0 && <div className="issue-list"><h3>需要修正的内容 <span>{problems.length}</span></h3>{problems.map((issue, index) => <div className="issue-row" key={`${issue.sheet}-${issue.row}-${index}`}><span>{issue.sheet || "工作簿"}</span><span>{issue.row ? `第 ${issue.row} 行 · ` : ""}{issue.field}</span><strong>{issue.message}</strong></div>)}</div>}
           {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
         </section>
-        <aside className="admin-note"><span>i</span><div><strong>更新规则与照片说明</strong><p>工作簿中出现排班记录的日期会替换该直播间当天的完整时段；未出现的日期不变。任何工作表校验失败都会阻止整次提交。主播照片可在“主播头像库”集中维护；相同时段和主播未重新附图时会保留原照片。</p></div></aside>
+        <aside className="admin-note"><span>i</span><div><strong>独立排班与照片说明</strong><p>导演、主播分别按各自时间切换，助播跟随主播。工作簿某日期任一侧有排班时，会整体替换该直播间当天的导演和主播排班；未出现的日期不变。任何工作表校验失败都会阻止整次提交。主播照片可在“主播头像库”集中维护；同一主播时段未重新附图时会保留原照片。</p></div></aside>
         </> : activeTab === "records" ? <AdminScheduleLibrary csrfToken={csrfToken} /> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
@@ -964,6 +1014,7 @@ export function App() {
         return {
           room: { id: response.room.code, name: response.room.name },
           schedule: response.schedule,
+          directorShifts: response.directorShifts,
           nextTransitionAt: response.nextTransitionAt,
           dataUpdatedAt: response.dataUpdatedAt,
         };
@@ -1088,13 +1139,19 @@ export function App() {
   const room = useMemo(() => {
     const selected = rooms.find((item) => item.id === roomId);
     if (!selected) return null;
-    return { ...selected, schedule: displayData?.room?.id === roomId ? displayData.schedule : [] };
+    return {
+      ...selected,
+      schedule: displayData?.room?.id === roomId ? displayData.schedule : [],
+      directorShifts: displayData?.room?.id === roomId ? displayData.directorShifts : [],
+    };
   }, [rooms, roomId, displayData]);
-  const program = useMemo(() => getProgram(room, timestamp), [room, timestamp]);
+  const program = useMemo(() => getProgram(room?.schedule, timestamp), [room, timestamp]);
+  const directorProgram = useMemo(() => getProgram(room?.directorShifts, timestamp), [room, timestamp]);
   const displayed = program.display;
+  const displayedDirector = directorProgram.display;
   const isLive = Boolean(program.current);
   const nowDate = new Date(timestamp);
-  const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : "暂无排班";
+  const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : displayedDirector ? "导演已排班" : "暂无排班";
 
   if (authLoading) return <div className="system-loading"><div className="loading-orbit" /><span>正在连接展示系统</span></div>;
   if (!user) return <LoginPage onLogin={login} theme={theme} onToggleTheme={toggleTheme} />;
@@ -1134,7 +1191,7 @@ export function App() {
 
           <section className="control-card schedule-card">
             <div className="section-heading schedule-heading">
-              <div><div className="section-kicker">TODAY</div><h2>当日排班</h2></div>
+              <div><div className="section-kicker">TODAY</div><h2>主播排班</h2></div>
               <span className="schedule-count">{program.today.length} 场</span>
             </div>
             {program.today.length ? (
@@ -1165,13 +1222,17 @@ export function App() {
           <div className="stage-main">
             <div className="stage-copy">
               <div className="room-heading"><div className="room-id-line">{room?.id ?? "—"}<span>号直播间</span></div><h1>{room?.name ?? "等待直播间信息"}</h1></div>
-              <div className="stage-period"><div className="stage-date">{formatDate(nowDate)}</div><div className="time-strip"><span className="time-strip-label">{isLive ? "当前时段" : displayed ? "即将开始" : "排班时段"}</span><span className="time-strip-range">{formatRange(displayed)}</span></div></div>
+              <div className="stage-period"><div className="stage-date">{formatDate(nowDate)}</div><div className="time-strip"><span className="time-strip-label">{isLive ? "主播时段" : displayed ? "下一主播时段" : "主播排班"}</span><span className="time-strip-range">{formatRange(displayed)}</span></div></div>
             </div>
             <div className="portrait-frame">
               {displayed?.photo ? <img src={displayed.photo} alt={`${displayed.host || "本场"} 主播照片`} /> : <div className="portrait-empty"><span>本场尚未添加</span><span>主播照片</span></div>}
             </div>
-            {displayed ? (
-              <div className="role-grid"><RoleCard label="导演" value={displayed.director} /><RoleCard label="主播" value={displayed.host} featured /><RoleCard label="助播" value={displayed.assistant} /></div>
+            {displayed || displayedDirector ? (
+              <div className="role-grid">
+                <RoleCard label="导演" value={displayedDirector?.director} time={displayedDirector ? `${directorProgram.current ? "当前" : "下一场"} · ${formatRange(displayedDirector)}` : "暂无导演排班"} />
+                <RoleCard label="主播" value={displayed?.host} time={displayed ? `${program.current ? "当前" : "下一场"} · ${formatRange(displayed)}` : "暂无主播排班"} featured />
+                <RoleCard label="助播" value={displayed?.assistant} time={displayed ? formatRange(displayed) : "随主播排班"} />
+              </div>
             ) : <div className="no-session">{room ? "当前没有可展示的排班" : "等待管理员上传直播间排班"}</div>}
           </div>
           <MerchandisingInfo products={displayed?.featuredProducts} salesTarget={displayed?.salesTarget} />

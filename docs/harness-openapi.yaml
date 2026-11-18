@@ -82,7 +82,7 @@ components:
           type: string
           minLength: 1
           maxLength: 60000
-          description: 按接入指南中的中文字段模板填写，最多 100 个时段。
+          description: 按接入指南中的中文分角色排班字段填写；导演和主播时段分别独立校验，合计最多 100 段。
     ScheduleTextCommitRequest:
       allOf:
         - $ref: '#/components/schemas/ScheduleTextRequest'
@@ -99,14 +99,17 @@ components:
         ok: { type: boolean, const: true }
         preview:
           type: object
-          required: [roomCode, roomName, date, replacingSlots, scheduleCount, schedule, warnings]
+          required: [roomCode, roomName, date, replacingSlots, replacingDirectorShifts, scheduleCount, directorShiftCount, assignmentCount, directorShifts, hostShifts, warnings]
           properties:
             roomCode: { type: string }
             roomName: { type: string }
             date: { type: string, format: date }
             replacingSlots: { type: integer }
+            replacingDirectorShifts: { type: integer }
             scheduleCount: { type: integer }
-            schedule:
+            directorShiftCount: { type: integer }
+            assignmentCount: { type: integer }
+            directorShifts:
               type: array
               items:
                 type: object
@@ -114,6 +117,13 @@ components:
                   start: { type: string }
                   end: { type: string }
                   director: { type: string }
+            hostShifts:
+              type: array
+              items:
+                type: object
+                properties:
+                  start: { type: string }
+                  end: { type: string }
                   host: { type: string }
                   assistant: { type: string }
                   featuredProducts: { type: array, items: { type: string } }

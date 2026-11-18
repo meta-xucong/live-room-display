@@ -206,8 +206,9 @@ button { cursor: pointer; }
   .time-strip-range { font-size: 21px; }
   .portrait-frame { width: 104px; height: 156px; max-height: none; }
   .role-grid { height: 72px; gap: 6px; }
-  .role-card { height: 72px; padding: 9px 8px; }
-  .role-name { height: 28px; margin-top: 5px; font-size: 15px; line-height: 28px; }
+  .role-card { height: 72px; padding: 6px 8px; }
+  .role-label { height: 13px; }
+  .role-name { height: 20px; margin-top: 2px; font-size: 14px; line-height: 20px; }
   .schedule-list { grid-template-columns: 1fr; }
 }
 
@@ -269,8 +270,13 @@ button { cursor: pointer; }
 .admin-card-heading h2 { margin: 0; color: #2c3d55; font-size: 15px; font-weight: 650; }
 .admin-card-heading p { margin: 5px 0 0; color: #8492a5; font-size: 10px; }
 .upload-form { display: grid; grid-template-columns: minmax(0, 1fr) 190px; align-items: stretch; gap: 12px; margin-top: 26px; }
+.upload-room-picker { grid-column: 1 / -1; display: grid; gap: 6px; min-width: 0; color: #435a76; font-size: 11px; font-weight: 650; }
+.upload-room-picker select { width: 100%; min-width: 0; min-height: 38px; padding: 7px 10px; border: 1px solid rgba(116,137,163,.3); border-radius: 8px; background: #fff; color: #2e4057; font-weight: 400; }
+.upload-room-picker select:focus-visible { outline: 2px solid #4e79bd; outline-offset: 2px; }
+.upload-room-picker small { color: #64758d; font-size: 10px; font-weight: 400; }
 .upload-dropzone { min-height: 125px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 17px; border: 1px dashed rgba(100, 129, 169, .32); border-radius: 11px; background: rgba(247, 250, 255, .72); color: #485e7b; text-align: center; cursor: pointer; transition: border-color .18s ease, background .18s ease; }
 .upload-dropzone:hover, .upload-selected { border-color: rgba(78, 121, 189, .6); background: rgba(237, 244, 254, .78); }
+.upload-dropzone:has(input:disabled) { cursor: default; }
 .upload-dropzone strong { max-width: 100%; overflow: hidden; color: #415976; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .upload-dropzone small { color: #8b99aa; font-size: 9px; }
 .upload-glyph { width: 25px; height: 25px; display: grid; place-items: center; border-radius: 8px; background: #e6effb; color: #4e79bd; font-size: 16px; }
@@ -612,6 +618,7 @@ body { background: #edf2f7; }
 .role-label { color: #718096; }
 .role-name { color: #243247; }
 .role-card-featured .role-name { color: #3d6dad; }
+.role-time { height: 12px; margin-top: 1px; overflow: hidden; color: #8090a6; font-size: clamp(8px, .63vw, 10px); line-height: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .no-session { border-color: rgba(126, 147, 173, .2); background: rgba(250, 252, 255, .74); color: #65758a; }
 
 .merch-row {
@@ -785,6 +792,7 @@ body { background: #edf2f7; }
 :root[data-theme="dark"] .role-label { color: #aab5c4; }
 :root[data-theme="dark"] .role-name { color: #eef2f6; }
 :root[data-theme="dark"] .role-card-featured .role-name { color: #e6c971; }
+:root[data-theme="dark"] .role-time { color: #aab5c4; }
 :root[data-theme="dark"] .no-session { border-color: rgba(219, 227, 237, .13); background: rgba(27, 33, 42, .76); color: #bdc7d3; }
 :root[data-theme="dark"] .merch-card { border-color: rgba(219, 227, 237, .13); background: rgba(24, 30, 38, .78); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035); }
 :root[data-theme="dark"] .merch-heading h2 { color: #edf1f6; }
@@ -838,6 +846,9 @@ body { background: #edf2f7; }
 :root[data-theme="dark"] .upload-mode-picker label.selected { border-color: rgba(125,164,215,.5); background: rgba(64,91,128,.28); }
 :root[data-theme="dark"] .upload-mode-picker label strong { color: #d0d9e4; }
 :root[data-theme="dark"] .upload-mode-picker label small { color: #9eabba; }
+:root[data-theme="dark"] .upload-room-picker { color: #d0d9e4; }
+:root[data-theme="dark"] .upload-room-picker select { color-scheme: dark; border-color: rgba(219,227,237,.2); background: #171e29; color: #e2e8ef; }
+:root[data-theme="dark"] .upload-room-picker small { color: #9eabba; }
 :root[data-theme="dark"] .upload-preview { border-color: rgba(125,192,156,.2); background: rgba(37,82,59,.16); }
 :root[data-theme="dark"] .upload-preview h3 { color: #b5d8c3; }
 :root[data-theme="dark"] .upload-preview > p,

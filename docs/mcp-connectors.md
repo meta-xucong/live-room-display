@@ -15,12 +15,12 @@ Codex 和 WorkBuddy 使用各自独立的 API 密钥连接。连接后可用自�
 MCP 提供五个工具：
 
 - `list_rooms`：列出直播间编号与名称。
-- `get_room_schedule`：读取指定直播间某日排班。
+- `get_room_schedule`：分别读取指定直播间某日的导演班次 `directorShifts` 和主播场次 `hostShifts`。
 - `preview_schedule_update`：校验并预览该直播间该日的完整排班，不写入数据。
 - `preview_room_schedules_update`：一次校验并预览同一直播间多个日期的完整排班，不写入数据。
 - `commit_schedule_update`：提交指定的预览。
 
-单日期更新使用 `preview_schedule_update`；同一直播间需要更新多个日期时使用 `preview_room_schedules_update`。每个被提交的日期都必须包含当天全部时段，提交会替换该直播间这些日期的完整排班；其他直播间及未列出的日期保持不变。预览会逐日显示直播间、日期、原时段数、新时段数、完整排班和校验提示。只有用户明确确认整份预览后，Harness 才能调用 `commit_schedule_update`。
+单日期更新使用 `preview_schedule_update`；同一直播间需要更新多个日期时使用 `preview_room_schedules_update`。每个日期都分别提供完整的 `directorShifts` 和 `hostShifts`；导演与主播时间独立校验，可以有不同数量和时段，助播随主播。提交会替换该直播间这些日期的两类完整排班；其他直播间及未列出的日期保持不变。预览会分别显示导演班次、主播场次和校验提示。只有用户明确确认整份预览后，Harness 才能调用 `commit_schedule_update`。
 
 “今天/明天”等明确相对日期可按上海时区解析，并在预览中展示成具体日期。未知的直播间、时段或人员必须询问，不可自行补值。
 
