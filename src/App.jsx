@@ -1,3 +1,4 @@
+import { StaffScheduleImport } from "./staff-import.jsx";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const THEME_STORAGE_KEY = "live-room-theme";
@@ -804,79 +805,6 @@ function AdminScheduleLibrary({ csrfToken }) {
 
 function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
   const [activeTab, setActiveTab] = useState("schedule");
-  const [file, setFile] = useState(null);
-  const [uploadMode, setUploadMode] = useState("single");
-  const [uploadRooms, setUploadRooms] = useState(null);
-  const [uploadRoomsError, setUploadRoomsError] = useState(false);
-  const [uploadRoomCode, setUploadRoomCode] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState(null);
-  const [preview, setPreview] = useState(null);
-  const [message, setMessage] = useState("");
-  const singleUpload = uploadMode === "single";
-  const uploadReady = !singleUpload || Boolean(uploadRooms && uploadRoomCode);
-
-  useEffect(() => {
-    if (activeTab !== "schedule" || !singleUpload) return;
-    const request = new AbortController();
-    setUploadRoomsError(false);
-    api("/api/v1/admin/schedule-upload/rooms", { signal: request.signal })
-      .then(({ rooms }) => { if (!request.signal.aborted) setUploadRooms(rooms); })
-      .catch(() => { if (!request.signal.aborted) setUploadRoomsError(true); });
-    return () => request.abort();
-  }, [activeTab, singleUpload]);
-
-  function clearUploadPreview() {
-    setPreview(null);
-    setResult(null);
-    setMessage("");
-  }
-
-  function changeUploadMode(mode) {
-    setUploadMode(mode);
-    setUploadRoomCode("");
-    setFile(null);
-    clearUploadPreview();
-  }
-
-  async function upload(action, event) {
-    event?.preventDefault();
-    if (!file || busy || !uploadReady) return;
-    if (action === "commit" && (!preview || (singleUpload && preview.rooms[0]?.code !== uploadRoomCode))) return;
-    setBusy(true);
-    setMessage("");
-    setResult(null);
-    const form = new FormData();
-    form.append("file", file);
-    const params = new URLSearchParams({ action, mode: uploadMode });
-    if (singleUpload) params.set("roomCode", uploadRoomCode);
-    if (action === "commit" && typeof preview?.dataUpdatedAt === "string") params.set("expectedDataUpdatedAt", preview.dataUpdatedAt);
-    try {
-      const response = await fetch(`/api/v1/admin/schedule-upload?${params}`, {
-        method: "POST", credentials: "same-origin", headers: { "x-csrf-token": csrfToken }, body: form,
-      });
-      const body = await response.json();
-      setResult(body);
-      if (response.ok && action === "preview") {
-        setPreview(body);
-        setMessage("预览已生成，当前数据未更改。核对后点击“确认并更新”。");
-      } else if (response.ok) {
-        setPreview(null);
-        const target = singleUpload ? `${uploadRoomCode} 号直播间` : `${body.roomCount} 个工作表`;
-        setMessage(`已更新 ${target}：主播 ${body.scheduleCount} 场、导演 ${body.directorShiftCount} 班。展示页将在 30 秒内同步。`);
-      } else {
-        setPreview(null);
-        setMessage(body.error?.message ?? `发现 ${body.errors?.length ?? 0} 项需要修正，现有数据未更改。`);
-      }
-    } catch {
-      setPreview(null);
-      setMessage("上传未完成，请检查网络连接后重试。现有数据保持不变。");
-    } finally {
-      setBusy(false);
-    }
-  }
-  const problems = result?.errors ?? result?.error?.details ?? [];
-  const warnings = result?.warnings ?? [];
   return (
     <div className="admin-shell">
       <header className="topbar admin-topbar">
@@ -892,7 +820,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <section className="admin-hero">
           <div className="section-kicker">DATA MANAGEMENT</div>
           <h1>排班信息管理</h1>
-          <p>支持单个直播间工作表或 27 个直播间总表。只更新文件中出现的直播间和排班日期；其他日期及直播间保持不变。<a className="template-link" href="/live-room-schedule-template.xlsx" download>下载空白模板</a></p>
+          <p>上传员工排班表，按直播间名称和日期更新排班。</p>
         </section>
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
@@ -900,69 +828,10 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
           <button type="button" role="tab" aria-selected={activeTab === "avatars"} className={activeTab === "avatars" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("avatars")}>主播头像库</button>
           <button type="button" role="tab" aria-selected={activeTab === "keys"} className={activeTab === "keys" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("keys")}>MCP 密钥</button>
         </div>
-        {activeTab === "schedule" ? <>
-        <section className="admin-card" role="tabpanel">
-          <div className="admin-card-heading">
-            <div className="admin-icon">↥</div>
-            <div><h2>导入直播间排班</h2><p>支持 .xlsx 工作簿和嵌入式 JPG、PNG 主播照片；提交前会显示变更预览</p></div>
-          </div>
-          <div className="upload-mode-picker" role="radiogroup" aria-label="上传范围">
-            <label className={uploadMode === "single" ? "selected" : ""}>
-              <input type="radio" name="uploadMode" value="single" checked={singleUpload} disabled={busy} onChange={() => changeUploadMode("single")} />
-              <span><strong>单个直播间</strong><small>选定直播间后上传 1 个工作表</small></span>
-            </label>
-            <label className={uploadMode === "master" ? "selected" : ""}>
-              <input type="radio" name="uploadMode" value="master" checked={!singleUpload} disabled={busy} onChange={() => changeUploadMode("master")} />
-              <span><strong>27 个直播间总表</strong><small>工作簿必须包含 27 个工作表</small></span>
-            </label>
-          </div>
-          <form className="upload-form" onSubmit={(event) => upload("preview", event)}>
-            {singleUpload && (
-              <label className="upload-room-picker">
-                <span>导入到直播间</span>
-                <select value={uploadRoomCode} required disabled={busy || !uploadRooms} aria-describedby="upload-room-hint"
-                  onChange={(event) => { setUploadRoomCode(event.target.value); setFile(null); clearUploadPreview(); }}>
-                  <option value="" disabled>{uploadRooms ? "请选择直播间" : uploadRoomsError ? "直播间读取失败，请刷新页面" : "正在读取直播间…"}</option>
-                  {uploadRooms?.map(({ code, name }) => (
-                    <option value={code} key={code}>{code} 号直播间{name && name !== `${code}号直播间` ? ` · ${name}` : ""}</option>
-                  ))}
-                </select>
-                <small id="upload-room-hint">排班将导入所选直播间，Excel 中的直播间名称和编号可留空。</small>
-              </label>
-            )}
-            <label className={`upload-dropzone${file ? " upload-selected" : ""}`} htmlFor="workbook-file">
-              <span className="upload-glyph">⌁</span>
-              <strong>{file ? file.name : "选择排班工作簿"}</strong>
-              <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · 点击更换` : uploadReady ? "点击选择 .xlsx 文件，文件最大 30 MB" : "请先选择直播间"}</small>
-              <input key={`${uploadMode}:${uploadRoomCode}`} id="workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" disabled={busy || !uploadReady} onChange={(event) => { setFile(event.target.files?.[0] ?? null); clearUploadPreview(); }} />
-            </label>
-            <button className="button-primary upload-button" type="submit" disabled={!uploadReady || !file || busy}>{busy ? "正在校验工作簿…" : "校验并预览"}</button>
-          </form>
-          {message && <div className={`form-message${problems.length ? " form-error" : result?.ok ? " form-success" : ""}`} role="status">{message}</div>}
-          {preview && (
-            <section className="upload-preview" aria-label="排班导入预览">
-              <h3>导入预览（尚未写入）</h3>
-              <div className="import-summary"><span><strong>{preview.roomCount}</strong> 个工作表</span><span><strong>{preview.addedRoomCount}</strong> 个新增直播间</span><span><strong>{preview.dateCount}</strong> 个排班日期</span><span>主播 <strong>{preview.scheduleCount}</strong> 场</span><span>导演 <strong>{preview.directorShiftCount}</strong> 班</span><span>更新后共 <strong>{preview.totalRoomCount}</strong> 个直播间</span></div>
-              <p>列出的日期会同时整体替换当天导演和主播两张独立排班表；未列出的直播间及日期保持不变。</p>
-              <ul className="upload-preview-list">{preview.rooms.map((room) => (
-                <li key={room.code}>
-                  <strong>{room.code} · {room.name}</strong>
-                  <span>{room.action}{room.nameChanged ? ` · 名称由“${room.previousName}”改为“${room.name}”` : ""} · {room.dateCount ? `${room.dateCount} 个日期、主播 ${room.scheduleCount} 场、导演 ${room.directorShiftCount} 班` : room.action === "新增" ? "新增空排班直播间" : "不改动现有排班"}</span>
-                  {room.dates.length > 0 && <small>{room.dates.map((date) => `${date.date}（主播 ${date.replacingSlots}→${date.hostShiftCount} 场，导演 ${date.replacingDirectorShifts}→${date.directorShiftCount} 班）`).join("；")}</small>}
-                </li>
-              ))}</ul>
-              <div className="upload-preview-actions">
-                <button className="button-primary upload-button" type="button" disabled={busy} onClick={() => upload("commit")}>{busy ? "正在更新…" : "确认并更新"}</button>
-                <button className="avatar-secondary-button" type="button" disabled={busy} onClick={() => { setPreview(null); setResult(null); setMessage("已取消本次导入。"); }}>取消</button>
-              </div>
-            </section>
-          )}
-          {result?.ok && !preview && <div className="import-summary"><span><strong>{result.roomCount}</strong> 个工作表已更新</span><span><strong>{result.totalRoomCount}</strong> 个直播间</span><span>主播 <strong>{result.scheduleCount}</strong> 场</span><span>导演 <strong>{result.directorShiftCount}</strong> 班</span><span>更新时间 <strong>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(result.dataUpdatedAt))}</strong></span></div>}
-          {problems.length > 0 && <div className="issue-list"><h3>需要修正的内容 <span>{problems.length}</span></h3>{problems.map((issue, index) => <div className="issue-row" key={`${issue.sheet}-${issue.row}-${index}`}><span>{issue.sheet || "工作簿"}</span><span>{issue.row ? `第 ${issue.row} 行 · ` : ""}{issue.field}</span><strong>{issue.message}</strong></div>)}</div>}
-          {warnings.length > 0 && <div className="warning-list"><h3>导入提示 <span>{warnings.length}</span></h3>{warnings.slice(0, 20).map((issue, index) => <div className="warning-row" key={`${issue.sheet}-${issue.row}-${index}`}>{issue.sheet} · 第 {issue.row} 行 · {issue.field}：{issue.message}</div>)}{warnings.length > 20 && <div className="warning-row">另有 {warnings.length - 20} 条提示。</div>}</div>}
-        </section>
-        <aside className="admin-note"><span>i</span><div><strong>独立排班与照片说明</strong><p>导演、主播分别按各自时间切换，助播跟随主播。工作簿某日期任一侧有排班时，会整体替换该直播间当天的导演和主播排班；未出现的日期不变。任何工作表校验失败都会阻止整次提交。主播照片可在“主播头像库”集中维护；同一主播时段未重新附图时会保留原照片。</p></div></aside>
-        </> : activeTab === "records" ? <AdminScheduleLibrary csrfToken={csrfToken} /> : activeTab === "avatars" ? <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div> : <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
+        <StaffScheduleImport api={api} csrfToken={csrfToken} hidden={activeTab !== "schedule"} onViewRecords={() => setActiveTab("records")} />
+        {activeTab === "records" && <AdminScheduleLibrary csrfToken={csrfToken} />}
+        {activeTab === "avatars" && <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div>}
+        {activeTab === "keys" && <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
       <footer className="admin-footer">直播间信息牌 <span>·</span> 管理工作台</footer>
     </div>

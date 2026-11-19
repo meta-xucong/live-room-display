@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseXlsx, cellHasFormula, cellValue } from "./server/xlsx.mjs";
+import { parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, "data"));
@@ -32,6 +33,12 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS rooms (
     code TEXT PRIMARY KEY, name TEXT NOT NULL, sheet_name TEXT NOT NULL, sort_order INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS room_aliases (
+    name_key TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS staff_import_receipts (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, result_json TEXT NOT NULL, expires_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS slots (
     id TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
@@ -63,8 +70,9 @@ const MIME = {
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
   ".ico": "image/x-icon", ".woff2": "font/woff2", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
-const MASTER_ROOM_COUNT = 27;
-const NUMBERED_ROOM_CODES = Array.from({ length: MASTER_ROOM_COUNT }, (_, index) => String(index + 1).padStart(2, "0"));
+const NUMBERED_ROOM_CODES = Array.from({ length: 27 }, (_, index) => String(index + 1).padStart(2, "0"));
+const STAFF_PREVIEW_TTL = 10 * 60_000;
+const staffPreviews = new Map();
 const MCP_ROOM_BATCH_PREVIEW_PREFIX = "mcp-room-schedules-v1\n";
 const sessions = db.prepare("SELECT s.token_hash,s.csrf_token,s.expires_at,u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.enabled=1");
 const integrationTokens = db.prepare("SELECT id,name FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL");
@@ -76,7 +84,12 @@ const integrationWindows = new Map();
 const cookieName = "lrd_session";
 const cookieSecure = process.env.NODE_ENV === "production" && process.env.SECURE_COOKIES !== "false";
 const previewCleanup = setInterval(() => {
-  try { db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(Date.now()); } catch {}
+  const now = Date.now();
+  for (const [id, preview] of staffPreviews) if (preview.expiresAt <= now) staffPreviews.delete(id);
+  try {
+    db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(now);
+    db.prepare("DELETE FROM staff_import_receipts WHERE expires_at<=?").run(now);
+  } catch {}
 }, 60_000);
 previewCleanup.unref();
 
@@ -176,8 +189,7 @@ function migrateLegacyDirectorShifts() {
           shift.starts_at, shift.ends_at, shift.director,
         );
       }
-      const currentVersion = db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
-      const updateAt = new Date(Math.max(Date.now(), (Date.parse(currentVersion) || 0) + 1)).toISOString();
+      const updateAt = nextDataUpdatedAt();
       db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
       db.prepare("INSERT INTO app_state(key,value) VALUES ('independent_director_shifts_v1',?)")
         .run(new Date().toISOString());
@@ -279,6 +291,8 @@ async function readUpload(request) {
   if (!boundaryMatch) throw Object.assign(new Error("请用表单上传 .xlsx 文件"), { status: 400 });
   const boundary = Buffer.from(`--${boundaryMatch[1] ?? boundaryMatch[2]}`);
   const body = await readBody(request, 30 * 1024 * 1024);
+  let file = null;
+  let roomBindings = null;
   let cursor = 0;
   while (true) {
     const start = body.indexOf(boundary, cursor);
@@ -295,14 +309,27 @@ async function readUpload(request) {
     const name = disposition.match(/(?:^|;)\s*name="([^"]+)"/i)?.[1];
     const filename = disposition.match(/(?:^|;)\s*filename="([^"]*)"/i)?.[1] ?? "";
     if (name === "file" && filename) {
-      const file = body.subarray(headerEnd + 4, dataEnd);
+      if (file) throw Object.assign(new Error("每次只能上传一个工作簿"), { status: 400 });
+      file = body.subarray(headerEnd + 4, dataEnd);
       if (!filename.toLowerCase().endsWith(".xlsx")) throw Object.assign(new Error("只支持 .xlsx 文件"), { status: 415 });
       if (file.length === 0) throw Object.assign(new Error("所选文件为空"), { status: 400 });
-      return file;
+    } else if (name === "roomBindings") {
+      if (roomBindings !== null || dataEnd - headerEnd - 4 > 16_384) {
+        throw Object.assign(new Error("直播间匹配数据无效"), { status: 400 });
+      }
+      roomBindings = body.subarray(headerEnd + 4, dataEnd).toString("utf8");
     }
     cursor = next;
   }
-  throw Object.assign(new Error("没有找到待上传的工作簿"), { status: 400 });
+  if (!file) throw Object.assign(new Error("没有找到待上传的工作簿"), { status: 400 });
+  let bindings = {};
+  if (roomBindings !== null) {
+    try { bindings = JSON.parse(roomBindings); } catch { bindings = null; }
+    if (!bindings || typeof bindings !== "object" || Array.isArray(bindings)) {
+      throw Object.assign(new Error("直播间匹配数据无效"), { status: 400 });
+    }
+  }
+  return { file, bindings };
 }
 
 async function readAvatarUpload(request) {
@@ -417,7 +444,7 @@ function salesDisplay(cents) {
   return `¥${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(yuan)}`;
 }
 
-function validateWorkbook(sheets, targetRoom = null) {
+function validateWorkbook(sheets) {
   const errors = [];
   const warnings = [];
   const rooms = [];
@@ -427,12 +454,10 @@ function validateWorkbook(sheets, targetRoom = null) {
   if (!sheets.length) return { rooms, errors: [{ sheet: "", row: "", field: "工作簿", message: "没有可读取的直播间工作表" }], warnings };
 
   for (const sheet of sheets) {
-    const name = targetRoom?.name ?? String(cellValue(sheet, 1, "B") ?? "").trim();
-    const code = targetRoom?.code ?? String(cellValue(sheet, 1, "E") ?? "").trim();
-    if (!targetRoom) {
-      if (cellHasFormula(sheet, 1, "B") || !name) pushError(sheet.name, 1, "直播间名称", "请在 B1 填写直播间名称");
-      if (cellHasFormula(sheet, 1, "E") || !code) pushError(sheet.name, 1, "直播间编号", "请在 E1 填写直播间编号");
-    }
+    const name = String(cellValue(sheet, 1, "B") ?? "").trim();
+    const code = String(cellValue(sheet, 1, "E") ?? "").trim();
+    if (cellHasFormula(sheet, 1, "B") || !name) pushError(sheet.name, 1, "直播间名称", "请在 B1 填写直播间名称");
+    if (cellHasFormula(sheet, 1, "E") || !code) pushError(sheet.name, 1, "直播间编号", "请在 E1 填写直播间编号");
     if (code && seenCodes.has(code)) pushError(sheet.name, 1, "直播间编号", `编号“${code}”重复`);
     if (code) seenCodes.add(code);
 
@@ -530,85 +555,183 @@ function validateWorkbook(sheets, targetRoom = null) {
   return { rooms, errors, warnings };
 }
 
-function workbookImportErrors(workbook, result, mode) {
+function staffRoomCatalog() {
+  const names = new Map(db.prepare("SELECT code,name FROM rooms").all().map(({ code, name }) => [code, name]));
+  return NUMBERED_ROOM_CODES.map((code) => ({ code, name: names.get(code) ?? null }));
+}
+
+function resolveStaffRooms(source, bindings) {
+  const existing = db.prepare("SELECT code,name FROM rooms").all();
+  const named = new Map();
+  const byCode = new Map(existing.map((room) => [room.code, room]));
+  const aliases = new Map(db.prepare("SELECT name_key,room_code FROM room_aliases").all()
+    .map(({ name_key, room_code }) => [name_key, room_code]));
+  for (const { code, name } of existing) {
+    const key = roomNameKey(name);
+    if (!named.has(key)) named.set(key, []);
+    named.get(key).push(code);
+  }
+  const keys = new Set(source.map((room) => room.key));
   const errors = [];
-  const expectedSheets = mode === "single" ? 1 : MASTER_ROOM_COUNT;
-  if (workbook.length !== expectedSheets) {
-    errors.push({
-      sheet: "工作簿", row: "", field: "工作表数量",
-      message: mode === "single"
-        ? `单直播间模式需要 1 个工作表，当前为 ${workbook.length} 个`
-        : `27 间总表模式需要 ${MASTER_ROOM_COUNT} 个工作表，当前为 ${workbook.length} 个`,
-    });
+  for (const [key, code] of Object.entries(bindings)) {
+    if (!keys.has(key) || !NUMBERED_ROOM_CODES.includes(code)) {
+      errors.push({ field: "直播间匹配", message: "匹配项不属于当前文件或直播间编号无效" });
+    }
   }
 
-  for (const room of result.rooms) {
-    const affectedDates = new Set([...room.directorShifts, ...room.hostShifts].map((shift) => shift.date));
-    if (!affectedDates.size) continue;
+  const targetNames = new Map();
+  const rooms = [];
+  const sourceRooms = source.map((room) => {
+    const candidates = named.get(room.key) ?? [];
+    const known = aliases.get(room.key) ?? (candidates.length === 1 ? candidates[0] : null);
+    const chosen = Object.hasOwn(bindings, room.key) ? bindings[room.key] : null;
+    const code = known ?? chosen;
+    const issue = (message) => errors.push({ sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message });
+    if (known && chosen && known !== chosen) issue("房间匹配已变化，请重新核对当前编号");
+    if (code) {
+      if (targetNames.has(code)) issue("与“" + targetNames.get(code) + "”选中了同一编号，请统一表内名称或更正匹配");
+      targetNames.set(code, room.name);
+      rooms.push({
+        ...room, code, name: byCode.get(code)?.name ?? room.name,
+        sourceName: room.name, isNew: !byCode.has(code), saveAlias: !known,
+      });
+    }
+    return {
+      sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
+      dateCount: room.dates.size, code, automatic: Boolean(known), ambiguous: !known && candidates.length > 1,
+    };
+  });
+  return { sourceRooms, rooms, errors };
+}
+
+function staffImportConflicts(rooms) {
+  const errors = [];
+  for (const room of rooms) {
     for (const [incoming, table, role] of [
       [room.directorShifts, "director_shifts", "导演"],
       [room.hostShifts, "slots", "主播"],
     ]) {
-      const existing = db.prepare(`SELECT date,start_time,end_time,starts_at,ends_at FROM ${table} WHERE room_code=?`).all(room.code);
-      const untouched = existing.filter((shift) => !affectedDates.has(shift.date));
+      const query = db.prepare("SELECT date,start_time,end_time FROM " + table
+        + " WHERE room_code=? AND starts_at<? AND ends_at>?");
       for (const shift of incoming) {
-        for (const previous of untouched) {
-          if (shift.startAt < previous.ends_at && previous.starts_at < shift.endAt) {
-            errors.push({
-              sheet: room.sheetName, row: shift.sourceRow, field: `${role}排班时间`,
-              message: `与未更新的现有${role}排班 ${previous.date} ${previous.start_time}-${previous.end_time} 重叠`,
-            });
-          }
-        }
+        const conflict = query.all(room.code, shift.endAt, shift.startAt).find((previous) => !room.dates.has(previous.date));
+        if (conflict) errors.push({
+          sheet: shift.sourceSheet, row: shift.sourceRow, field: role + "时间", room: room.sourceName, date: shift.date,
+          message: "与未更新日期的现有排班 " + conflict.date + " " + conflict.start_time + "–" + conflict.end_time + " 重叠",
+        });
       }
     }
   }
   return errors;
 }
 
-function workbookImportSummary(result) {
-  const existingRooms = db.prepare("SELECT code,name FROM rooms").all();
-  const existingByCode = new Map(existingRooms.map((room) => [room.code, room]));
-  const rooms = result.rooms.map((room) => {
-    const datesByKey = new Map();
-    for (const shift of room.directorShifts) {
-      if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShiftCount: 0, hostShiftCount: 0 });
-      datesByKey.get(shift.date).directorShiftCount += 1;
-    }
-    for (const shift of room.hostShifts) {
-      if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShiftCount: 0, hostShiftCount: 0 });
-      datesByKey.get(shift.date).hostShiftCount += 1;
-    }
-    const dates = [...datesByKey.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, counts]) => ({
-      date, ...counts, scheduleCount: counts.hostShiftCount,
-      replacingSlots: db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?").get(room.code, date).count,
-      replacingDirectorShifts: db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?").get(room.code, date).count,
-    }));
-    return {
-      code: room.code,
-      name: room.name,
-      action: existingByCode.has(room.code) ? "更新" : "新增",
-      previousName: existingByCode.get(room.code)?.name ?? null,
-      nameChanged: Boolean(existingByCode.has(room.code) && existingByCode.get(room.code).name !== room.name),
-      dateCount: dates.length,
-      scheduleCount: room.hostShifts.length,
-      directorShiftCount: room.directorShifts.length,
-      dates,
-    };
-  });
-  const addedRoomCount = rooms.filter((room) => room.action === "新增").length;
-  const totalRoomCount = existingRooms.length + addedRoomCount;
+function staffImportSummary(rooms, warnings) {
+  const days = [...new Set(rooms.flatMap((room) => [...room.dates.keys()]))].sort();
   return {
     roomCount: rooms.length,
-    scheduleCount: rooms.reduce((count, room) => count + room.scheduleCount, 0),
-    directorShiftCount: rooms.reduce((count, room) => count + room.directorShiftCount, 0),
-    dateCount: rooms.reduce((count, room) => count + room.dateCount, 0),
-    addedRoomCount,
-    updatedRoomCount: rooms.length - addedRoomCount,
-    totalRoomCount,
-    rooms,
-    dataUpdatedAt: updatedAtValue(),
+    dateCount: rooms.reduce((sum, room) => sum + room.dates.size, 0),
+    firstDate: days[0],
+    lastDate: days.at(-1),
+    scheduleCount: rooms.reduce((sum, room) => sum + room.hostShifts.length, 0),
+    directorShiftCount: rooms.reduce((sum, room) => sum + room.directorShifts.length, 0),
+    skippedCount: warnings.length,
   };
+}
+
+function staffPreviewRooms(rooms) {
+  const oldHostCount = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?");
+  const oldDirectorCount = db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?");
+  const displayShift = ({ host, director, start, end, overnight, sourceSheet, sourceRow }) =>
+    ({ person: host ?? director, start, end, overnight, sourceSheet, sourceRow });
+  return rooms.map((room) => ({
+    code: room.code, name: room.name, sourceName: room.sourceName, isNew: room.isNew,
+    dates: [...room.dates.keys()].sort().map((date) => ({
+      date,
+      previousHostCount: oldHostCount.get(room.code, date).count,
+      previousDirectorCount: oldDirectorCount.get(room.code, date).count,
+      hostShifts: room.hostShifts.filter((shift) => shift.date === date).map(displayShift),
+      directorShifts: room.directorShifts.filter((shift) => shift.date === date).map(displayShift),
+    })),
+  }));
+}
+
+function staffImportReceipt(id, userId) {
+  const row = db.prepare("SELECT result_json FROM staff_import_receipts WHERE id=? AND user_id=? AND expires_at>?")
+    .get(id, userId, Date.now());
+  return row ? JSON.parse(row.result_json) : null;
+}
+
+function commitStaffImport(id, userId) {
+  const receipt = staffImportReceipt(id, userId);
+  if (receipt) return receipt;
+  const preview = staffPreviews.get(id);
+  if (!preview || preview.userId !== userId || preview.expiresAt <= Date.now()) {
+    throw Object.assign(new Error("预览已失效，请重新生成预览"), { status: 409 });
+  }
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const existingReceipt = staffImportReceipt(id, userId);
+    if (existingReceipt) {
+      db.exec("COMMIT");
+      return existingReceipt;
+    }
+    if (updatedAtValue() !== preview.version) {
+      throw Object.assign(new Error("排班或直播间资料已更新，请重新生成预览"), { status: 409 });
+    }
+    const updateAt = nextDataUpdatedAt();
+    let roomOrder = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
+    const insertRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+    const insertAlias = db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES (?,?)");
+    const findHosts = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?");
+    const findDirectors = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=?");
+    const deleteHosts = db.prepare("DELETE FROM slots WHERE room_code=? AND date=?");
+    const deleteDirectors = db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?");
+    const insertHost = db.prepare(`INSERT INTO slots(
+      id,room_code,date,start_time,end_time,starts_at,ends_at,host,assistant,
+      products_json,sales_target_cents,notes,photo_type,photo_blob
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insertDirector = db.prepare(`INSERT INTO director_shifts(
+      id,room_code,date,start_time,end_time,starts_at,ends_at,director
+    ) VALUES (?,?,?,?,?,?,?,?)`);
+    const shiftKey = (start, end, person) => JSON.stringify([start, end, person]);
+    for (const room of preview.rooms) {
+      if (room.isNew) insertRoom.run(room.code, room.name, room.sheetName, roomOrder++);
+      if (room.saveAlias) insertAlias.run(room.key, room.code);
+      for (const date of room.dates.keys()) {
+        const oldHosts = new Map(findHosts.all(room.code, date).map((slot) => [
+          shiftKey(slot.start_time, slot.end_time, slot.host), slot,
+        ]));
+        const oldDirectors = new Map(findDirectors.all(room.code, date).map((shift) => [
+          shiftKey(shift.start_time, shift.end_time, shift.director), shift,
+        ]));
+        deleteHosts.run(room.code, date);
+        deleteDirectors.run(room.code, date);
+        for (const slot of room.hostShifts.filter((shift) => shift.date === date)) {
+          const old = oldHosts.get(shiftKey(slot.start, slot.end, slot.host));
+          insertHost.run(
+            old?.id ?? slot.id, room.code, date, slot.start, slot.end, slot.startAt, slot.endAt,
+            slot.host, old?.assistant ?? "", old?.products_json ?? "[]", old?.sales_target_cents ?? null,
+            old?.notes ?? "", old?.photo_type ?? null, old?.photo_blob ?? null,
+          );
+        }
+        for (const shift of room.directorShifts.filter((item) => item.date === date)) {
+          const old = oldDirectors.get(shiftKey(shift.start, shift.end, shift.director));
+          insertDirector.run(old?.id ?? shift.id, room.code, date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director);
+        }
+      }
+    }
+    seedUniqueHostAvatars(preview.rooms.flatMap((room) => room.hostShifts));
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
+    const result = { ok: true, ...preview.summary, dataUpdatedAt: updateAt };
+    db.prepare("INSERT INTO staff_import_receipts(id,user_id,result_json,expires_at) VALUES (?,?,?,?)")
+      .run(id, userId, JSON.stringify(result), Date.now() + 24 * 60 * 60_000);
+    db.exec("COMMIT");
+    staffPreviews.delete(id);
+    return result;
+  } catch (cause) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw cause;
+  }
 }
 
 function fixedTextError(message, field = "格式", row = "") {
@@ -948,6 +1071,10 @@ function updatedAtValue() {
   return db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
 }
 
+function nextDataUpdatedAt() {
+  return new Date(Math.max(Date.now(), (Date.parse(updatedAtValue()) || 0) + 1)).toISOString();
+}
+
 function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
   const roomSchedule = parsed.result.rooms[0];
   const directorShifts = roomSchedule.directorShifts;
@@ -1177,7 +1304,7 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     throw new Error("多日期预览已损坏，请重新预览");
   }
   const { roomCode, roomName, parsedSchedules, preview } = validateMcpRoomSchedulesPayload(payload);
-  const updateAt = new Date(Math.max(Date.now(), (Date.parse(updatedAtValue()) || 0) + 1)).toISOString();
+  const updateAt = nextDataUpdatedAt();
   let preservedPhotos = 0;
   const preservedByDate = new Map();
   try {
@@ -1264,7 +1391,7 @@ function commitMcpPreview(previewId, tokenId) {
   const parsed = validateFixedScheduleText(row.schedule_text);
   const preview = mcpPreviewFor(parsed);
   let preservedPhotos = 0;
-  const updateAt = new Date().toISOString();
+  const updateAt = nextDataUpdatedAt();
   try {
     db.exec("BEGIN IMMEDIATE");
     const currentTicket = db.prepare("SELECT id FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(previewId, tokenId, Date.now());
@@ -1625,8 +1752,7 @@ async function handle(request, response) {
       return error(response, 422, "SCHEDULE_INVALID", cause.message, cause.details ?? []);
     }
 
-    const currentVersionTime = Date.parse(updatedAtValue()) || 0;
-    const updateAt = new Date(Math.max(Date.now(), currentVersionTime + 1)).toISOString();
+    const updateAt = nextDataUpdatedAt();
     try {
       db.exec("BEGIN IMMEDIATE");
       if (input.dataUpdatedAt !== updatedAtValue()) throw new Error("SCHEDULES_CHANGED");
@@ -1765,7 +1891,7 @@ async function handle(request, response) {
       for (const item of upload.prepared) {
         saveAvatar.run(randomBytes(16).toString("hex"), item.name, item.nameKey, item.photoType, item.bytes, item.photoHash, now, now);
       }
-      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(new Date(now).toISOString());
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
       db.exec("COMMIT");
     } catch (cause) {
       try { db.exec("ROLLBACK"); } catch {}
@@ -1784,7 +1910,7 @@ async function handle(request, response) {
     if (!avatar) return error(response, 404, "AVATAR_NOT_FOUND", "没有找到这位主播");
     const now = Date.now();
     db.prepare("UPDATE host_avatars SET photo_type=NULL,photo_blob=NULL,photo_hash=NULL,updated_at=? WHERE id=?").run(now, avatar.id);
-    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(new Date(now).toISOString());
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
     return json(response, 200, { ok: true, dataUpdatedAt: new Date(now).toISOString(), ...avatarLibraryPayload() });
   }
 
@@ -1866,7 +1992,7 @@ async function handle(request, response) {
       `${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift,
     ]));
     let preservedPhotos = 0;
-    const updateAt = new Date().toISOString();
+    const updateAt = nextDataUpdatedAt();
     try {
       db.exec("BEGIN IMMEDIATE");
       if (existingRoom) {
@@ -1916,8 +2042,7 @@ async function handle(request, response) {
 
   if (request.method === "GET" && pathname === "/api/v1/admin/schedule-upload/rooms") {
     if (!requireUser(request, response, "admin")) return;
-    const names = new Map(db.prepare("SELECT code,name FROM rooms").all().map(({ code, name }) => [code, name]));
-    return json(response, 200, { rooms: NUMBERED_ROOM_CODES.map((code) => ({ code, name: names.get(code) ?? null })) });
+    return json(response, 200, { rooms: staffRoomCatalog() });
   }
 
   if (request.method === "POST" && pathname === "/api/v1/admin/schedule-upload") {
@@ -1925,110 +2050,61 @@ async function handle(request, response) {
     if (!user) return;
     if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
     const action = url.searchParams.get("action");
-    const mode = url.searchParams.get("mode");
-    if (!['preview', 'commit'].includes(action) || !['single', 'master'].includes(mode)) {
-      return error(response, 400, "UPLOAD_MODE_INVALID", "请指定单直播间或 27 间总表模式，并先预览再提交");
+    if (url.searchParams.get("mode") !== "room-name" || !["preview", "commit"].includes(action)) {
+      return error(response, 400, "UPLOAD_MODE_INVALID", "请刷新页面后使用员工排班表导入");
     }
-    const targetCode = mode === "single" ? url.searchParams.get("roomCode") : null;
-    if (mode === "single" && !NUMBERED_ROOM_CODES.includes(targetCode)) {
-      return error(response, 400, "UPLOAD_ROOM_INVALID", "请在网页选择 01 至 27 号直播间");
-    }
-    const uploadWindow = uploadWindows.get(user.id);
-    if (uploadWindow && uploadWindow.until > Date.now() && uploadWindow.count >= 8) {
-      return error(response, 429, "UPLOAD_RATE_LIMIT", "上传次数过多，请稍后再试");
-    }
-    uploadWindows.set(user.id, uploadWindow?.until > Date.now()
-      ? { count: uploadWindow.count + 1, until: uploadWindow.until }
-      : { count: 1, until: Date.now() + 10 * 60_000 });
-    let workbook;
-    try {
-      const bytes = await readUpload(request);
-      workbook = parseXlsx(bytes);
-    } catch (cause) {
-      return error(response, cause.status ?? 422, "WORKBOOK_READ_FAILED", cause.message, []);
-    }
-    const targetRoom = targetCode ? {
-      code: targetCode,
-      name: db.prepare("SELECT name FROM rooms WHERE code=?").get(targetCode)?.name ?? `${targetCode}号直播间`,
-    } : null;
-    const result = validateWorkbook(workbook, targetRoom);
-    const expectedDataUpdatedAt = url.searchParams.get("expectedDataUpdatedAt");
-    if (action === "commit" && (expectedDataUpdatedAt === null || expectedDataUpdatedAt !== updatedAtValue())) {
-      return error(response, 409, "SCHEDULES_CHANGED", "预览后排班数据有更新，请重新校验并预览");
-    }
-    result.errors.push(...workbookImportErrors(workbook, result, mode));
-    const slotCount = result.rooms.reduce((count, room) => count + room.hostShifts.length, 0);
-    const directorShiftCount = result.rooms.reduce((count, room) => count + room.directorShifts.length, 0);
-    if (result.errors.length) {
-      return json(response, 422, {
-        ok: false, roomCount: result.rooms.length, scheduleCount: slotCount, directorShiftCount, workbookSheetCount: workbook.length,
-        errors: result.errors, warnings: result.warnings,
-      });
-    }
-    const summary = workbookImportSummary(result);
-    if (action === "preview") return json(response, 200, { ok: true, mode, workbookSheetCount: workbook.length, ...summary, warnings: result.warnings });
-
-    if (expectedDataUpdatedAt === null || expectedDataUpdatedAt !== summary.dataUpdatedAt) {
-      return error(response, 409, "SCHEDULES_CHANGED", "预览后排班数据有更新，请重新校验并预览");
-    }
-    const updateAt = new Date().toISOString();
-    try {
-      db.exec("BEGIN IMMEDIATE");
-      if (expectedDataUpdatedAt !== updatedAtValue()) throw new Error("SCHEDULES_CHANGED");
-      let nextRoomOrder = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
-      const findRoom = db.prepare("SELECT sort_order FROM rooms WHERE code=?");
-      const insertRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
-      const updateRoom = db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?");
-      const insertSlot = db.prepare(`INSERT INTO slots(
-        id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-        products_json,sales_target_cents,notes,photo_type,photo_blob
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-      const insertDirector = db.prepare(`INSERT INTO director_shifts(
-        id,room_code,date,start_time,end_time,starts_at,ends_at,director
-      ) VALUES (?,?,?,?,?,?,?,?)`);
-      for (const room of result.rooms) {
-        if (!findRoom.get(room.code)) insertRoom.run(room.code, room.name, room.sheetName, nextRoomOrder++);
-        else if (!targetRoom) updateRoom.run(room.name, room.sheetName, room.code);
-        const datesByKey = new Map();
-        for (const shift of [...room.directorShifts, ...room.hostShifts]) {
-          if (!datesByKey.has(shift.date)) datesByKey.set(shift.date, { directorShifts: [], hostShifts: [] });
-          datesByKey.get(shift.date)["director" in shift ? "directorShifts" : "hostShifts"].push(shift);
-        }
-        for (const [date, shifts] of datesByKey) {
-          const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(room.code, date);
-          const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
-          const previousDirectors = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=?").all(room.code, date);
-          const previousDirectorByKey = new Map(previousDirectors.map((shift) => [`${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift]));
-          db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(room.code, date);
-          db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(room.code, date);
-          for (const slot of shifts.hostShifts) {
-            const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
-            insertSlot.run(
-              previous?.id ?? slot.id, room.code, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-              "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
-              slot.notes, slot.photo?.contentType ?? previous?.photo_type ?? null, slot.photo?.bytes ?? previous?.photo_blob ?? null,
-            );
-          }
-          for (const shift of shifts.directorShifts) {
-            const previous = previousDirectorByKey.get(`${shift.start}\u0000${shift.end}\u0000${shift.director}`);
-            insertDirector.run(previous?.id ?? shift.id, room.code, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director);
-          }
-        }
+    if (action === "commit") {
+      let input;
+      try { input = await readJson(request); } catch (cause) {
+        return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
       }
-      seedUniqueHostAvatars(result.rooms.flatMap((room) => room.hostShifts));
-      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
-      db.exec("COMMIT");
-    } catch (cause) {
-      try { db.exec("ROLLBACK"); } catch {}
-      if (cause.message === "SCHEDULES_CHANGED") return error(response, 409, "SCHEDULES_CHANGED", "预览后排班数据有更新，请重新校验并预览");
-      console.error("工作簿更新失败:", cause.message);
-      return error(response, 500, "IMPORT_FAILED", "更新失败，现有排班数据已保留");
+      if (typeof input?.previewId !== "string" || !/^[a-f0-9]{48}$/.test(input.previewId)) {
+        return error(response, 400, "INVALID_PREVIEW", "请先生成排班预览");
+      }
+      try {
+        return json(response, 200, commitStaffImport(input.previewId, user.id));
+      } catch (cause) {
+        if (cause.status === 409) return error(response, 409, "PREVIEW_EXPIRED", cause.message);
+        console.error("员工排班表导入失败:", cause.code ?? "IMPORT_FAILED");
+        return error(response, 500, "IMPORT_FAILED", "更新失败，请重新预览后再试");
+      }
     }
-    const totalRoomCount = db.prepare("SELECT COUNT(*) AS count FROM rooms").get().count;
+
+    const now = Date.now();
+    let uploadWindow = uploadWindows.get(user.id);
+    if (!uploadWindow || uploadWindow.until <= now) {
+      uploadWindow = { count: 0, until: now + 10 * 60_000 };
+      uploadWindows.set(user.id, uploadWindow);
+    }
+    if (uploadWindow.count >= 20) return error(response, 429, "UPLOAD_RATE_LIMIT", "上传次数过多，请稍后再试");
+    uploadWindow.count += 1;
+    let workbook, bindings;
+    try {
+      const upload = await readUpload(request);
+      workbook = parseXlsx(upload.file);
+      bindings = upload.bindings;
+    } catch (cause) {
+      return error(response, cause.status ?? 422, "WORKBOOK_READ_FAILED", cause.message);
+    }
+    const parsed = parseStaffSchedule(workbook, excelDate);
+    if (parsed.errors.length) return json(response, 422, { errors: parsed.errors, warnings: parsed.warnings });
+    const { sourceRooms, rooms, errors } = resolveStaffRooms(parsed.rooms, bindings);
+    if (errors.length) return json(response, 422, {
+      errors, warnings: parsed.warnings, sourceRooms, roomOptions: staffRoomCatalog(),
+    });
+    const summary = staffImportSummary(parsed.rooms, parsed.warnings);
+    if (sourceRooms.some((room) => !room.code)) return json(response, 200, {
+      status: "needs_mapping", sourceRooms, roomOptions: staffRoomCatalog(), summary, warnings: parsed.warnings,
+    });
+    const conflicts = staffImportConflicts(rooms);
+    if (conflicts.length) return json(response, 422, { errors: conflicts, warnings: parsed.warnings });
+    const previewId = randomBytes(24).toString("hex");
+    const expiresAt = Date.now() + STAFF_PREVIEW_TTL;
+    if (staffPreviews.size >= 64) staffPreviews.delete(staffPreviews.keys().next().value);
+    staffPreviews.set(previewId, { userId: user.id, version: updatedAtValue(), rooms, summary, expiresAt });
     return json(response, 200, {
-      ok: true, roomCount: result.rooms.length, totalRoomCount, scheduleCount: slotCount,
-      directorShiftCount,
-      warnings: result.warnings, dataUpdatedAt: updateAt,
+      status: "ready", previewId, expiresAt, sourceRooms, roomOptions: staffRoomCatalog(),
+      rooms: staffPreviewRooms(rooms), summary, warnings: parsed.warnings,
     });
   }
 
@@ -2073,7 +2149,7 @@ const server = createServer((request, response) => {
 
 const port = Number(process.env.PORT || 4174);
 const host = process.env.HOST || "0.0.0.0";
-server.listen(port, host, () => console.log(`直播间信息服务已启动：http://${host}:${port}`));
+server.listen(port, host, () => console.log(`直播间信息服务已启动：http://${host}:${server.address().port}`));
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => server.close(() => {

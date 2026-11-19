@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "vite build",
+    "test": "node --test",
     "start": "node server.mjs",
     "create-user": "node scripts/create-user.mjs",
     "create-api-token": "node scripts/create-api-token.mjs",

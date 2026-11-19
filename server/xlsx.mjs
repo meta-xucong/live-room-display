@@ -185,6 +185,8 @@ export function parseXlsx(buffer) {
     }
   }
   const workbook = readXml(files, "xl/workbook.xml");
+  const workbookProperties = workbook.match(/<(?:[\w.-]+:)?workbookPr\b([^>]*)>/)?.[1] ?? "";
+  const date1904 = ["1", "true"].includes(attributes(workbookProperties).date1904);
   const workbookRels = relationshipMap(readXml(files, "xl/_rels/workbook.xml.rels"));
   const sharedStrings = parseSharedStrings(readXml(files, "xl/sharedStrings.xml"));
   const sheets = [];
@@ -202,7 +204,7 @@ export function parseXlsx(buffer) {
     } catch (cause) {
       throw new Error(`工作表“${attr.name}”：${cause.message}`);
     }
-    sheets.push({ name: attr.name, rows: parseSheet(xml, sharedStrings), images });
+    sheets.push({ name: attr.name, rows: parseSheet(xml, sharedStrings), images, date1904 });
   }
   return sheets;
 }
