@@ -347,8 +347,8 @@ button { cursor: pointer; }
 .avatar-pending-item { position: relative; display: grid; gap: 7px; min-width: 0; padding: 9px; border: 1px solid rgba(119,139,164,.16); border-radius: 9px; background: rgba(255,255,255,.8); }
 .avatar-pending-item img { width: 100%; height: 140px; border-radius: 6px; background: #edf1f6; object-fit: cover; }
 .avatar-pending-item label { display: grid; gap: 4px; color: #718096; font-size: 9px; }
-.avatar-pending-item input, .avatar-search input { width: 100%; min-height: 34px; padding: 0 9px; border: 1px solid rgba(116,137,163,.2); border-radius: 7px; outline: none; background: rgba(255,255,255,.85); color: #2e4057; font: inherit; font-size: 10px; }
-.avatar-pending-item input:focus, .avatar-search input:focus { border-color: rgba(78,121,189,.6); box-shadow: 0 0 0 3px rgba(78,121,189,.08); }
+.avatar-pending-item input, .avatar-search input, .avatar-name-form input { width: 100%; min-height: 34px; padding: 0 9px; border: 1px solid rgba(116,137,163,.2); border-radius: 7px; outline: none; background: rgba(255,255,255,.85); color: #2e4057; font: inherit; font-size: 10px; }
+.avatar-pending-item input:focus, .avatar-search input:focus, .avatar-name-form input:focus { border-color: rgba(78,121,189,.6); box-shadow: 0 0 0 3px rgba(78,121,189,.08); }
 .avatar-pending-item small { overflow: hidden; color: #8b99aa; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .avatar-remove-pending { justify-self: start; padding: 2px 0; border: 0; background: transparent; color: #a65c5c; font-size: 9px; cursor: pointer; }
 .avatar-text-button { border: 0; background: transparent; color: #5b7da8; font-size: 10px; cursor: pointer; }
@@ -380,8 +380,14 @@ button { cursor: pointer; }
 .avatar-profile-image:not(:disabled):hover img { transform: scale(1.035); }
 .avatar-profile-image i { position: absolute; right: 9px; bottom: 9px; padding: 5px 8px; border: 1px solid rgba(255,255,255,.45); border-radius: 20px; background: rgba(24,34,47,.56); color: white; font-size: 8px; font-style: normal; backdrop-filter: blur(10px); }
 .avatar-profile-info { display: grid; gap: 4px; padding: 11px 12px 4px; }
+.avatar-profile-name { display: flex; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; }
+.avatar-profile-name button { flex: none; min-height: 22px; padding-inline: 0; white-space: nowrap; }
 .avatar-profile-info strong { overflow: hidden; color: #344961; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .avatar-profile-info span, .avatar-profile-info small { color: #8795a8; font-size: 9px; }
+.avatar-name-form { display: grid; gap: 6px; padding-top: 5px; }
+.avatar-name-form label { display: grid; gap: 4px; color: #52647b; font-size: 10px; }
+.avatar-name-form .form-message { margin: 0; padding: 5px 7px; font-size: 10px; }
+.avatar-name-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
 .avatar-profile-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px 12px; }
 .avatar-empty { padding: 38px 18px; border: 1px dashed rgba(119,139,164,.24); border-radius: 11px; background: rgba(255,255,255,.4); color: #8291a5; font-size: 10px; text-align: center; }
 .avatar-preview-overlay { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(17,25,36,.56); backdrop-filter: blur(10px); }
@@ -889,8 +895,10 @@ body { background: #edf2f7; }
 :root[data-theme="dark"] .avatar-profile-card { border-color: rgba(219,227,237,.13); background: rgba(10,14,20,.55); }
 :root[data-theme="dark"] .avatar-pending-item img,
 :root[data-theme="dark"] .avatar-profile-image { background: #171e28; }
-:root[data-theme="dark"] .avatar-pending-item label { color: #a7b2c1; }
+:root[data-theme="dark"] .avatar-pending-item label,
+:root[data-theme="dark"] .avatar-name-form label { color: #a7b2c1; }
 :root[data-theme="dark"] .avatar-pending-item input,
+:root[data-theme="dark"] .avatar-name-form input,
 :root[data-theme="dark"] .avatar-search input { border-color: rgba(219,227,237,.15); background: rgba(8,12,18,.62); color: #e2e8ef; }
 :root[data-theme="dark"] .avatar-stats strong { color: #d9e5f2; }
 :root[data-theme="dark"] .avatar-secondary-button { border-color: rgba(219,227,237,.18); background: rgba(18,24,32,.7); color: #c1d2e8; }

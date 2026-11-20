@@ -212,6 +212,9 @@ function AvatarLibrary({ csrfToken }) {
   const [replaceName, setReplaceName] = useState("");
   const [viewing, setViewing] = useState(null);
   const [removingId, setRemovingId] = useState("");
+  const [nameDraft, setNameDraft] = useState(null);
+  const [nameError, setNameError] = useState("");
+  const [savingName, setSavingName] = useState(false);
   const fileInput = useRef(null);
   const pendingRef = useRef(pending);
 
@@ -273,7 +276,7 @@ function AvatarLibrary({ csrfToken }) {
   }
 
   async function submitUpload(replaceExisting = false) {
-    if (!pending.length || busy) return;
+    if (!pending.length || busy || savingName || removingId) return;
     if (pending.some((item) => !item.name.trim())) {
       setMessage("请给每张照片填写主播姓名。");
       return;
@@ -310,6 +313,7 @@ function AvatarLibrary({ csrfToken }) {
   }
 
   async function removeAvatar(profile) {
+    if (busy || savingName || removingId) return;
     const usageText = profile.usedSlots ? "将影响 " + profile.usedSlots + " 个排班，展示页会改为头像占位。" : "这张照片将从头像库移除。";
     if (!window.confirm("确定移除“" + profile.name + "”的头像吗？" + usageText)) return;
     setRemovingId(profile.id);
@@ -328,6 +332,38 @@ function AvatarLibrary({ csrfToken }) {
     }
   }
 
+  function beginRename(profile) {
+    setNameDraft({ id: profile.id, previousName: profile.name, value: profile.name });
+    setNameError("");
+    setMessage("");
+  }
+
+  async function saveName(event) {
+    event.preventDefault();
+    const name = nameDraft?.value.trim();
+    if (!name || name === nameDraft.previousName || savingName || busy || removingId) return;
+    setSavingName(true);
+    setNameError("");
+    try {
+      const response = await api("/api/v1/admin/host-avatars/" + encodeURIComponent(nameDraft.id), {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "x-csrf-token": csrfToken },
+        body: JSON.stringify({ name, expectedName: nameDraft.previousName }),
+      });
+      setData(response);
+      setNameDraft(null);
+      setSearch((value) => name.toLocaleLowerCase("zh-CN").includes(value.trim().toLocaleLowerCase("zh-CN")) ? value : "");
+      setMessage(response.updatedScheduleCount
+        ? `已保存姓名，同步更新 ${response.updatedScheduleCount} 条排班。`
+        : "已保存主播姓名。");
+    } catch (cause) {
+      setNameError(cause.message);
+    } finally {
+      setSavingName(false);
+    }
+  }
+
+  const changingAvatar = busy || savingName || Boolean(removingId);
   const profiles = data?.profiles ?? [];
   const visibleProfiles = profiles.filter((profile) => profile.name.toLocaleLowerCase("zh-CN").includes(search.trim().toLocaleLowerCase("zh-CN")));
   const invalidFiles = pending.filter((item) => item.file.size > 8 * 1024 * 1024 || !/\.(?:jpe?g|png)$/i.test(item.file.name));
@@ -377,13 +413,13 @@ function AvatarLibrary({ csrfToken }) {
                 <div><strong>有 {replaceNames.length} 位主播已经有头像</strong><span>{replaceNames.join("、")}。替换后，所有使用这些主播的排班页面都会显示新头像。</span></div>
                 <div className="avatar-confirm-actions">
                   <button type="button" className="avatar-secondary-button" onClick={() => setReplaceNames([])}>返回检查</button>
-                  <button type="button" className="button-primary avatar-choose-button" disabled={busy || invalidFiles.length > 0} onClick={() => submitUpload(true)}>{busy ? "正在保存…" : "确认替换并保存"}</button>
+                  <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0} onClick={() => submitUpload(true)}>{busy ? "正在保存…" : "确认替换并保存"}</button>
                 </div>
               </div>
             )}
             <div className="avatar-upload-actions">
               {invalidFiles.length > 0 && <span className="avatar-invalid-hint">请检查文件格式和单张大小。</span>}
-              <button type="button" className="button-primary avatar-choose-button" disabled={busy || invalidFiles.length > 0 || pending.some((item) => !item.name.trim())} onClick={() => submitUpload(false)}>{busy ? "正在保存…" : "上传到头像库"}</button>
+              <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0 || pending.some((item) => !item.name.trim())} onClick={() => submitUpload(false)}>{busy ? "正在保存…" : "上传到头像库"}</button>
             </div>
           </div>
         )}
@@ -399,7 +435,7 @@ function AvatarLibrary({ csrfToken }) {
       )}
 
       <div className="avatar-library-toolbar">
-        <div><span className="section-kicker">HOST DIRECTORY</span><h2>主播头像库</h2><p>管理员可以随时查看、放大预览和更换头像。</p></div>
+        <div><span className="section-kicker">HOST DIRECTORY</span><h2>主播头像库</h2><p>查看头像、编辑姓名和更换照片。</p></div>
         <label className="avatar-search">搜索主播<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入主播姓名" /></label>
       </div>
       <div className="avatar-stats">
@@ -417,13 +453,37 @@ function AvatarLibrary({ csrfToken }) {
                   {profile.photoUrl && <i>放大预览</i>}
                 </button>
                 <div className="avatar-profile-info">
-                  <strong>{profile.name}</strong>
+                  <div className="avatar-profile-name">
+                    <strong title={profile.name}>{profile.name}</strong>
+                    {nameDraft?.id !== profile.id && (
+                      <button type="button" className="avatar-text-button" disabled={changingAvatar}
+                        aria-label={"编辑 " + profile.name + " 的姓名"} onClick={() => beginRename(profile)}>编辑姓名</button>
+                    )}
+                  </div>
                   <span>{profile.usedSlots} 个排班使用</span>
                   <small>{profile.hasPhoto ? "更新于 " + new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(profile.updatedAt)) : "等待上传头像"}</small>
+                  {nameDraft?.id === profile.id && (
+                    <form className="avatar-name-form" onSubmit={saveName}>
+                      <label>新姓名
+                        <input value={nameDraft.value} autoFocus required maxLength={80} disabled={savingName}
+                          onChange={(event) => { setNameDraft({ ...nameDraft, value: event.target.value }); setNameError(""); }} />
+                      </label>
+                      {profile.usedSlots > 0 && <small>保存后同步更新 {profile.usedSlots} 条排班中的主播姓名。</small>}
+                      {nameError && <div className="form-message form-error" role="alert">{nameError}</div>}
+                      <div className="avatar-name-actions">
+                        <button type="button" className="avatar-secondary-button" disabled={savingName}
+                          onClick={() => { setNameDraft(null); setNameError(""); }}>取消</button>
+                        <button type="submit" className="button-primary avatar-choose-button"
+                          disabled={changingAvatar || !nameDraft.value.trim() || nameDraft.value.trim() === nameDraft.previousName}>
+                          {savingName ? "正在保存…" : "保存姓名"}
+                        </button>
+                      </div>
+                    </form>
+                  )}
                 </div>
                 <div className="avatar-profile-actions">
-                  <button type="button" className="avatar-secondary-button" onClick={() => { setReplaceName(profile.name); fileInput.current?.click(); }}>更换头像</button>
-                  {profile.hasPhoto && <button type="button" className="avatar-text-button danger" disabled={removingId === profile.id} onClick={() => removeAvatar(profile)}>{removingId === profile.id ? "处理中…" : "移除"}</button>}
+                  <button type="button" className="avatar-secondary-button" disabled={changingAvatar} onClick={() => { setReplaceName(profile.name); fileInput.current?.click(); }}>更换头像</button>
+                  {profile.hasPhoto && <button type="button" className="avatar-text-button danger" disabled={changingAvatar} onClick={() => removeAvatar(profile)}>{removingId === profile.id ? "处理中…" : "移除"}</button>}
                 </div>
               </article>
             ))}

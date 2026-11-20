@@ -1933,6 +1933,56 @@ async function handle(request, response) {
   }
 
   const adminAvatarMatch = pathname.match(/^\/api\/v1\/admin\/host-avatars\/([a-f\d]{32})$/i);
+  if (request.method === "PATCH" && adminAvatarMatch) {
+    const user = requireUser(request, response, "admin");
+    if (!user) return;
+    if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+    let input;
+    try { input = await readJson(request); } catch (cause) {
+      return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+    }
+    const name = typeof input?.name === "string" ? input.name.trim() : "";
+    const key = hostNameKey(name);
+    if (!key || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name) || typeof input?.expectedName !== "string") {
+      return error(response, 422, "AVATAR_NAME_INVALID", "请填写有效的主播姓名，最多 80 个字符");
+    }
+    const id = adminAvatarMatch[1];
+    let result;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const avatar = db.prepare("SELECT name,name_key,updated_at FROM host_avatars WHERE id=?").get(id);
+      const reject = (status, code, message) => Object.assign(new Error(message), { status, code });
+      if (!avatar) throw reject(404, "AVATAR_NOT_FOUND", "主播档案不存在");
+      if (avatar.name !== input.expectedName) {
+        throw reject(409, "AVATAR_NAME_CHANGED", "主播姓名已更新，请刷新头像库后再编辑");
+      }
+      result = { ok: true, updatedScheduleCount: 0, dataUpdatedAt: updatedAtValue() };
+      if (avatar.name !== name) {
+        const other = hostAvatarByNameKey.get(key);
+        const hosts = db.prepare("SELECT DISTINCT host FROM slots WHERE host<>''").all().map(({ host }) => host);
+        if ((other && other.id !== id) || (key !== avatar.name_key && hosts.some((host) => hostNameKey(host) === key))) {
+          throw reject(409, "AVATAR_NAME_CONFLICT", "这个姓名已被其他主播档案或排班使用，请填写可区分的姓名");
+        }
+        const updateHost = db.prepare("UPDATE slots SET host=? WHERE host=?");
+        for (const host of hosts) {
+          if (host !== name && hostNameKey(host) === avatar.name_key) {
+            result.updatedScheduleCount += Number(updateHost.run(name, host).changes);
+          }
+        }
+        db.prepare("UPDATE host_avatars SET name=?,name_key=?,updated_at=? WHERE id=?")
+          .run(name, key, Math.max(Date.now(), avatar.updated_at + 1), id);
+        result.dataUpdatedAt = nextDataUpdatedAt();
+        db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(result.dataUpdatedAt);
+      }
+      db.exec("COMMIT");
+    } catch (cause) {
+      try { db.exec("ROLLBACK"); } catch {}
+      if (cause.status) return error(response, cause.status, cause.code, cause.message);
+      console.error("主播改名失败:", cause.code ?? "AVATAR_RENAME_FAILED");
+      return error(response, 500, "AVATAR_RENAME_FAILED", "保存姓名失败，请稍后重试");
+    }
+    return json(response, 200, { ...result, ...avatarLibraryPayload() });
+  }
   if (request.method === "DELETE" && adminAvatarMatch) {
     const user = requireUser(request, response, "admin");
     if (!user) return;

@@ -237,6 +237,61 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   assert.deepEqual(JSON.parse(stored.products_json), []);
 }));
 
+test("avatar rename preserves the photo and updates only the matching host assignments", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {
+  const originalId = "a".repeat(32);
+  const otherId = "b".repeat(32);
+  const now = Date.now();
+  const photo = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const insertAvatar = db.prepare("INSERT INTO host_avatars(id,name,name_key,photo_type,photo_blob,photo_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)");
+  insertAvatar.run(originalId, "旧 名", "旧名", "image/png", photo, "original-hash", now, now);
+  insertAvatar.run(otherId, "其他主播", "其他主播", null, null, null, now, now);
+  const insertRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+  insertRoom.run("01", "Alpha", "One", 0);
+  insertRoom.run("02", "Beta", "Two", 1);
+  const insertShift = db.prepare(`INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host,assistant)
+    VALUES (?,?,?,'08:00','12:00',?,?,?,?)`);
+  const from = Date.parse("2026-11-19T08:00:00+08:00");
+  const to = Date.parse("2026-11-19T12:00:00+08:00");
+  insertShift.run("one", "01", "2026-11-19", from, to, "旧名", "旧 名");
+  insertShift.run("two", "02", "2026-11-19", from, to, "旧 名", "");
+  insertShift.run("other", "02", "2026-11-20", from + 86400000, to + 86400000, "仅排班主播", "");
+  const path = "/api/v1/admin/host-avatars/" + originalId;
+  const rename = (name, expectedName = "旧 名", auth = admin) => request(path, {
+    method: "PATCH", headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ name, expectedName }),
+  });
+
+  assert.equal((await rename("新姓名", "旧 名", viewer)).status, 403);
+  assert.equal((await rename("新姓名", "旧 名", { cookie: admin.cookie })).status, 403);
+  assert.equal((await rename(" ")).status, 422);
+  assert.equal((await rename("其他 主播")).body.error.code, "AVATAR_NAME_CONFLICT");
+  assert.equal((await rename("仅排班主播")).body.error.code, "AVATAR_NAME_CONFLICT");
+  assert.equal((await rename("新姓名", "过期姓名")).body.error.code, "AVATAR_NAME_CHANGED");
+  assert.equal(db.prepare("SELECT host FROM slots WHERE id='one'").get().host, "旧名");
+
+  const previousPreview = await preview(workbook([["46345", "", "Alpha", "08:00-12:00", "旧名"]]));
+  assert.equal(previousPreview.body.status, "ready");
+  const renamed = await rename(" 新姓名 ");
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.body.updatedScheduleCount, 2);
+  const profile = renamed.body.profiles.find((item) => item.id === originalId);
+  assert.equal(profile.name, "新姓名");
+  assert.equal(profile.usedSlots, 2);
+  assert.equal(renamed.body.profiles.length, 2);
+  const saved = db.prepare("SELECT * FROM host_avatars WHERE id=?").get(originalId);
+  assert.deepEqual(Buffer.from(saved.photo_blob), photo);
+  assert.equal(saved.photo_hash, "original-hash");
+  assert.equal(saved.created_at, now);
+  assert.equal(db.prepare("SELECT host FROM slots WHERE id='other'").get().host, "仅排班主播");
+  assert.equal(db.prepare("SELECT assistant FROM slots WHERE id='one'").get().assistant, "旧 名");
+  for (const code of ["01", "02"]) {
+    const schedule = await request("/api/v1/rooms/" + code + "/schedule?date=2026-11-19", { headers: viewer });
+    assert.equal(schedule.body.schedule[0].host, "新姓名");
+    assert.equal(schedule.body.schedule[0].photo, profile.photoUrl);
+  }
+  assert.equal((await commit(previousPreview.body.previewId)).status, 409);
+}));
+
 test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
   const bytes = await readFile(process.env.STAFF_IMPORT_XLSX);
   const [sheet] = parseXlsx(bytes);
