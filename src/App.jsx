@@ -135,7 +135,7 @@ function MerchandisingInfo({ products = [], salesTarget = "" }) {
       <section className="merch-card target-card" aria-label="目标销售额">
         <span className="merch-kicker">SALES TARGET</span>
         <span className="target-label">目标销售额</span>
-        <strong className="target-value">{salesTarget || "待设置"}</strong>
+        <strong className="target-value" title={salesTarget || undefined}>{salesTarget || "待设置"}</strong>
       </section>
     </div>
   );
@@ -688,8 +688,8 @@ function AdminScheduleLibrary({ csrfToken }) {
                       ) : <>
                         <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
                         <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
-                        <label className="schedule-edit-wide">主推商品（每行一项）<textarea value={editValues.products} maxLength={6000} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
-                        <label>目标销售额<input value={editValues.salesTarget} maxLength={32} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="例如：200000 或 20万" /></label>
+                        <label className="schedule-edit-wide">主推商品（逗号或换行分隔）<textarea value={editValues.products} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
+                        <label>目标销售额<textarea value={editValues.salesTarget} rows={2} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="按原文显示" /></label>
                         <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
                       </>}
                       <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>
@@ -699,7 +699,7 @@ function AdminScheduleLibrary({ csrfToken }) {
               ) : (
                 <tr key={slot.id}>
                   <td>{slot.kind === "director" ? "导演排班" : "主播排班"}</td><td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
-                  <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td>{slot.salesTarget || "—"}</td>
+                  <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td className="schedule-target-cell">{slot.salesTarget || "—"}</td>
                   <td>{slot.kind === "host" ? <span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span> : "—"}</td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
                   <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
                 </tr>
@@ -725,7 +725,9 @@ function AdminScheduleLibrary({ csrfToken }) {
       ...slot, start: editValues.start, end: editValues.end, director: editValues.director,
     } : {
       ...slot, start: editValues.start, end: editValues.end, host: editValues.host, assistant: editValues.assistant,
-      featuredProducts: editValues.products.split(/[\r\n;；、]+/).map((item) => item.trim()).filter(Boolean),
+      featuredProducts: editValues.products === slot.featuredProducts.join("\n")
+        ? slot.featuredProducts
+        : editValues.products.split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean),
       salesTarget: editValues.salesTarget, notes: editValues.notes,
     };
     // Filters can hide siblings, so submit the complete unfiltered day from the source payload.

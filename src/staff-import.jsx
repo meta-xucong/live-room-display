@@ -36,6 +36,12 @@ function ShiftDetails({ label, shifts, previous }) {
               <time>{shift.start}–{shift.overnight && "次日 "}{shift.end}</time>
               <strong>{shift.person}</strong>
               <small>{shift.sourceSheet} 第 {shift.sourceRow} 行</small>
+              {shift.featuredProducts?.length > 0 && (
+                <span className="staff-shift-merch"><small>主推商品</small> <span>{shift.featuredProducts.join("、")}</span></span>
+              )}
+              {shift.salesTarget && (
+                <span className="staff-shift-merch"><small>目标销售额</small> <span>{shift.salesTarget}</span></span>
+              )}
             </li>
           ))}
         </ul>
@@ -231,7 +237,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
     <section className="admin-card" role="tabpanel" hidden={hidden}>
       <div className="admin-card-heading">
         <div className="admin-icon" aria-hidden="true">↥</div>
-        <div><h2>导入员工排班表</h2><p>上传原表，按直播间名称和日期导入。导演和主播按各自时段录入。</p></div>
+        <div><h2>导入员工排班表</h2><p>按直播间名称和日期导入。主推商品用逗号分隔，目标销售额按原文展示。</p></div>
       </div>
       {!result && (
         <form className={"upload-form staff-import-form" + (!preview && needsMatching ? " staff-matching-active" : "")}

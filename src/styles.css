@@ -289,6 +289,7 @@ button { cursor: pointer; }
 .staff-shift-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; padding: 4px 8px 8px; }
 .staff-shifts ul, .staff-issues ul { margin: 6px 0; padding: 0; list-style: none; }
 .staff-shifts li { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0; font-size: 11px; }
+.staff-shift-merch { flex-basis: 100%; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .staff-issues { padding: 3px 10px; }
 .staff-issues li { padding: 4px; font-size: 11px; overflow-wrap: anywhere; }
 .staff-import-success { margin-top: 16px; }
@@ -651,14 +652,14 @@ body { background: #edf2f7; }
 .merch-heading h2 { margin: 3px 0 0; color: #263449; font-size: clamp(12px, 1vw, 15px); font-weight: 650; }
 .merch-kicker { display: block; color: #8494aa; font-size: 8px; font-weight: 700; letter-spacing: .16em; }
 .product-count { flex: none; color: #718198; font-size: 10px; }
-.product-list { min-height: 0; flex: 1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: center; gap: clamp(6px, .8vw, 10px); margin: 7px 0 0; padding: 0; list-style: none; }
+.product-list { min-height: 0; flex: 1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: safe center; gap: clamp(6px, .8vw, 10px); margin: 7px 0 0; padding: 0; overflow: auto; list-style: none; }
 .product-list li { min-width: 0; min-height: 42px; padding: 0 9px; display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: center; gap: 7px; border: 1px solid rgba(126, 147, 173, .16); border-radius: 8px; background: rgba(255, 255, 255, .72); }
 .product-index { width: 22px; height: 19px; display: grid; place-items: center; border-radius: 6px; background: rgba(78, 121, 189, .1); color: #4e79bd; font-size: 9px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.product-name { min-width: 0; overflow: hidden; color: #314158; font-size: clamp(11px, .9vw, 14px); line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.product-name { min-width: 0; color: #314158; font-size: clamp(11px, .9vw, 14px); line-height: 1.25; overflow-wrap: anywhere; }
 .merch-empty { display: flex; flex: 1; align-items: center; color: #748399; font-size: 11px; }
 .target-card { display: flex; flex-direction: column; justify-content: center; align-items: flex-start; background: rgba(237, 244, 254, .88); border-color: rgba(95, 133, 188, .27); }
 .target-label { margin-top: 6px; color: #718096; font-size: clamp(10px, .85vw, 13px); }
-.target-value { max-width: 100%; overflow: hidden; margin-top: 3px; color: #3d6dad; font-size: clamp(24px, 2.6vw, 42px); font-weight: 650; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
+.target-value { min-height: 0; max-width: 100%; overflow: auto; margin-top: 3px; color: #3d6dad; font-size: clamp(22px, 2.2vw, 38px); font-weight: 650; line-height: 1.2; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .fullscreen-layout .merch-row { height: clamp(132px, 15vh, 164px); }
 .fullscreen-layout .portrait-frame { height: clamp(280px, calc(100vh - 520px), 560px); }
@@ -668,7 +669,7 @@ body { background: #edf2f7; }
   .products-card { min-height: 140px; }
   .product-list { grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .product-list li { min-height: 23px; padding: 0; border: 0; background: transparent; }
-  .target-card { min-height: 70px; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; align-items: center; column-gap: 8px; }
+  .target-card { min-height: 70px; display: grid; grid-template-columns: minmax(72px, .55fr) minmax(0, 1fr); grid-template-rows: auto auto; align-items: center; column-gap: 8px; }
   .target-card .merch-kicker, .target-card .target-label { grid-column: 1; }
   .target-card .target-label { margin-top: 3px; }
   .target-card .target-value { grid-column: 2; grid-row: 1 / span 2; margin: 0; font-size: 24px; }
@@ -967,7 +968,7 @@ body, .topbar, .control-card, .display-stage, .merch-card, .auth-card, .admin-ca
 .schedule-table th { background: rgba(247,250,254,.74); color: #8795a8; font-size: 8px; font-weight: 600; white-space: nowrap; }
 .schedule-table tbody tr:last-child td { border-bottom: 0; }
 .schedule-table .schedule-time-cell { color: #3f5c7e; font-weight: 650; white-space: nowrap; }
-.schedule-products-cell, .schedule-notes-cell { max-width: 210px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.schedule-products-cell, .schedule-target-cell, .schedule-notes-cell { max-width: 210px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .schedule-avatar-status { display: inline-block; padding: 3px 6px; border-radius: 20px; font-size: 8px; white-space: nowrap; }
 .schedule-avatar-status.ready { background: rgba(72,164,116,.1); color: #438262; }
 .schedule-avatar-status.missing { background: rgba(202,154,70,.12); color: #94713a; }

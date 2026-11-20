@@ -45,7 +45,7 @@ db.exec(`
     date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
     starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL,
     director TEXT NOT NULL DEFAULT '', host TEXT NOT NULL DEFAULT '', assistant TEXT NOT NULL DEFAULT '',
-    products_json TEXT NOT NULL DEFAULT '[]', sales_target_cents INTEGER,
+    products_json TEXT NOT NULL DEFAULT '[]', sales_target_cents INTEGER, sales_target_text TEXT,
     notes TEXT NOT NULL DEFAULT '', photo_type TEXT, photo_blob BLOB
   );
   CREATE TABLE IF NOT EXISTS director_shifts (
@@ -63,6 +63,21 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   INSERT OR IGNORE INTO app_state(key, value) VALUES ('data_updated_at', '');
 `);
+
+const salesTextColumn = db.prepare("SELECT 1 FROM pragma_table_info('slots') WHERE name='sales_target_text'");
+if (!salesTextColumn.get()) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!salesTextColumn.get()) {
+      db.exec("ALTER TABLE slots ADD COLUMN sales_target_text TEXT");
+      db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
+    }
+    db.exec("COMMIT");
+  } catch (cause) {
+    db.exec("ROLLBACK");
+    throw cause;
+  }
+}
 
 const MIME = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -416,16 +431,6 @@ function excelTime(value) {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-function parseMoney(value) {
-  if (value === "" || value == null) return null;
-  const text = String(value).trim().replace(/,/g, "");
-  const match = text.match(/^(?:¥|￥)?\s*(\d+(?:\.\d+)?)\s*(万元|万|元)?$/);
-  if (!match) return NaN;
-  const number = Number(match[1]);
-  const multiplier = match[2]?.startsWith("万") ? 10_000 : 1;
-  return Math.round(number * multiplier * 100);
-}
-
 function shanghaiDate(date) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
@@ -434,7 +439,9 @@ function shanghaiDate(date) {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-function salesDisplay(cents) {
+function slotSalesTarget(slot) {
+  if (slot?.sales_target_text != null) return slot.sales_target_text;
+  const cents = slot?.sales_target_cents;
   if (cents == null) return "";
   const yuan = cents / 100;
   if (yuan >= 100_000) {
@@ -519,19 +526,18 @@ function validateWorkbook(sheets) {
         const host = String(read(rowNumber, "I") ?? "").trim();
         const assistant = String(read(rowNumber, "J") ?? "").trim();
         const products = String(read(rowNumber, "L") ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-        const salesTargetCents = parseMoney(read(rowNumber, "M"));
-        if (Number.isNaN(salesTargetCents)) pushError(sheet.name, rowNumber, "目标销售额", "金额请填写数字、元或万元，例如 200000 或 20万");
+        const salesTarget = String(read(rowNumber, "M") ?? "");
         if (!host) pushWarning(sheet.name, rowNumber, "主播", "未填写主播");
         if (!assistant) pushWarning(sheet.name, rowNumber, "助播", "未填写助播");
         if (!rowImages.length) pushWarning(sheet.name, rowNumber, "主播照片", "未添加主播照片");
         if (!products.length) pushWarning(sheet.name, rowNumber, "主推商品", "未填写主推商品");
-        if (salesTargetCents == null) pushWarning(sheet.name, rowNumber, "目标销售额", "未填写目标销售额");
+        if (!salesTarget) pushWarning(sheet.name, rowNumber, "目标销售额", "未填写目标销售额");
         if (rowImages.length > 1) pushError(sheet.name, rowNumber, "主播照片", "每个主播时段最多添加一张照片");
         if (rowImages.some((image) => image.columnNumber !== 10)) pushError(sheet.name, rowNumber, "主播照片", "请将照片锚定在 K 列对应主播排班行");
         if (!hostHasValues && rowImages.length) pushError(sheet.name, rowNumber, "主播照片", "照片所在行没有主播排班信息");
         if (range.date && range.start && range.end) hostShifts.push({
           id: randomBytes(16).toString("hex"), sourceRow: rowNumber, ...range,
-          host, assistant, products, salesTargetCents,
+          host, assistant, products, salesTarget,
           notes: String(read(rowNumber, "N") ?? "").trim(), photo: rowImages[0] ?? null,
         });
       }
@@ -638,20 +644,34 @@ function staffImportSummary(rooms, warnings) {
   };
 }
 
+const shiftKey = (start, end, person) => JSON.stringify([start, end, person]);
+
 function staffPreviewRooms(rooms) {
-  const oldHostCount = db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code=? AND date=?");
+  const findHosts = db.prepare(`SELECT start_time,end_time,host,products_json,sales_target_cents,sales_target_text
+    FROM slots WHERE room_code=? AND date=?`);
   const oldDirectorCount = db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?");
   const displayShift = ({ host, director, start, end, overnight, sourceSheet, sourceRow }) =>
     ({ person: host ?? director, start, end, overnight, sourceSheet, sourceRow });
   return rooms.map((room) => ({
     code: room.code, name: room.name, sourceName: room.sourceName, isNew: room.isNew,
-    dates: [...room.dates.keys()].sort().map((date) => ({
-      date,
-      previousHostCount: oldHostCount.get(room.code, date).count,
-      previousDirectorCount: oldDirectorCount.get(room.code, date).count,
-      hostShifts: room.hostShifts.filter((shift) => shift.date === date).map(displayShift),
-      directorShifts: room.directorShifts.filter((shift) => shift.date === date).map(displayShift),
-    })),
+    dates: [...room.dates.keys()].sort().map((date) => {
+      const previousHosts = findHosts.all(room.code, date);
+      const byHost = new Map(previousHosts.map((slot) => [shiftKey(slot.start_time, slot.end_time, slot.host), slot]));
+      return {
+        date,
+        previousHostCount: previousHosts.length,
+        previousDirectorCount: oldDirectorCount.get(room.code, date).count,
+        hostShifts: room.hostShifts.filter((shift) => shift.date === date).map((shift) => {
+          const old = byHost.get(shiftKey(shift.start, shift.end, shift.host));
+          return {
+            ...displayShift(shift),
+            featuredProducts: shift.products ?? JSON.parse(old?.products_json ?? "[]"),
+            salesTarget: shift.salesTarget ?? slotSalesTarget(old),
+          };
+        }),
+        directorShifts: room.directorShifts.filter((shift) => shift.date === date).map(displayShift),
+      };
+    }),
   }));
 }
 
@@ -688,12 +708,11 @@ function commitStaffImport(id, userId) {
     const deleteDirectors = db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?");
     const insertHost = db.prepare(`INSERT INTO slots(
       id,room_code,date,start_time,end_time,starts_at,ends_at,host,assistant,
-      products_json,sales_target_cents,notes,photo_type,photo_blob
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      products_json,sales_target_cents,sales_target_text,notes,photo_type,photo_blob
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insertDirector = db.prepare(`INSERT INTO director_shifts(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director
     ) VALUES (?,?,?,?,?,?,?,?)`);
-    const shiftKey = (start, end, person) => JSON.stringify([start, end, person]);
     for (const room of preview.rooms) {
       if (room.isNew) insertRoom.run(room.code, room.name, room.sheetName, roomOrder++);
       if (room.saveAlias) insertAlias.run(room.key, room.code);
@@ -710,7 +729,10 @@ function commitStaffImport(id, userId) {
           const old = oldHosts.get(shiftKey(slot.start, slot.end, slot.host));
           insertHost.run(
             old?.id ?? slot.id, room.code, date, slot.start, slot.end, slot.startAt, slot.endAt,
-            slot.host, old?.assistant ?? "", old?.products_json ?? "[]", old?.sales_target_cents ?? null,
+            slot.host, old?.assistant ?? "",
+            slot.products === undefined ? old?.products_json ?? "[]" : JSON.stringify(slot.products),
+            slot.salesTarget === undefined ? old?.sales_target_cents ?? null : null,
+            slot.salesTarget ?? old?.sales_target_text ?? null,
             old?.notes ?? "", old?.photo_type ?? null, old?.photo_blob ?? null,
           );
         }
@@ -862,7 +884,7 @@ function publicSlot(slot) {
   return {
     id: slot.id, date: slot.date, start: slot.start_time, end: slot.end_time,
     host: slot.host, assistant: slot.assistant,
-    featuredProducts: products, salesTarget: salesDisplay(slot.sales_target_cents),
+    featuredProducts: products, salesTarget: slotSalesTarget(slot),
     photo,
     startsAt: slot.starts_at, endsAt: slot.ends_at,
   };
@@ -922,7 +944,7 @@ function adminSchedulePayload() {
     groupFor(row).slots.push({
       id: row.id, kind: "host", start: row.start_time, end: row.end_time,
       host: row.host, assistant: row.assistant,
-      featuredProducts: JSON.parse(row.products_json), salesTarget: salesDisplay(row.sales_target_cents), notes: row.notes,
+      featuredProducts: JSON.parse(row.products_json), salesTarget: slotSalesTarget(row), notes: row.notes,
       hasAvatar: avatar ? Boolean(avatar.photo_type) : Boolean(row.photo_type),
       avatarSource: avatar?.photo_type ? "头像库" : row.photo_type ? "本场照片" : "未配置",
     });
@@ -995,7 +1017,7 @@ const mcpTools = [
               host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
               assistant: { type: "string", description: "助播，随主播排班" },
               featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
-              salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
+              salesTarget: { description: "目标销售额原文，按填写内容显示", oneOf: [{ type: "string" }, { type: "number" }] },
               notes: { type: "string" },
             },
           },
@@ -1043,7 +1065,7 @@ const mcpTools = [
                     host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
                     assistant: { type: "string", description: "助播，随主播排班" },
                     featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
-                    salesTarget: { oneOf: [{ type: "string" }, { type: "number" }] },
+                    salesTarget: { description: "目标销售额原文，按填写内容显示", oneOf: [{ type: "string" }, { type: "number" }] },
                     notes: { type: "string" },
                   },
                 },
@@ -1117,7 +1139,7 @@ function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
     return {
       start: slot.start, end: slot.end, host: slot.host,
       assistant: slot.assistant, featuredProducts: slot.products,
-      salesTarget: salesDisplay(slot.salesTargetCents), notes: slot.notes,
+      salesTarget: slot.salesTarget, notes: slot.notes,
       hasAvatar, avatarSource: avatar?.photo_type ? "头像库" : hasAvatar ? "本场已有照片" : "未配置",
       row: index + 4,
     };
@@ -1320,7 +1342,7 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     }
     const insertSlot = db.prepare(`INSERT INTO slots(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-      products_json,sales_target_cents,notes,photo_type,photo_blob
+      products_json,sales_target_text,notes,photo_type,photo_blob
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insertDirector = db.prepare(`INSERT INTO director_shifts(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director
@@ -1340,7 +1362,7 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
         }
         insertSlot.run(
           previous?.id ?? slot.id, roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTarget,
           slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
@@ -1409,7 +1431,7 @@ function commitMcpPreview(previewId, tokenId) {
     db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
     const insertSlot = db.prepare(`INSERT INTO slots(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-      products_json,sales_target_cents,notes,photo_type,photo_blob
+      products_json,sales_target_text,notes,photo_type,photo_blob
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insertDirector = db.prepare(`INSERT INTO director_shifts(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director
@@ -1421,7 +1443,7 @@ function commitMcpPreview(previewId, tokenId) {
       insertSlot.run(
         previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
         "", slot.host, slot.assistant, JSON.stringify(slot.products),
-        slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
+        slot.salesTarget, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
       );
     }
     for (const shift of schedule.directorShifts) insertDirector.run(
@@ -1461,7 +1483,7 @@ async function callMcpTool(name, args, token) {
       const hasPhoto = avatar ? Boolean(avatar.photo_type) : Boolean(slot.photo_blob);
       return {
         start: slot.start_time, end: slot.end_time, host: slot.host, assistant: slot.assistant,
-        featuredProducts: JSON.parse(slot.products_json), salesTarget: salesDisplay(slot.sales_target_cents),
+        featuredProducts: JSON.parse(slot.products_json), salesTarget: slotSalesTarget(slot),
         notes: slot.notes, hasPhoto, avatarSource: avatar?.photo_type ? "头像库" : hasPhoto ? "本场已有照片" : "未配置",
       };
     });
@@ -1714,12 +1736,21 @@ async function handle(request, response) {
     const hostInput = Array.isArray(input.hostShifts) ? input.hostShifts : [];
     const directorInput = Array.isArray(input.directorShifts) ? input.directorShifts : [];
     const originalNotes = hostInput.map((slot) => typeof slot?.notes === "string" ? slot.notes.trim() : "");
+    if (hostInput.some((slot) =>
+      (slot?.salesTarget != null && !["string", "number"].includes(typeof slot.salesTarget)) ||
+      (slot?.featuredProducts != null && (!Array.isArray(slot.featuredProducts) ||
+        slot.featuredProducts.some((product) => typeof product !== "string")))
+    )) {
+      return error(response, 422, "SCHEDULE_INVALID", "主推商品和目标销售额格式不正确");
+    }
     const editPayload = {
       ...input,
       directorShifts: directorInput.map((shift) => ({ ...shift })),
       hostShifts: hostInput.map((slot, index) => ({
         ...slot,
-        // Keep multiline notes separate from the single-line schedule parser.
+        // Keep merchandise values and multiline notes outside the line-based schedule parser.
+        featuredProducts: [],
+        salesTarget: "",
         notes: originalNotes[index].replace(/\r\n?/g, " ").replace(/\n/g, " ").trim(),
       })),
     };
@@ -1740,9 +1771,9 @@ async function handle(request, response) {
         return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
       }
       preview = mcpPreviewFor(parsed);
-      sourceHostByKey = new Map(editPayload.hostShifts.map((slot, index) => [
+      sourceHostByKey = new Map(hostInput.map((slot, index) => [
         `${excelTime(slot.start)}\u0000${excelTime(slot.end)}\u0000${String(slot.host ?? "").trim()}`,
-        { id: slot.id, notes: originalNotes[index] ?? "" },
+        { id: slot.id, products: slot.featuredProducts ?? [], salesTarget: String(slot.salesTarget ?? ""), notes: originalNotes[index] },
       ]));
       sourceDirectorByKey = new Map(editPayload.directorShifts.map((shift) => [
         `${excelTime(shift.start)}\u0000${excelTime(shift.end)}\u0000${String(shift.director ?? "").trim()}`,
@@ -1770,7 +1801,7 @@ async function handle(request, response) {
       db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       const insertSlot = db.prepare(`INSERT INTO slots(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-        products_json,sales_target_cents,notes,photo_type,photo_blob
+        products_json,sales_target_text,notes,photo_type,photo_blob
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
       const insertDirector = db.prepare(`INSERT INTO director_shifts(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director
@@ -1783,7 +1814,7 @@ async function handle(request, response) {
           ?? previousByHostKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
         insertSlot.run(
           previous?.id ?? priorById?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTargetCents,
+          "", slot.host, slot.assistant, JSON.stringify(source?.products ?? slot.products), source?.salesTarget ?? slot.salesTarget,
           source?.notes ?? slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
@@ -2005,7 +2036,7 @@ async function handle(request, response) {
       db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       const insertSlot = db.prepare(`INSERT INTO slots(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-        products_json,sales_target_cents,notes,photo_type,photo_blob
+        products_json,sales_target_text,notes,photo_type,photo_blob
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
       const insertDirector = db.prepare(`INSERT INTO director_shifts(
         id,room_code,date,start_time,end_time,starts_at,ends_at,director
@@ -2016,7 +2047,7 @@ async function handle(request, response) {
         insertSlot.run(
           previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
           "", slot.host, slot.assistant, JSON.stringify(slot.products),
-          slot.salesTargetCents, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
+          slot.salesTarget, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
       for (const shift of schedule.directorShifts) {

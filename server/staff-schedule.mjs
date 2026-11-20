@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { cellHasFormula, cellValue } from "./xlsx.mjs";
 
 const required = ["日期", "直播间", "主播时间", "主播", "导演时间", "导演"];
+const merchandise = ["主推商品", "目标销售额"];
+const fields = [...required, ...merchandise];
 const roles = [
   { role: "主播", name: "host", records: "hostShifts" },
   { role: "导演", name: "director", records: "directorShifts" },
@@ -46,7 +48,7 @@ export function parseStaffSchedule(sheets, parseDate) {
     const columns = new Map();
     for (const [column, cell] of cells) {
       const label = String(cell.value ?? "").trim();
-      if (!required.includes(label)) continue;
+      if (!fields.includes(label)) continue;
       if (columns.has(label) || cell.formula) {
         report(errors, sheet.name, headerRow, column, label, "表头必须唯一并使用固定文字");
       }
@@ -64,7 +66,7 @@ export function parseStaffSchedule(sheets, parseDate) {
       const raw = (field) => cellValue(sheet, row, columns.get(field));
       const text = (field) => String(raw(field)).trim();
       const issue = (list, field, message) => report(list, sheet.name, row, columns.get(field), field, message, date, room?.name);
-      const formulas = required.filter((field) => cellHasFormula(sheet, row, columns.get(field)));
+      const formulas = fields.filter((field) => cellHasFormula(sheet, row, columns.get(field)));
       if (formulas.length) {
         for (const field of formulas) issue(errors, field, "请填写固定值");
         if (formulas.includes("日期")) date = "";
@@ -95,6 +97,10 @@ export function parseStaffSchedule(sheets, parseDate) {
         }
       }
       if (room && date && !room.dates.has(date)) room.dates.set(date, { sheet: sheet.name, row, count: 0 });
+      const merchandiseField = merchandise.find((field) => text(field));
+      if (merchandiseField && (!text("主播时间") || !text("主播"))) {
+        issue(warnings, merchandiseField, "本行没有主播场次，已跳过主推商品和目标销售额");
+      }
       for (const entry of roles) {
         const { role } = entry;
         const timeField = `${role}时间`;
@@ -110,10 +116,15 @@ export function parseStaffSchedule(sheets, parseDate) {
         else if (!person) issue(warnings, role, "有时段但缺少姓名，已跳过此班次");
         else if (person.length > 80) issue(errors, role, "姓名不能超过 80 个字符");
         else {
-          room[entry.records].push({
+          const shift = {
             id: randomBytes(16).toString("hex"), date, sourceSheet: sheet.name, sourceRow: row,
             ...range, [entry.name]: person,
-          });
+          };
+          if (entry.name === "host") {
+            if (columns.has("主推商品")) shift.products = text("主推商品").split(/[,，]/).map((item) => item.trim()).filter(Boolean);
+            if (columns.has("目标销售额")) shift.salesTarget = String(raw("目标销售额"));
+          }
+          room[entry.records].push(shift);
           room.dates.get(date).count += 1;
         }
       }

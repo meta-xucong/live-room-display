@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { crc32 } from "node:zlib";
+import { cellValue, parseXlsx } from "../server/xlsx.mjs";
 
 function zip(entries) {
   const content = [], directory = [];
@@ -39,15 +40,17 @@ function zip(entries) {
   return Buffer.concat([...content, ...directory, end]);
 }
 
-function workbook(rows, date1904 = false) {
+function workbook(rows, date1904 = false, withMerchandise = false) {
+  const headers = ["日期", "星期", "直播间", "主播时间", "主播", "导演时间", "导演", "休"];
+  if (withMerchandise) headers.push("主推商品", "目标销售额");
   return zip({
     "xl/workbook.xml": '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
       '<workbookPr date1904="' + Number(date1904) + '"/><sheets><sheet name="Sheet1" r:id="r1"/></sheets></workbook>',
     "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>',
     "xl/worksheets/sheet1.xml": "<worksheet><sheetData>" + [
-      ["日期", "星期", "直播间", "主播时间", "主播", "导演时间", "导演", "休"],
+      headers,
       ...rows,
-    ].map((row, r) => "<row>" + row.map((value, c) => value ? "<c r=\"" + "ABCDEFGH"[c] + (r + 1) +
+    ].map((row, r) => "<row>" + row.map((value, c) => value ? "<c r=\"" + "ABCDEFGHIJ"[c] + (r + 1) +
       '" t="inlineStr"><is><t>' + value + "</t></is></c>" : "").join("") + "</row>").join("") + "</sheetData></worksheet>",
   });
 }
@@ -197,10 +200,47 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   const slots = JSON.parse(schedule.body.result.content[0].text);
   assert.equal(slots.hostShifts.length, 1);
   assert.equal(slots.directorShifts.length, 1);
+
+  const target = "  0010 或 20万\n按现场决定  ";
+  const sameShift = ["46345", "", "Alpha", "08:00-12:00", "Host A", "21:00-00:30", "Director A"];
+  const merch = await preview(workbook([
+    [...sameShift, "", "商品甲, 商品乙，商品丙；加绒", target],
+    ["", "", "", "", "", "14:00-16:00", "Director B", "", "忽略这一项", "待定"],
+  ], false, true));
+  assert.equal(merch.status, 200, JSON.stringify(merch.body));
+  assert.equal(merch.body.summary.skippedCount, 1);
+  assert.equal(merch.body.rooms[0].dates[0].hostShifts[0].salesTarget, target);
+  const products = ["商品甲", "商品乙", "商品丙；加绒"];
+  assert.deepEqual(merch.body.rooms[0].dates[0].hostShifts[0].featuredProducts, products);
+  const merchReceipt = await commit(merch.body.previewId);
+  assert.equal(merchReceipt.status, 200);
+  const productSchedule = await request("/api/v1/rooms/01/schedule?date=2026-11-19", { headers: admin });
+  assert.equal(productSchedule.body.schedule[0].salesTarget, target);
+  assert.deepEqual(productSchedule.body.schedule[0].featuredProducts, products);
+  assert.equal(db.prepare("SELECT sales_target_cents FROM slots WHERE id='keep'").get().sales_target_cents, null);
+  const edit = await request("/api/v1/admin/schedules", {
+    method: "PUT", headers: { ...admin, "content-type": "application/json" },
+    body: JSON.stringify({
+      roomCode: "01", date: "2026-11-19", dataUpdatedAt: merchReceipt.body.dataUpdatedAt,
+      directorShifts: [{ start: "21:00", end: "00:30", director: "Director A" }],
+      hostShifts: [{ id: "keep", start: "08:00", end: "12:00", host: "Host A", featuredProducts: products, salesTarget: target }],
+    }),
+  });
+  assert.equal(edit.status, 200, JSON.stringify(edit.body));
+  const legacyFile = await preview(workbook([sameShift]));
+  assert.equal((await commit(legacyFile.body.previewId)).status, 200);
+  assert.equal(db.prepare("SELECT sales_target_text FROM slots WHERE id='keep'").get().sales_target_text, target);
+  const blank = await preview(workbook([sameShift], false, true));
+  assert.equal((await commit(blank.body.previewId)).status, 200);
+  const stored = db.prepare("SELECT sales_target_text,products_json FROM slots WHERE id='keep'").get();
+  assert.equal(stored.sales_target_text, "");
+  assert.deepEqual(JSON.parse(stored.products_json), []);
 }));
 
 test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
   const bytes = await readFile(process.env.STAFF_IMPORT_XLSX);
+  const [sheet] = parseXlsx(bytes);
+  const withMerchandise = cellValue(sheet, 1, "I") === "主推商品";
   const first = await preview(bytes);
   assert.equal(first.status, 200, JSON.stringify(first.body));
   assert.equal(first.body.status, "needs_mapping");
@@ -209,8 +249,13 @@ test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.deepEqual(ready.body.summary, {
     roomCount: 3, dateCount: 12, firstDate: "2026-11-19", lastDate: "2026-11-22",
-    scheduleCount: 33, directorShiftCount: 26, skippedCount: 2,
+    scheduleCount: 33, directorShiftCount: 26, skippedCount: withMerchandise ? 4 : 2,
   });
+  if (withMerchandise) {
+    const firstSlot = ready.body.rooms[0].dates[0].hostShifts[0];
+    assert.equal(firstSlot.salesTarget, cellValue(sheet, 2, "J"));
+    assert.deepEqual(firstSlot.featuredProducts, cellValue(sheet, 2, "I").split(/[,，]/).map(item => item.trim()));
+  }
   assert.equal(ready.body.rooms[2].dates[2].hostShifts.length, 2);
   assert.equal(ready.body.rooms[2].dates[2].directorShifts.length, 0);
   assert.equal((await commit(ready.body.previewId)).status, 200);
