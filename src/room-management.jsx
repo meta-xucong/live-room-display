@@ -7,23 +7,30 @@ function RoomAvatar({ room }) {
     <span className="room-avatar" aria-hidden="true">
       {url && url !== failedUrl
         ? <img src={url} alt="" onError={() => setFailedUrl(url)} />
-        : room.code ?? room.id}
+        : "房"}
     </span>
   );
 }
 
-function RoomPickerLabel({ room }) {
+function RoomListPosition({ index }) {
+  return <span className="room-list-position" title="列表序号" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>;
+}
+
+function RoomPickerLabel({ room, index }) {
   return (
     <>
+      <RoomListPosition index={index} />
       <RoomAvatar room={room} />
-      <span className="room-picker-name">{room.id}号直播间 · {room.name}</span>
+      <span className="room-picker-name">{room.name}</span>
+      <small className="room-picker-code">{room.id}号</small>
     </>
   );
 }
 
 export function DisplayRoomPicker({ rooms, value, onChange }) {
   const picker = useRef(null);
-  const selected = rooms.find((room) => room.id === value) ?? rooms[0];
+  const selectedIndex = Math.max(0, rooms.findIndex((room) => room.id === value));
+  const selected = rooms[selectedIndex];
 
   useEffect(() => {
     function closeOutside(event) {
@@ -66,13 +73,15 @@ export function DisplayRoomPicker({ rooms, value, onChange }) {
           onBlur={(event) => {
             if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
           }}>
-          <summary className="room-picker-trigger" title={selected.name}><RoomPickerLabel room={selected} /></summary>
+          <summary className="room-picker-trigger" title={selected.id + "号直播间 · " + selected.name}>
+            <RoomPickerLabel room={selected} index={selectedIndex} />
+          </summary>
           <div className="room-picker-menu" role="group" aria-label="选择直播间">
-            {rooms.map((room) => (
-              <button type="button" className="room-picker-option" key={room.id} title={room.name}
+            {rooms.map((room, index) => (
+              <button type="button" className="room-picker-option" key={room.id} title={room.id + "号直播间 · " + room.name}
                 aria-current={selected.id === room.id ? "true" : undefined}
                 onClick={() => { onChange(room.id); closePicker(); }}>
-                <RoomPickerLabel room={room} />
+                <RoomPickerLabel room={room} index={index} />
               </button>
             ))}
           </div>
@@ -170,17 +179,18 @@ export function RoomManagement({ api, csrfToken }) {
   return (
     <section className="admin-card room-management" id="room-management-panel" role="tabpanel" aria-labelledby="room-management-tab">
       <div className="admin-card-heading">
-        <div><h2>直播间管理</h2><p>直播间头像会显示在展示端的直播间选择器中。</p></div>
+        <div><h2>直播间管理</h2><p>按房号排列，左侧序号随列表更新。</p></div>
       </div>
       <input ref={fileInput} type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" onChange={selectAvatar} hidden />
       {message && <p className={"form-message" + (message.error ? " form-error" : "")} role={message.error ? "alert" : "status"}>{message.text}</p>}
       {data?.rooms.length > 0 ? (
         <ul className="room-management-list">
-          {data.rooms.map((room) => {
+          {data.rooms.map((room, index) => {
             const targets = (data.duplicateGroups?.find((codes) => codes.includes(room.code)) ?? []).filter((code) => code !== room.code);
             return (
               <li className="room-management-row" key={room.code}>
                 <div className="room-management-identity">
+                  <RoomListPosition index={index} />
                   <RoomAvatar room={room} />
                   <div>
                     <h3>{room.code} 号 · {room.name}</h3>

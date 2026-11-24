@@ -103,6 +103,7 @@ const restoreHostAvatarName = db.prepare("DELETE FROM deleted_host_avatar_names 
 const failures = new Map();
 const uploadWindows = new Map();
 const integrationWindows = new Map();
+const roomCodeCollator = new Intl.Collator("zh-CN", { numeric: true });
 const cookieName = "lrd_session";
 const cookieSecure = process.env.NODE_ENV === "production" && process.env.SECURE_COOKIES !== "false";
 const previewCleanup = setInterval(() => {
@@ -138,6 +139,13 @@ function hashToken(token) {
 
 function hostNameKey(name) {
   return String(name ?? "").normalize("NFKC").trim().replace(/\s+/g, "").toLocaleLowerCase("zh-CN");
+}
+
+function compareRoomCodes(left, right) {
+  const leftIsNumber = /^\d+$/.test(left);
+  const rightIsNumber = /^\d+$/.test(right);
+  return Number(rightIsNumber) - Number(leftIsNumber)
+    || roomCodeCollator.compare(left, right) || left.localeCompare(right);
 }
 
 function slotHostAvatar(slot, legacyPhoto = slot.photo_type) {
@@ -652,7 +660,8 @@ function resolveStaffRooms(source, bindings) {
       candidateCodes: !automatic && candidates.length > 1 ? candidates : [],
     };
   });
-  return { sourceRooms, rooms: [...targets.values()], unmatchedRooms, errors };
+  const rooms = [...targets.values()].sort((a, b) => compareRoomCodes(a.code, b.code));
+  return { sourceRooms, rooms, unmatchedRooms, errors };
 }
 
 function staffImportConflicts(rooms) {
@@ -978,13 +987,9 @@ function avatarLibraryPayload() {
 }
 
 function adminSchedulePayload() {
-  const rooms = db.prepare("SELECT code,name,sort_order AS sortOrder FROM rooms ORDER BY sort_order").all();
-  const rows = db.prepare(`SELECT s.*,r.name AS room_name,r.sort_order AS room_sort_order
-    FROM slots s JOIN rooms r ON r.code=s.room_code
-    ORDER BY s.date DESC,r.sort_order,s.start_time`).all();
-  const directorRows = db.prepare(`SELECT d.*,r.name AS room_name,r.sort_order AS room_sort_order
-    FROM director_shifts d JOIN rooms r ON r.code=d.room_code
-    ORDER BY d.date DESC,r.sort_order,d.start_time`).all();
+  const rooms = roomList().map(({ code, name, sortOrder }) => ({ code, name, sortOrder }));
+  const rows = db.prepare("SELECT s.*,r.name AS room_name FROM slots s JOIN rooms r ON r.code=s.room_code").all();
+  const directorRows = db.prepare("SELECT d.*,r.name AS room_name FROM director_shifts d JOIN rooms r ON r.code=d.room_code").all();
   const groups = new Map();
   const groupFor = (row) => {
     const key = `${row.room_code}\u0000${row.date}`;
@@ -1011,8 +1016,9 @@ function adminSchedulePayload() {
     });
   }
   for (const group of groups.values()) group.slots.sort((a, b) => a.start.localeCompare(b.start) || a.kind.localeCompare(b.kind));
+  const orderedGroups = [...groups.values()].sort((a, b) => b.date.localeCompare(a.date) || compareRoomCodes(a.roomCode, b.roomCode));
   return {
-    rooms, groups: [...groups.values()], scheduleCount: rows.length,
+    rooms, groups: orderedGroups, scheduleCount: rows.length,
     directorShiftCount: directorRows.length, dataUpdatedAt: updatedAtValue(),
   };
 }
@@ -1155,10 +1161,11 @@ function roomList(includeCounts = false) {
   const counts = includeCounts ? `,
     (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
     (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount` : "";
-  return db.prepare(`SELECT r.code,r.name,r.sort_order AS sortOrder,a.version AS avatarVersion${counts}
-    FROM rooms r LEFT JOIN room_avatars a ON a.room_code=r.code ORDER BY r.sort_order,r.code`).all()
-    .map(({ avatarVersion, ...room }) => ({
-      ...room, avatarUrl: avatarVersion ? `/api/v1/rooms/${encodeURIComponent(room.code)}/avatar?v=${avatarVersion}` : null,
+  return db.prepare(`SELECT r.code,r.name,a.version AS avatarVersion${counts}
+    FROM rooms r LEFT JOIN room_avatars a ON a.room_code=r.code`).all()
+    .sort((a, b) => compareRoomCodes(a.code, b.code))
+    .map(({ avatarVersion, ...room }, sortOrder) => ({
+      ...room, sortOrder, avatarUrl: avatarVersion ? `/api/v1/rooms/${encodeURIComponent(room.code)}/avatar?v=${avatarVersion}` : null,
     }));
 }
 
@@ -1615,10 +1622,8 @@ function commitMcpPreview(previewId, tokenId) {
 
 async function callMcpTool(name, args, token) {
   if (name === "list_rooms") {
-    const rooms = db.prepare(`SELECT r.code,r.name,r.sort_order AS sortOrder,
-      (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
-      (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount
-      FROM rooms r ORDER BY r.sort_order`).all();
+    const rooms = roomList(true).map(({ code, name, sortOrder, scheduleCount, directorShiftCount }) =>
+      ({ code, name, sortOrder, scheduleCount, directorShiftCount }));
     return mcpToolResult({ rooms });
   }
   if (name === "get_room_schedule") {
