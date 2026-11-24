@@ -157,7 +157,10 @@ button { cursor: pointer; }
 .time-strip-label { color: #c1b8a9; font-size: 11px; }
 .time-strip-range { min-width: 0; overflow: hidden; color: var(--gold); font-size: clamp(20px, 2.5vw, 48px); font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: .02em; text-overflow: ellipsis; white-space: nowrap; }
 .portrait-frame { grid-column: 2; grid-row: 1 / span 2; align-self: center; width: auto; height: clamp(280px, calc(100vh - 430px), 620px); max-width: 100%; aspect-ratio: 2 / 3; display: flex; align-items: center; justify-content: center; overflow: hidden; border: 1px solid #a58c66; border-radius: 10px; background: #f0e7d8; box-shadow: 0 16px 40px rgba(0, 0, 0, .22); }
-.portrait-frame img { display: block; width: 100%; height: 100%; object-fit: contain; object-position: center; }
+.portrait-frame img,
+.avatar-pending-item img,
+.avatar-profile-image img { display: block; width: 100%; object-fit: cover; object-position: center top; }
+.portrait-frame img { height: 100%; }
 .portrait-empty { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; background: #302921; color: #b8aa93; font-size: 10px; }
 
 .role-grid { grid-column: 1; grid-row: 2; align-self: start; width: 100%; min-height: clamp(82px, 8vh, 112px); min-width: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(8px, 1vw, 14px); }
@@ -345,7 +348,7 @@ button { cursor: pointer; }
 .avatar-pending-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; color: #435872; font-size: 11px; }
 .avatar-pending-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 10px; }
 .avatar-pending-item { position: relative; display: grid; gap: 7px; min-width: 0; padding: 9px; border: 1px solid rgba(119,139,164,.16); border-radius: 9px; background: rgba(255,255,255,.8); }
-.avatar-pending-item img { width: 100%; height: 140px; border-radius: 6px; background: #edf1f6; object-fit: cover; }
+.avatar-pending-item img { aspect-ratio: 4 / 5; border-radius: 6px; background: #edf1f6; }
 .avatar-pending-item label { display: grid; gap: 4px; color: #718096; font-size: 9px; }
 .avatar-pending-item input, .avatar-search input, .avatar-name-form input { width: 100%; min-height: 34px; padding: 0 9px; border: 1px solid rgba(116,137,163,.2); border-radius: 7px; outline: none; background: rgba(255,255,255,.85); color: #2e4057; font: inherit; font-size: 10px; }
 .avatar-pending-item input:focus, .avatar-search input:focus, .avatar-name-form input:focus { border-color: rgba(78,121,189,.6); box-shadow: 0 0 0 3px rgba(78,121,189,.08); }
@@ -374,9 +377,9 @@ button { cursor: pointer; }
 .avatar-stats strong { color: #334a67; font-size: 21px; font-weight: 600; }
 .avatar-profile-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(190px,1fr)); gap: 13px; }
 .avatar-profile-card { overflow: hidden; border: 1px solid rgba(255,255,255,.95); border-radius: 12px; background: rgba(255,255,255,.75); box-shadow: 0 10px 27px rgba(49,69,101,.05); }
-.avatar-profile-image { position: relative; width: 100%; height: 200px; display: grid; place-items: center; overflow: hidden; padding: 0; border: 0; background: linear-gradient(145deg,#edf2f8,#e5ebf3); color: #8a99ac; font-size: 10px; cursor: pointer; }
+.avatar-profile-image { position: relative; width: 100%; aspect-ratio: 4 / 5; display: grid; place-items: center; overflow: hidden; padding: 0; border: 0; background: linear-gradient(145deg,#edf2f8,#e5ebf3); color: #8a99ac; font-size: 10px; cursor: pointer; }
 .avatar-profile-image:disabled { cursor: default; }
-.avatar-profile-image img { width: 100%; height: 100%; object-fit: cover; transition: transform .25s ease; }
+.avatar-profile-image img { position: absolute; inset: 0; height: 100%; transform-origin: center top; transition: transform .25s ease; }
 .avatar-profile-image:not(:disabled):hover img { transform: scale(1.035); }
 .avatar-profile-image i { position: absolute; right: 9px; bottom: 9px; padding: 5px 8px; border: 1px solid rgba(255,255,255,.45); border-radius: 20px; background: rgba(24,34,47,.56); color: white; font-size: 8px; font-style: normal; backdrop-filter: blur(10px); }
 .avatar-profile-info { display: grid; gap: 4px; padding: 11px 12px 4px; }
@@ -388,7 +391,8 @@ button { cursor: pointer; }
 .avatar-name-form label { display: grid; gap: 4px; color: #52647b; font-size: 10px; }
 .avatar-name-form .form-message { margin: 0; padding: 5px 7px; font-size: 10px; }
 .avatar-name-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: flex-end; }
-.avatar-profile-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px 12px; }
+.avatar-profile-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 9px 12px 12px; }
+.avatar-profile-actions .avatar-text-button { min-height: 32px; padding: 0 2px; white-space: nowrap; }
 .avatar-empty { padding: 38px 18px; border: 1px dashed rgba(119,139,164,.24); border-radius: 11px; background: rgba(255,255,255,.4); color: #8291a5; font-size: 10px; text-align: center; }
 .avatar-preview-overlay { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(17,25,36,.56); backdrop-filter: blur(10px); }
 .avatar-preview-dialog { position: relative; width: min(440px,100%); max-height: calc(100vh - 48px); display: grid; justify-items: center; gap: 9px; overflow: auto; padding: 20px; border: 1px solid rgba(255,255,255,.8); border-radius: 16px; background: rgba(255,255,255,.93); box-shadow: 0 24px 75px rgba(0,0,0,.22); }
@@ -469,8 +473,6 @@ button { cursor: pointer; }
   .avatar-library-toolbar { align-items: stretch; flex-direction: column; }
   .avatar-search { width: 100%; }
   .avatar-profile-grid { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }
-  .avatar-profile-image { height: clamp(130px,48vw,200px); }
-  .avatar-profile-actions { align-items: flex-start; flex-direction: column; }
   .avatar-replace-confirm { align-items: stretch; flex-direction: column; }
   .avatar-confirm-actions { justify-content: flex-end; }
   .avatar-upload-actions { align-items: flex-end; }

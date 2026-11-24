@@ -292,10 +292,82 @@ test("avatar rename preserves the photo and updates only the matching host assig
   assert.equal((await commit(previousPreview.body.previewId)).status, 409);
 }));
 
+test("deleting a host profile preserves schedules and blocks automatic avatar restoration", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {
+  const id = "a".repeat(32);
+  const slotId = "b".repeat(32);
+  const now = Date.now();
+  const photo = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','Alpha','One',0)").run();
+  db.prepare("INSERT INTO host_avatars(id,name,name_key,photo_type,photo_blob,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+    .run(id, "旧 名", "旧名", "image/png", photo, now, now);
+  db.prepare(`INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host,assistant,photo_type,photo_blob)
+    VALUES (?,'01','2026-11-19','08:00','12:00',?,?,'旧名','助播','image/png',?)`)
+    .run(slotId, Date.parse("2026-11-19T08:00:00+08:00"), Date.parse("2026-11-19T12:00:00+08:00"), photo);
+
+  const libraryPath = "/api/v1/admin/host-avatars";
+  const profilePath = libraryPath + "/" + id;
+  const schedulePath = "/api/v1/rooms/01/schedule?date=2026-11-19";
+  const deleteProfile = (expectedName, headers = admin, path = profilePath) => request(path + "/profile", {
+    method: "DELETE", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ expectedName }),
+  });
+  assert.equal((await deleteProfile("旧 名", viewer)).status, 403);
+  assert.equal((await deleteProfile("旧 名", { cookie: admin.cookie })).status, 403);
+  assert.equal((await deleteProfile("已修改")).body.error.code, "AVATAR_NAME_CHANGED");
+
+  const removedPhoto = await request(profilePath, { method: "DELETE", headers: admin });
+  assert.equal(removedPhoto.status, 200);
+  assert.equal(removedPhoto.body.profiles[0].id, id);
+  assert.equal(removedPhoto.body.profiles[0].hasPhoto, false);
+  assert.equal(removedPhoto.body.profiles[0].usedSlots, 1);
+  assert.equal((await request(schedulePath, { headers: viewer })).body.schedule[0].photo, null);
+
+  const uploadPhoto = () => {
+    const body = new FormData();
+    body.append("photos", new Blob([photo], { type: "image/png" }), "host.png");
+    body.append("names", JSON.stringify(["旧 名"]));
+    return request(libraryPath, { method: "POST", headers: admin, body });
+  };
+  assert.equal((await uploadPhoto()).body.profiles[0].hasPhoto, true);
+  const deleted = await deleteProfile("旧 名");
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(deleted.body.profiles, []);
+  assert.equal(db.prepare("SELECT 1 FROM host_avatars WHERE id=?").get(id), undefined);
+  assert.equal((await deleteProfile("旧 名")).status, 404);
+
+  const schedule = await request(schedulePath, { headers: viewer });
+  assert.equal(schedule.body.schedule[0].id, slotId);
+  assert.equal(schedule.body.schedule[0].host, "旧名");
+  assert.equal(schedule.body.schedule[0].assistant, "助播");
+  assert.equal(schedule.body.schedule[0].photo, null);
+  const adminSchedule = await request("/api/v1/admin/schedules", { headers: admin });
+  assert.equal(adminSchedule.body.groups[0].slots[0].avatarSource, "未配置");
+  assert.equal((await request("/api/v1/media/" + slotId, { headers: viewer })).status, 404);
+  assert.equal((await request("/api/v1/host-avatars/" + id + "/media", { headers: viewer })).status, 404);
+
+  const reimport = await preview(workbook([
+    ["46345", "", "Alpha", "08:00-12:00", "旧名"],
+    ["", "", "", "13:00-15:00", "新主播"],
+  ]));
+  assert.equal(reimport.body.status, "ready");
+  const imported = await commit(reimport.body.previewId);
+  assert.equal(imported.status, 200);
+  const library = await request(libraryPath, { headers: admin });
+  assert.deepEqual(library.body.profiles.map(({ name, hasPhoto }) => ({ name, hasPhoto })), [{ name: "新主播", hasPhoto: false }]);
+  assert.equal((await deleteProfile("新主播", admin, libraryPath + "/" + library.body.profiles[0].id)).status, 200);
+
+  const restored = await uploadPhoto();
+  assert.equal(restored.status, 200);
+  assert.equal(restored.body.profiles[0].name, "旧 名");
+  assert.notEqual(restored.body.profiles[0].id, id);
+  assert.equal((await request(schedulePath, { headers: viewer })).body.schedule[0].photo, restored.body.profiles[0].photoUrl);
+}));
+
 test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
   const bytes = await readFile(process.env.STAFF_IMPORT_XLSX);
   const [sheet] = parseXlsx(bytes);
-  const withMerchandise = cellValue(sheet, 1, "I") === "主推商品";
+  const headers = [...sheet.rows.get(1)];
+  const productColumn = headers.find(([, cell]) => cell.value === "主推商品")?.[0];
+  const targetColumn = headers.find(([, cell]) => cell.value === "目标销售额")?.[0];
   const first = await preview(bytes);
   assert.equal(first.status, 200, JSON.stringify(first.body));
   assert.equal(first.body.status, "needs_mapping");
@@ -304,12 +376,12 @@ test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.deepEqual(ready.body.summary, {
     roomCount: 3, dateCount: 12, firstDate: "2026-11-19", lastDate: "2026-11-22",
-    scheduleCount: 33, directorShiftCount: 26, skippedCount: withMerchandise ? 4 : 2,
+    scheduleCount: 33, directorShiftCount: 26, skippedCount: productColumn ? 4 : 2,
   });
-  if (withMerchandise) {
+  if (productColumn && targetColumn) {
     const firstSlot = ready.body.rooms[0].dates[0].hostShifts[0];
-    assert.equal(firstSlot.salesTarget, cellValue(sheet, 2, "J"));
-    assert.deepEqual(firstSlot.featuredProducts, cellValue(sheet, 2, "I").split(/[,，]/).map(item => item.trim()));
+    assert.equal(firstSlot.salesTarget, cellValue(sheet, 2, targetColumn));
+    assert.deepEqual(firstSlot.featuredProducts, cellValue(sheet, 2, productColumn).split(/[,，]/).map(item => item.trim()).filter(Boolean));
   }
   assert.equal(ready.body.rooms[2].dates[2].hostShifts.length, 2);
   assert.equal(ready.body.rooms[2].dates[2].directorShifts.length, 0);

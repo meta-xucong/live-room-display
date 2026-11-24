@@ -211,12 +211,13 @@ function AvatarLibrary({ csrfToken }) {
   const [replaceNames, setReplaceNames] = useState([]);
   const [replaceName, setReplaceName] = useState("");
   const [viewing, setViewing] = useState(null);
-  const [removingId, setRemovingId] = useState("");
+  const [avatarAction, setAvatarAction] = useState(null);
   const [nameDraft, setNameDraft] = useState(null);
   const [nameError, setNameError] = useState("");
   const [savingName, setSavingName] = useState(false);
   const fileInput = useRef(null);
   const pendingRef = useRef(pending);
+  const changingAvatar = busy || savingName || Boolean(avatarAction);
 
   useEffect(() => { pendingRef.current = pending; }, [pending]);
   useEffect(() => () => pendingRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)), []);
@@ -276,7 +277,7 @@ function AvatarLibrary({ csrfToken }) {
   }
 
   async function submitUpload(replaceExisting = false) {
-    if (!pending.length || busy || savingName || removingId) return;
+    if (!pending.length || changingAvatar) return;
     if (pending.some((item) => !item.name.trim())) {
       setMessage("请给每张照片填写主播姓名。");
       return;
@@ -312,23 +313,34 @@ function AvatarLibrary({ csrfToken }) {
     }
   }
 
-  async function removeAvatar(profile) {
-    if (busy || savingName || removingId) return;
-    const usageText = profile.usedSlots ? "将影响 " + profile.usedSlots + " 个排班，展示页会改为头像占位。" : "这张照片将从头像库移除。";
-    if (!window.confirm("确定移除“" + profile.name + "”的头像吗？" + usageText)) return;
-    setRemovingId(profile.id);
+  async function removeAvatar(profile, action) {
+    if (changingAvatar) return;
+    const deleting = action === "profile";
+    const subject = `“${profile.name}”`;
+    const question = deleting ? `确定删除主播 ${subject} 的档案和头像吗？` : `确定移除 ${subject} 的头像吗？`;
+    const usage = profile.usedSlots ? `关联的 ${profile.usedSlots} 条排班会保留，展示页显示头像占位。` : "";
+    if (!window.confirm(question + usage)) return;
+    setAvatarAction({ id: profile.id, action });
     setMessage("");
     try {
-      const response = await api("/api/v1/admin/host-avatars/" + encodeURIComponent(profile.id), {
+      const path = "/api/v1/admin/host-avatars/" + encodeURIComponent(profile.id);
+      const headers = { "x-csrf-token": csrfToken };
+      const response = await api(deleting ? path + "/profile" : path, {
         method: "DELETE",
-        headers: { "x-csrf-token": csrfToken },
+        headers: deleting ? { ...headers, "content-type": "application/json" } : headers,
+        body: deleting ? JSON.stringify({ expectedName: profile.name }) : undefined,
       });
       setData(response);
-      setMessage("已移除“" + profile.name + "”的头像。");
+      setViewing((current) => current?.id === profile.id ? null : current);
+      if (deleting && nameDraft?.id === profile.id) {
+        setNameDraft(null);
+        setNameError("");
+      }
+      setMessage(deleting ? `已删除主播 ${subject}。` : `已移除 ${subject} 的头像。`);
     } catch (cause) {
       setMessage(cause.message);
     } finally {
-      setRemovingId("");
+      setAvatarAction(null);
     }
   }
 
@@ -341,7 +353,7 @@ function AvatarLibrary({ csrfToken }) {
   async function saveName(event) {
     event.preventDefault();
     const name = nameDraft?.value.trim();
-    if (!name || name === nameDraft.previousName || savingName || busy || removingId) return;
+    if (!name || name === nameDraft.previousName || changingAvatar) return;
     setSavingName(true);
     setNameError("");
     try {
@@ -363,7 +375,6 @@ function AvatarLibrary({ csrfToken }) {
     }
   }
 
-  const changingAvatar = busy || savingName || Boolean(removingId);
   const profiles = data?.profiles ?? [];
   const visibleProfiles = profiles.filter((profile) => profile.name.toLocaleLowerCase("zh-CN").includes(search.trim().toLocaleLowerCase("zh-CN")));
   const invalidFiles = pending.filter((item) => item.file.size > 8 * 1024 * 1024 || !/\.(?:jpe?g|png)$/i.test(item.file.name));
@@ -483,7 +494,14 @@ function AvatarLibrary({ csrfToken }) {
                 </div>
                 <div className="avatar-profile-actions">
                   <button type="button" className="avatar-secondary-button" disabled={changingAvatar} onClick={() => { setReplaceName(profile.name); fileInput.current?.click(); }}>更换头像</button>
-                  {profile.hasPhoto && <button type="button" className="avatar-text-button danger" disabled={changingAvatar} onClick={() => removeAvatar(profile)}>{removingId === profile.id ? "处理中…" : "移除"}</button>}
+                  {profile.hasPhoto && (
+                    <button type="button" className="avatar-text-button danger" disabled={changingAvatar} onClick={() => removeAvatar(profile, "photo")}>
+                      {avatarAction?.id === profile.id && avatarAction.action === "photo" ? "处理中…" : "移除头像"}
+                    </button>
+                  )}
+                  <button type="button" className="avatar-text-button danger" disabled={changingAvatar} onClick={() => removeAvatar(profile, "profile")}>
+                    {avatarAction?.id === profile.id && avatarAction.action === "profile" ? "删除中…" : "删除主播"}
+                  </button>
                 </div>
               </article>
             ))}
