@@ -1,4 +1,5 @@
 import { StaffScheduleImport } from "./staff-import.jsx";
+import { DisplayRoomPicker, RoomManagement } from "./room-management.jsx";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const THEME_STORAGE_KEY = "live-room-theme";
@@ -905,11 +906,13 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>
           <button type="button" role="tab" aria-selected={activeTab === "records"} className={activeTab === "records" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("records")}>已录入排班</button>
+          <button type="button" role="tab" id="room-management-tab" aria-controls={activeTab === "rooms" ? "room-management-panel" : undefined} aria-selected={activeTab === "rooms"} className={activeTab === "rooms" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("rooms")}>直播间管理</button>
           <button type="button" role="tab" aria-selected={activeTab === "avatars"} className={activeTab === "avatars" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("avatars")}>主播头像库</button>
           <button type="button" role="tab" aria-selected={activeTab === "keys"} className={activeTab === "keys" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("keys")}>MCP 密钥</button>
         </div>
         <StaffScheduleImport api={api} csrfToken={csrfToken} hidden={activeTab !== "schedule"} onViewRecords={() => setActiveTab("records")} />
         {activeTab === "records" && <AdminScheduleLibrary csrfToken={csrfToken} />}
+        {activeTab === "rooms" && <RoomManagement api={api} csrfToken={csrfToken} />}
         {activeTab === "avatars" && <div role="tabpanel"><AvatarLibrary csrfToken={csrfToken} /></div>}
         {activeTab === "keys" && <div role="tabpanel"><McpKeyManager csrfToken={csrfToken} /></div>}
       </main>
@@ -942,7 +945,7 @@ export function App() {
 
   const loadRooms = useCallback(async () => {
     const response = await api("/api/v1/rooms");
-    const mapped = response.rooms.map((room) => ({ id: room.code, name: room.name }));
+    const mapped = response.rooms.map((room) => ({ id: room.code, name: room.name, avatarUrl: room.avatarUrl }));
     setRooms(mapped);
     setConnectionError("");
     setRoomId((selected) => {
@@ -1079,6 +1082,7 @@ export function App() {
   }
 
   function chooseRoom(nextId) {
+    if (nextId === roomId) return;
     setRoomId(nextId);
     setDisplayData(null);
     window.localStorage.setItem("live-room-selected", nextId);
@@ -1110,12 +1114,7 @@ export function App() {
     <div className="app-shell">
       <header className="topbar">
         <Brand />
-        <div className="room-selector-inline">
-          <label htmlFor="room-select">直播间</label>
-          <select id="room-select" value={roomId} onChange={(event) => chooseRoom(event.target.value)} disabled={!rooms.length}>
-            {rooms.map((item) => <option key={item.id} value={item.id}>{item.id}号直播间 · {item.name}</option>)}
-          </select>
-        </div>
+        <DisplayRoomPicker rooms={rooms} value={roomId} onChange={chooseRoom} />
         <div className="topbar-right">
           <span className="refresh-indicator" />
           <span>{connectionError ? "正在重连" : "实时同步"}</span>

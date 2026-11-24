@@ -34,6 +34,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS rooms (
     code TEXT PRIMARY KEY, name TEXT NOT NULL, sheet_name TEXT NOT NULL, sort_order INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS room_avatars (
+    room_code TEXT PRIMARY KEY REFERENCES rooms(code) ON DELETE CASCADE,
+    photo_type TEXT NOT NULL, photo_blob BLOB NOT NULL, version TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS room_aliases (
     name_key TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE
   );
@@ -1131,6 +1135,85 @@ function nextDataUpdatedAt() {
   return new Date(Math.max(Date.now(), (Date.parse(updatedAtValue()) || 0) + 1)).toISOString();
 }
 
+function roomList(includeCounts = false) {
+  const counts = includeCounts ? `,
+    (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
+    (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount` : "";
+  return db.prepare(`SELECT r.code,r.name,r.sort_order AS sortOrder,a.version AS avatarVersion${counts}
+    FROM rooms r LEFT JOIN room_avatars a ON a.room_code=r.code ORDER BY r.sort_order,r.code`).all()
+    .map(({ avatarVersion, ...room }) => ({
+      ...room, avatarUrl: avatarVersion ? `/api/v1/rooms/${encodeURIComponent(room.code)}/avatar?v=${avatarVersion}` : null,
+    }));
+}
+
+function adminRoomsPayload() {
+  return { rooms: roomList(true), dataUpdatedAt: updatedAtValue() };
+}
+
+function renameRoom(room, name) {
+  const key = roomNameKey(name);
+  const oldKey = roomNameKey(room.name);
+  if (key !== oldKey) {
+    const otherNames = new Set(db.prepare("SELECT name FROM rooms WHERE code<>?").all(room.code)
+      .map(({ name }) => roomNameKey(name)));
+    const otherAlias = db.prepare("SELECT room_code FROM room_aliases WHERE name_key=? AND room_code<>?").get(key, room.code);
+    if (otherNames.has(key) || otherAlias) {
+      throw Object.assign(new Error("该名称已用于其他直播间，请换一个名称"), { status: 409, code: "ROOM_NAME_CONFLICT" });
+    }
+    if (oldKey && !otherNames.has(oldKey)) {
+      db.prepare("INSERT OR IGNORE INTO room_aliases(name_key,room_code) VALUES (?,?)").run(oldKey, room.code);
+    }
+  }
+  db.prepare("UPDATE rooms SET name=? WHERE code=?").run(name, room.code);
+}
+
+async function manageRoom(request, response, code, isAvatar) {
+  const user = requireUser(request, response, "admin");
+  if (!user) return;
+  if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
+
+  let name, photo, photoType;
+  try {
+    if (request.method === "PATCH") {
+      const input = await readJson(request);
+      name = typeof input?.name === "string" ? input.name.trim() : "";
+      if (!roomNameKey(name) || name.length > 120 || /[\u0000-\u001f\u007f]/.test(name)) {
+        return error(response, 422, "ROOM_NAME_INVALID", "请填写有效的直播间名称，最多 120 个字符");
+      }
+    }
+    if (request.method === "PUT") {
+      photo = await readBody(request, 8 * 1024 * 1024);
+      photoType = imageTypeForBytes(photo);
+      if (!photoType) return error(response, 415, "ROOM_AVATAR_INVALID", "请选择有效的 JPG 或 PNG 图片");
+    }
+  } catch (cause) {
+    return error(response, cause.status ?? 400, "INVALID_REQUEST", cause.message);
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const room = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(code);
+    if (!room) throw Object.assign(new Error("直播间不存在"), { status: 404, code: "ROOM_NOT_FOUND" });
+    if (request.headers["if-match"] !== JSON.stringify(updatedAtValue())) {
+      throw Object.assign(new Error("直播间或排班已更新，请核对后重试"), { status: 409, code: "ROOMS_CHANGED" });
+    }
+    if (request.method === "PATCH") renameRoom(room, name);
+    else if (request.method === "PUT") {
+      db.prepare(`INSERT INTO room_avatars(room_code,photo_type,photo_blob,version) VALUES (?,?,?,?)
+        ON CONFLICT(room_code) DO UPDATE SET photo_type=excluded.photo_type,photo_blob=excluded.photo_blob,version=excluded.version`)
+        .run(code, photoType, photo, randomBytes(16).toString("hex"));
+    } else if (isAvatar) db.prepare("DELETE FROM room_avatars WHERE room_code=?").run(code);
+    else db.prepare("DELETE FROM rooms WHERE code=?").run(code);
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
+    db.exec("COMMIT");
+  } catch (cause) {
+    db.exec("ROLLBACK");
+    if (cause.status) return error(response, cause.status, cause.code, cause.message);
+    throw cause;
+  }
+  return json(response, 200, adminRoomsPayload());
+}
+
 function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
   const roomSchedule = parsed.result.rooms[0];
   const directorShifts = roomSchedule.directorShifts;
@@ -2070,7 +2153,26 @@ async function handle(request, response) {
 
   if (request.method === "GET" && pathname === "/api/v1/rooms") {
     if (!requireUser(request, response)) return;
-    return json(response, 200, { rooms: db.prepare("SELECT code,name,sort_order AS sortOrder FROM rooms ORDER BY sort_order").all() });
+    return json(response, 200, { rooms: roomList() });
+  }
+  if (request.method === "GET" && pathname === "/api/v1/admin/rooms") {
+    if (!requireUser(request, response, "admin")) return;
+    return json(response, 200, adminRoomsPayload());
+  }
+  const adminRoomMatch = pathname.match(/^\/api\/v1\/admin\/rooms\/([^/]+)(\/avatar)?$/);
+  if (adminRoomMatch) {
+    const isAvatar = Boolean(adminRoomMatch[2]);
+    if (request.method === "DELETE" || request.method === (isAvatar ? "PUT" : "PATCH")) {
+      return manageRoom(request, response, adminRoomMatch[1], isAvatar);
+    }
+  }
+  const roomAvatarMatch = pathname.match(/^\/api\/v1\/rooms\/([^/]+)\/avatar$/);
+  if (request.method === "GET" && roomAvatarMatch) {
+    if (!requireUser(request, response)) return;
+    const avatar = db.prepare("SELECT photo_type,photo_blob FROM room_avatars WHERE room_code=?").get(roomAvatarMatch[1]);
+    if (!avatar) return error(response, 404, "MEDIA_NOT_FOUND", "直播间未配置头像");
+    response.writeHead(200, { "content-type": avatar.photo_type, "cache-control": "private, max-age=300", "x-content-type-options": "nosniff" });
+    return response.end(avatar.photo_blob);
   }
 
   const displayMatch = pathname.match(/^\/api\/v1\/rooms\/([^/]+)\/display$/);

@@ -105,7 +105,7 @@ async function withServer(run) {
     const commit = (previewId, headers = admin) => request("/api/v1/admin/schedule-upload?action=commit&mode=room-name", {
       method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ previewId }),
     });
-    await run({ db, admin, other, viewer, preview, commit, request });
+    await run({ db, admin, other, viewer, preview, commit, request, url });
   } finally {
     db?.close();
     child.kill();
@@ -344,6 +344,89 @@ test("actual multi-staff template imports seven numbered rooms", { skip: !proces
   assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='old'").get().room_code, "03");
   assert.equal(db.prepare("SELECT room_code FROM room_aliases WHERE name_key='champion儿童官方旗舰店'").get().room_code, "02");
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM director_shifts").get().count, 31);
+}));
+
+test("room management protects changes, retains name matching and removes only the confirmed room", () => withServer(async ({
+  db, admin, viewer, request, preview, commit, url,
+}) => {
+  const file = workbook([
+    ["46351", "", "店铺甲", "07:00-11:00", "主播甲", "07:00-15:00", "导演甲"],
+    ["46351", "", "店铺乙", "08:00-12:00", "主播乙"],
+  ]);
+  const ready = await preview(file, { 店铺甲: "01", 店铺乙: "02" });
+  assert.equal(ready.body.status, "ready");
+  assert.equal((await commit(ready.body.previewId)).status, 200);
+  db.prepare("DELETE FROM room_aliases WHERE room_code='01'").run();
+
+  const listPath = "/api/v1/admin/rooms";
+  const roomPath = listPath + "/01";
+  const avatarPath = roomPath + "/avatar";
+  const list = await request(listPath, { headers: admin });
+  assert.equal((await request(listPath, { headers: viewer })).status, 403);
+  assert.deepEqual(list.body.rooms[0], {
+    code: "01", name: "店铺甲", sortOrder: 0, scheduleCount: 1, directorShiftCount: 1, avatarUrl: null,
+  });
+  const rename = (name, version, headers = admin) => request(roomPath, {
+    method: "PATCH",
+    headers: { ...headers, "content-type": "application/json", "if-match": JSON.stringify(version) },
+    body: JSON.stringify({ name }),
+  });
+  const initialVersion = list.body.dataUpdatedAt;
+  assert.equal((await rename("新门店", initialVersion, viewer)).status, 403);
+  assert.equal((await rename("新门店", initialVersion, { cookie: admin.cookie })).status, 403);
+  assert.equal((await rename(" ", initialVersion)).body.error.code, "ROOM_NAME_INVALID");
+  assert.equal((await rename("店铺乙", initialVersion)).body.error.code, "ROOM_NAME_CONFLICT");
+  const renamed = await rename(" 新门店 ", initialVersion);
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.body.rooms[0].name, "新门店");
+  assert.equal(renamed.body.rooms[0].scheduleCount, 1);
+  assert.equal((await preview(file)).body.status, "ready");
+  assert.equal((await rename("过期改名", initialVersion)).body.error.code, "ROOMS_CHANGED");
+
+  const saveAvatar = (body, version, auth = admin) => request(avatarPath, {
+    method: "PUT", headers: { ...auth, "if-match": JSON.stringify(version) }, body,
+  });
+  const firstPhoto = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const secondPhoto = Buffer.from([255, 216, 255, 0]);
+  assert.equal((await saveAvatar(firstPhoto, renamed.body.dataUpdatedAt, viewer)).status, 403);
+  assert.equal((await saveAvatar(Buffer.from("invalid"), renamed.body.dataUpdatedAt)).status, 415);
+  const uploaded = await saveAvatar(firstPhoto, renamed.body.dataUpdatedAt);
+  assert.equal(uploaded.status, 200);
+  const readerRooms = await request("/api/v1/rooms", { headers: viewer });
+  const url1 = readerRooms.body.rooms[0].avatarUrl;
+  assert.ok(url1);
+  assert.equal(readerRooms.body.rooms[0].name, "新门店");
+  assert.equal(readerRooms.body.rooms[1].avatarUrl, null);
+  assert.equal((await request(url1)).status, 401);
+  const media = await fetch(url + url1, { headers: viewer, signal: AbortSignal.timeout(5000) });
+  assert.equal(media.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await media.arrayBuffer()), firstPhoto);
+  const updated = await saveAvatar(secondPhoto, uploaded.body.dataUpdatedAt);
+  const url2 = updated.body.rooms[0].avatarUrl;
+  assert.notEqual(url2, url1);
+  const reset = await request(avatarPath, {
+    method: "DELETE", headers: { ...admin, "if-match": JSON.stringify(updated.body.dataUpdatedAt) },
+  });
+  assert.equal(reset.body.rooms[0].avatarUrl, null);
+  assert.equal((await request(url2, { headers: viewer })).status, 404);
+
+  const withAvatar = await saveAvatar(firstPhoto, reset.body.dataUpdatedAt);
+  const stalePreview = await preview(file);
+  const remove = (version, auth = admin) => request(roomPath, {
+    method: "DELETE", headers: { ...auth, "if-match": JSON.stringify(version) },
+  });
+  assert.equal((await remove(withAvatar.body.dataUpdatedAt, viewer)).status, 403);
+  assert.equal((await remove(reset.body.dataUpdatedAt)).body.error.code, "ROOMS_CHANGED");
+  const removed = await remove(withAvatar.body.dataUpdatedAt);
+  assert.equal(removed.status, 200);
+  assert.deepEqual(removed.body.rooms.map(({ code }) => code), ["02"]);
+  assert.equal((await commit(stalePreview.body.previewId)).status, 409);
+  assert.equal((await request("/api/v1/rooms/01/display", { headers: viewer })).status, 404);
+  assert.equal((await request(withAvatar.body.rooms[0].avatarUrl, { headers: viewer })).status, 404);
+  for (const table of ["slots", "director_shifts", "room_aliases", "room_avatars"]) {
+    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE room_code='01'`).get().count, 0);
+  }
+  assert.equal(db.prepare("SELECT host FROM slots WHERE room_code='02'").get().host, "主播乙");
 }));
 
 test("avatar rename preserves the photo and updates only the matching host assignments", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {
