@@ -3,7 +3,9 @@ import { cellHasFormula, cellValue } from "./xlsx.mjs";
 
 const required = ["日期", "直播间", "主播时间", "主播", "导演时间", "导演"];
 const merchandise = ["主推商品", "目标销售额"];
-const fields = [...required, ...merchandise];
+const fields = [...required, ...merchandise, "直播间号码", "助播时间", "助播"];
+const headerAliases = new Map([["直播间名称", "直播间"], ["直播间编号", "直播间号码"]]);
+export const NUMBERED_ROOM_CODES = Array.from({ length: 27 }, (_, index) => String(index + 1).padStart(2, "0"));
 const roles = [
   { role: "主播", name: "host", records: "hostShifts" },
   { role: "导演", name: "director", records: "directorShifts" },
@@ -11,6 +13,12 @@ const roles = [
 
 export function roomNameKey(name) {
   return String(name ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function staffRoomCode(value) {
+  const match = value.normalize("NFKC").match(/^(\d{1,2})(?:\s*号(?:\s*直播间)?)?$/);
+  const code = match?.[1].padStart(2, "0");
+  return NUMBERED_ROOM_CODES.includes(code) ? code : null;
 }
 
 function scheduleRange(value, date) {
@@ -47,7 +55,8 @@ export function parseStaffSchedule(sheets, parseDate) {
     const [headerRow, cells] = rows[0];
     const columns = new Map();
     for (const [column, cell] of cells) {
-      const label = String(cell.value ?? "").trim();
+      const header = String(cell.value ?? "").trim();
+      const label = headerAliases.get(header) ?? header;
       if (!fields.includes(label)) continue;
       if (columns.has(label) || cell.formula) {
         report(errors, sheet.name, headerRow, column, label, "表头必须唯一并使用固定文字");
@@ -70,7 +79,7 @@ export function parseStaffSchedule(sheets, parseDate) {
       if (formulas.length) {
         for (const field of formulas) issue(errors, field, "请填写固定值");
         if (formulas.includes("日期")) date = "";
-        if (formulas.includes("日期") || formulas.includes("直播间")) room = null;
+        if (formulas.some((field) => ["日期", "直播间", "直播间号码"].includes(field))) room = null;
         continue;
       }
       if (text("日期")) {
@@ -83,24 +92,34 @@ export function parseStaffSchedule(sheets, parseDate) {
         if (!date) issue(errors, "日期", "请填写有效日期，例如 2026-11-19");
       }
       const roomText = text("直播间");
-      if (roomText) {
-        const key = roomNameKey(roomText);
+      const numberText = text("直播间号码");
+      if (roomText || numberText) {
+        const code = staffRoomCode(numberText);
+        const numberOnly = !roomText && (!code || room?.code !== code);
+        const name = roomText || (numberOnly ? `${Number(code)}号直播间` : room.name);
+        const key = roomNameKey(name);
         room = null;
-        if (roomText.length > 120 || !key) issue(errors, "直播间", "直播间名称须为 1–120 个字符");
+        if (numberText && !code) issue(errors, "直播间号码", "请填写 01–27 之间的编号，例如 8 号直播间");
+        else if (roomText.length > 120 || !key) issue(errors, "直播间", "直播间名称须为 1–120 个字符");
         else if (!date) issue(errors, "日期", "直播间所属日期缺失");
         else {
           if (!rooms.has(key)) rooms.set(key, {
-            key, name: roomText, sheetName: sheet.name, sourceRow: row,
+            key, name, numberOnly, sheetName: sheet.name, sourceRow: row,
             dates: new Map(), hostShifts: [], directorShifts: [],
           });
           room = rooms.get(key);
+          if (roomText) room.numberOnly = false;
+          if (code && room.code && code !== room.code) {
+            issue(errors, "直播间号码", `同一直播间名称已在 ${room.codeSource.sheet} 第 ${room.codeSource.row} 行填写为 ${room.code} 号`);
+            room = null;
+          } else if (code && !room.code) {
+            room.code = code;
+            room.codeSource = { sheet: sheet.name, row, column: columns.get("直播间号码") };
+          }
         }
       }
       if (room && date && !room.dates.has(date)) room.dates.set(date, { sheet: sheet.name, row, count: 0 });
-      const merchandiseField = merchandise.find((field) => text(field));
-      if (merchandiseField && (!text("主播时间") || !text("主播"))) {
-        issue(warnings, merchandiseField, "本行没有主播场次，已跳过主推商品和目标销售额");
-      }
+      let hostShift;
       for (const entry of roles) {
         const { role } = entry;
         const timeField = `${role}时间`;
@@ -123,9 +142,27 @@ export function parseStaffSchedule(sheets, parseDate) {
           if (entry.name === "host") {
             if (columns.has("主推商品")) shift.products = text("主推商品").split(/[,，]/).map((item) => item.trim()).filter(Boolean);
             if (columns.has("目标销售额")) shift.salesTarget = String(raw("目标销售额"));
+            hostShift = shift;
           }
           room[entry.records].push(shift);
           room.dates.get(date).count += 1;
+        }
+      }
+      const merchandiseField = merchandise.find((field) => text(field));
+      if (merchandiseField && (!text("主播时间") || !text("主播"))) {
+        issue(warnings, merchandiseField, "本行没有主播场次，已跳过主推商品和目标销售额");
+      }
+      const assistant = text("助播");
+      const assistantTime = text("助播时间");
+      if (assistant || assistantTime) {
+        if (!hostShift) issue(warnings, "助播", "本行没有有效主播场次，已跳过助播");
+        else if (!assistant) issue(warnings, "助播", "有助播时段但缺少姓名，已跳过助播");
+        else if (assistant.length > 80) issue(errors, "助播", "姓名不能超过 80 个字符");
+        else {
+          const range = assistantTime ? scheduleRange(assistantTime, date) : hostShift;
+          if (range?.startAt !== hostShift.startAt || range?.endAt !== hostShift.endAt) {
+            issue(errors, "助播时间", "助播跟随本行主播，请填写同一时段或留空");
+          } else hostShift.assistant = assistant;
         }
       }
     }
@@ -139,21 +176,45 @@ export function parseStaffSchedule(sheets, parseDate) {
         room.dates.delete(date);
       }
     }
-    if (!room.dates.size) continue;
-    for (const { role, records } of roles) {
-      room[records].sort((a, b) => a.startAt - b.startAt);
+    if (room.dates.size) active.push(room);
+  }
+  if (!active.length && !errors.length) report(errors, "", "", "", "排班", "文件中没有可导入的排班");
+  return { rooms: active, errors, warnings };
+}
+
+export function normalizeStaffShifts(rooms, warnings) {
+  const errors = [];
+  for (const room of rooms) {
+    for (const { role, name, records } of roles) {
+      const sorted = room[records].sort((a, b) => a.startAt - b.startAt);
+      room[records] = [];
+      const seen = new Map();
       let previous = null;
-      for (const shift of room[records]) {
+      for (const shift of sorted) {
+        const key = JSON.stringify([
+          shift.date, shift.start, shift.end, shift[name], shift.assistant, shift.products, shift.salesTarget,
+        ]);
+        const duplicate = seen.get(key);
+        if (duplicate) {
+          warnings.push({
+            sheet: shift.sourceSheet, row: shift.sourceRow, field: `${role}时间`,
+            message: `和 ${duplicate.sourceSheet} 第 ${duplicate.sourceRow} 行的排班相同，已合并重复记录`,
+            date: shift.date, room: room.name,
+          });
+          continue;
+        }
+        seen.set(key, shift);
+        room[records].push(shift);
         if (previous && shift.startAt < previous.endAt) {
-          report(errors, shift.sourceSheet, shift.sourceRow, "", `${role}时间`,
-            `与 ${previous.sourceSheet} 第 ${previous.sourceRow} 行的同角色排班重叠`, shift.date, room.name);
+          errors.push({
+            sheet: shift.sourceSheet, row: shift.sourceRow, field: `${role}时间`,
+            message: `与 ${previous.sourceSheet} 第 ${previous.sourceRow} 行的同角色排班重叠`,
+            date: shift.date, room: room.name,
+          });
         }
         if (!previous || shift.endAt > previous.endAt) previous = shift;
       }
     }
-    active.push(room);
   }
-  if (!active.length && !errors.length) report(errors, "", "", "", "排班", "文件中没有可导入的排班");
-  if (rooms.size > 27) report(errors, "", "", "", "直播间", "一次最多导入 27 个直播间");
-  return { rooms: active, errors, warnings };
+  return errors;
 }

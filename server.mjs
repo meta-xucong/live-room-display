@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseXlsx, cellHasFormula, cellValue } from "./server/xlsx.mjs";
-import { parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
+import { NUMBERED_ROOM_CODES, normalizeStaffShifts, parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, "data"));
@@ -86,7 +86,6 @@ const MIME = {
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
   ".ico": "image/x-icon", ".woff2": "font/woff2", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
-const NUMBERED_ROOM_CODES = Array.from({ length: 27 }, (_, index) => String(index + 1).padStart(2, "0"));
 const STAFF_PREVIEW_TTL = 10 * 60_000;
 const staffPreviews = new Map();
 const MCP_ROOM_BATCH_PREVIEW_PREFIX = "mcp-room-schedules-v1\n";
@@ -595,29 +594,51 @@ function resolveStaffRooms(source, bindings) {
     }
   }
 
-  const targetNames = new Map();
-  const rooms = [];
+  const targets = new Map();
+  const unmatchedRooms = [];
   const sourceRooms = source.map((room) => {
     const candidates = named.get(room.key) ?? [];
-    const known = aliases.get(room.key) ?? (candidates.length === 1 ? candidates[0] : null);
+    const known = room.numberOnly ? null : aliases.get(room.key) ?? (candidates.length === 1 ? candidates[0] : null);
     const chosen = Object.hasOwn(bindings, room.key) ? bindings[room.key] : null;
-    const code = known ?? chosen;
-    const issue = (message) => errors.push({ sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message });
-    if (known && chosen && known !== chosen) issue("房间匹配已变化，请重新核对当前编号");
-    if (code) {
-      if (targetNames.has(code)) issue("与“" + targetNames.get(code) + "”选中了同一编号，请统一表内名称或更正匹配");
-      targetNames.set(code, room.name);
-      rooms.push({
-        ...room, code, name: byCode.get(code)?.name ?? room.name,
-        sourceName: room.name, isNew: !byCode.has(code), saveAlias: !known,
-      });
+    const automatic = Boolean(room.code || known);
+    const code = room.code ?? known ?? chosen;
+    const otherCodes = room.code && !room.numberOnly ? (known ? [known] : candidates).filter((item) => item !== room.code) : [];
+    const issue = (message) =>
+      errors.push({ sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message });
+    if (automatic && chosen && code !== chosen) issue("房间匹配已变化，请重新核对当前编号");
+    if (!code) unmatchedRooms.push(room);
+    else {
+      let target = targets.get(code);
+      if (target && (!automatic || !target.automatic)) {
+        issue(`与“${target.sourceName}”选中了同一编号，请为相关名称填写正确的直播间号码或更正匹配`);
+      }
+      if (!target) {
+        target = {
+          code, name: byCode.get(code)?.name ?? room.name, sourceName: room.name, sheetName: room.sheetName,
+          isNew: !byCode.has(code), automatic, sourceNames: [], aliasKeys: [], numberConflicts: [],
+          dates: new Map(), hostShifts: [], directorShifts: [],
+        };
+        targets.set(code, target);
+      }
+      if (!room.numberOnly) {
+        if (!target.sourceNames.length) {
+          target.sourceName = room.name;
+          if (target.isNew) target.name = room.name;
+        }
+        target.sourceNames.push(room.name);
+        if (otherCodes.length) target.numberConflicts.push({ name: room.name, codes: otherCodes, ...room.codeSource });
+        if (!known && !otherCodes.length) target.aliasKeys.push(room.key);
+      }
+      for (const [date, group] of room.dates) target.dates.set(date, group);
+      target.hostShifts.push(...room.hostShifts);
+      target.directorShifts.push(...room.directorShifts);
     }
     return {
       sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
-      dateCount: room.dates.size, code, automatic: Boolean(known), ambiguous: !known && candidates.length > 1,
+      dateCount: room.dates.size, code, automatic, ambiguous: !automatic && candidates.length > 1,
     };
   });
-  return { sourceRooms, rooms, errors };
+  return { sourceRooms, rooms: [...targets.values()], unmatchedRooms, errors };
 }
 
 function staffImportConflicts(rooms) {
@@ -657,13 +678,14 @@ function staffImportSummary(rooms, warnings) {
 const shiftKey = (start, end, person) => JSON.stringify([start, end, person]);
 
 function staffPreviewRooms(rooms) {
-  const findHosts = db.prepare(`SELECT start_time,end_time,host,products_json,sales_target_cents,sales_target_text
+  const findHosts = db.prepare(`SELECT start_time,end_time,host,assistant,products_json,sales_target_cents,sales_target_text
     FROM slots WHERE room_code=? AND date=?`);
   const oldDirectorCount = db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?");
   const displayShift = ({ host, director, start, end, overnight, sourceSheet, sourceRow }) =>
     ({ person: host ?? director, start, end, overnight, sourceSheet, sourceRow });
   return rooms.map((room) => ({
-    code: room.code, name: room.name, sourceName: room.sourceName, isNew: room.isNew,
+    code: room.code, name: room.name, sourceName: room.sourceName, sourceNames: room.sourceNames,
+    isNew: room.isNew, numberConflicts: room.numberConflicts,
     dates: [...room.dates.keys()].sort().map((date) => {
       const previousHosts = findHosts.all(room.code, date);
       const byHost = new Map(previousHosts.map((slot) => [shiftKey(slot.start_time, slot.end_time, slot.host), slot]));
@@ -675,6 +697,7 @@ function staffPreviewRooms(rooms) {
           const old = byHost.get(shiftKey(shift.start, shift.end, shift.host));
           return {
             ...displayShift(shift),
+            assistant: shift.assistant ?? old?.assistant ?? "",
             featuredProducts: shift.products ?? JSON.parse(old?.products_json ?? "[]"),
             salesTarget: shift.salesTarget ?? slotSalesTarget(old),
           };
@@ -725,7 +748,7 @@ function commitStaffImport(id, userId) {
     ) VALUES (?,?,?,?,?,?,?,?)`);
     for (const room of preview.rooms) {
       if (room.isNew) insertRoom.run(room.code, room.name, room.sheetName, roomOrder++);
-      if (room.saveAlias) insertAlias.run(room.key, room.code);
+      for (const key of room.aliasKeys) insertAlias.run(key, room.code);
       for (const date of room.dates.keys()) {
         const oldHosts = new Map(findHosts.all(room.code, date).map((slot) => [
           shiftKey(slot.start_time, slot.end_time, slot.host), slot,
@@ -739,7 +762,7 @@ function commitStaffImport(id, userId) {
           const old = oldHosts.get(shiftKey(slot.start, slot.end, slot.host));
           insertHost.run(
             old?.id ?? slot.id, room.code, date, slot.start, slot.end, slot.startAt, slot.endAt,
-            slot.host, old?.assistant ?? "",
+            slot.host, slot.assistant ?? old?.assistant ?? "",
             slot.products === undefined ? old?.products_json ?? "[]" : JSON.stringify(slot.products),
             slot.salesTarget === undefined ? old?.sales_target_cents ?? null : null,
             slot.salesTarget ?? old?.sales_target_text ?? null,
@@ -2219,16 +2242,21 @@ async function handle(request, response) {
     }
     const parsed = parseStaffSchedule(workbook, excelDate);
     if (parsed.errors.length) return json(response, 422, { errors: parsed.errors, warnings: parsed.warnings });
-    const { sourceRooms, rooms, errors } = resolveStaffRooms(parsed.rooms, bindings);
-    if (errors.length) return json(response, 422, {
-      errors, warnings: parsed.warnings, sourceRooms, roomOptions: staffRoomCatalog(),
+    const { sourceRooms, rooms, unmatchedRooms, errors } = resolveStaffRooms(parsed.rooms, bindings);
+    const grouped = [...rooms, ...unmatchedRooms];
+    if (grouped.length > NUMBERED_ROOM_CODES.length) {
+      errors.push({ field: "直播间", message: "一次最多导入 27 个直播间" });
+    }
+    const conflicts = errors.length ? errors : normalizeStaffShifts(grouped, parsed.warnings);
+    if (conflicts.length) return json(response, 422, {
+      errors: conflicts, warnings: parsed.warnings, sourceRooms, roomOptions: staffRoomCatalog(),
     });
-    const summary = staffImportSummary(parsed.rooms, parsed.warnings);
-    if (sourceRooms.some((room) => !room.code)) return json(response, 200, {
+    const summary = staffImportSummary(grouped, parsed.warnings);
+    if (unmatchedRooms.length) return json(response, 200, {
       status: "needs_mapping", sourceRooms, roomOptions: staffRoomCatalog(), summary, warnings: parsed.warnings,
     });
-    const conflicts = staffImportConflicts(rooms);
-    if (conflicts.length) return json(response, 422, { errors: conflicts, warnings: parsed.warnings });
+    const existingConflicts = staffImportConflicts(rooms);
+    if (existingConflicts.length) return json(response, 422, { errors: existingConflicts, warnings: parsed.warnings });
     const previewId = randomBytes(24).toString("hex");
     const expiresAt = Date.now() + STAFF_PREVIEW_TTL;
     if (staffPreviews.size >= 64) staffPreviews.delete(staffPreviews.keys().next().value);

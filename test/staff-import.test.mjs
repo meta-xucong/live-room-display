@@ -43,16 +43,23 @@ function zip(entries) {
 function workbook(rows, date1904 = false, withMerchandise = false) {
   const headers = ["日期", "星期", "直播间", "主播时间", "主播", "导演时间", "导演", "休"];
   if (withMerchandise) headers.push("主推商品", "目标销售额");
-  return zip({
+  return scheduleWorkbook([{ name: "Sheet1", headers, rows }], date1904);
+}
+
+function scheduleWorkbook(sheets, date1904 = false) {
+  const entries = {
     "xl/workbook.xml": '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
-      '<workbookPr date1904="' + Number(date1904) + '"/><sheets><sheet name="Sheet1" r:id="r1"/></sheets></workbook>',
-    "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="r1" Target="worksheets/sheet1.xml"/></Relationships>',
-    "xl/worksheets/sheet1.xml": "<worksheet><sheetData>" + [
-      headers,
-      ...rows,
-    ].map((row, r) => "<row>" + row.map((value, c) => value ? "<c r=\"" + "ABCDEFGHIJ"[c] + (r + 1) +
-      '" t="inlineStr"><is><t>' + value + "</t></is></c>" : "").join("") + "</row>").join("") + "</sheetData></worksheet>",
-  });
+      '<workbookPr date1904="' + Number(date1904) + '"/><sheets>' +
+      sheets.map(({ name }, index) => `<sheet name="${name}" r:id="r${index + 1}"/>`).join("") + "</sheets></workbook>",
+    "xl/_rels/workbook.xml.rels": "<Relationships>" + sheets.map((_, index) =>
+      `<Relationship Id="r${index + 1}" Target="worksheets/sheet${index + 1}.xml"/>`).join("") + "</Relationships>",
+  };
+  for (const [index, { headers, rows }] of sheets.entries()) {
+    entries[`xl/worksheets/sheet${index + 1}.xml`] = "<worksheet><sheetData>" + [headers, ...rows].map((row, r) =>
+      "<row>" + row.map((value, column) => value ? `<c r="${String.fromCharCode(65 + column)}${r + 1}" t="inlineStr"><is><t>` +
+        value + "</t></is></c>" : "").join("") + "</row>").join("") + "</sheetData></worksheet>";
+  }
+  return zip(entries);
 }
 
 async function withServer(run) {
@@ -235,6 +242,108 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   const stored = db.prepare("SELECT sales_target_text,products_json FROM slots WHERE id='keep'").get();
   assert.equal(stored.sales_target_text, "");
   assert.deepEqual(JSON.parse(stored.products_json), []);
+}));
+
+test("staff sheets merge by room number, skip blanks and deduplicate identical shifts", () => withServer(async ({ db, viewer, request, preview, commit }) => {
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('06','后台房间名','Existing',0)").run();
+  const headers = ["日期", "星期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演", "助播时间", "助播", "休"];
+  const sheet = (name, rows) => ({ name, headers, rows });
+  const first = sheet("甲", [
+    ["46351", "", "店铺甲", "６号直播间", "07:00-11:00", "主播甲", "07:00-15:00", "导演甲", "7:00-11:00", "助播甲"],
+    [],
+    ["", "", "", "", "11:00-15:00", "主播乙", "07:00-15:00", "导演甲"],
+    ["46352", "", "未排班直播间", "27号直播间"],
+  ]);
+  const second = sheet("乙", [
+    ["46351", "", "店铺乙", "06", "16:00-20:00", "主播丙"],
+    ["46352", "", "", "6", "", "", "8:00-12:00", "导演乙"],
+    ["46352", "", "店铺丙", "12号", "09:00-13:00", "主播丁"],
+  ]);
+  const invalidName = await preview(scheduleWorkbook([first, sheet("编号冲突", [
+    ["46351", "", "店铺甲", "07", "16:00-20:00", "主播丙"],
+  ])]));
+  assert.equal(invalidName.status, 422);
+  assert.match(invalidName.body.errors[0].message, /已在 甲 第 2 行/);
+  const invalidCode = await preview(scheduleWorkbook([sheet("范围", [["46351", "", "店铺", "28", "16:00-20:00", "主播丙"]])]));
+  assert.equal(invalidCode.status, 422);
+  assert.equal(invalidCode.body.errors[0].column, "D");
+  const conflictingCatalog = await preview(scheduleWorkbook([sheet("系统编号", [
+    ["46351", "", "后台房间名", "07", "16:00-20:00", "主播丙"],
+  ])]));
+  assert.equal(conflictingCatalog.body.status, "ready");
+  assert.equal(conflictingCatalog.body.rooms[0].code, "07");
+  assert.deepEqual(conflictingCatalog.body.rooms[0].numberConflicts, [
+    { name: "后台房间名", codes: ["06"], sheet: "系统编号", row: 2, column: "D" },
+  ]);
+  const overlapping = await preview(scheduleWorkbook([first, sheet("并班", [
+    ["46351", "", "不同表内名", "6", "14:00-20:00", "主播丙"],
+  ])]));
+  assert.equal(overlapping.status, 422);
+  assert.equal(overlapping.body.errors[0].sheet, "并班");
+  assert.match(overlapping.body.errors[0].message, /甲 第 4 行/);
+  const noInheritedContext = await preview(scheduleWorkbook([first, sheet("缺少日期", [
+    ["", "", "店铺乙", "06", "16:00-20:00", "主播丙"],
+  ])]));
+  assert.equal(noInheritedContext.status, 422);
+  assert.equal(noInheritedContext.body.errors[0].field, "日期");
+
+  const file = scheduleWorkbook([sheet("空白模板", []), first, second, { name: "空白", headers: [], rows: [] }]);
+  const ready = await preview(file);
+  assert.equal(ready.status, 200, JSON.stringify(ready.body));
+  assert.equal(ready.body.status, "ready");
+  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["06", "12"]);
+  assert.deepEqual(ready.body.rooms[0].sourceNames, ["店铺甲", "店铺乙"]);
+  assert.deepEqual(ready.body.summary, {
+    roomCount: 2, dateCount: 3, firstDate: "2026-11-25", lastDate: "2026-11-26",
+    scheduleCount: 4, directorShiftCount: 2, skippedCount: 2,
+  });
+  assert.equal(ready.body.rooms[0].dates[0].hostShifts[0].assistant, "助播甲");
+  assert.deepEqual(ready.body.rooms[0].dates[0].hostShifts.map(({ sourceSheet }) => sourceSheet), ["甲", "甲", "乙"]);
+  assert.equal(ready.body.rooms[0].dates[0].directorShifts.length, 1);
+  assert.equal(ready.body.rooms[0].dates[1].directorShifts.length, 1);
+  assert.equal((await commit(ready.body.previewId)).status, 200);
+  assert.deepEqual(db.prepare("SELECT name_key,room_code FROM room_aliases WHERE room_code='06' ORDER BY name_key").all()
+    .map(({ name_key }) => name_key), ["店铺乙", "店铺甲"]);
+  const displayed = await request("/api/v1/rooms/06/schedule?date=2026-11-25", { headers: viewer });
+  assert.equal(displayed.body.schedule[0].assistant, "助播甲");
+  assert.equal(displayed.body.schedule.length, 3);
+
+  const old = await preview(workbook([
+    ["46353", "", "店铺甲", "07:00-11:00", "主播甲"],
+    ["46353", "", "店铺乙", "11:00-15:00", "主播乙"],
+  ]));
+  assert.equal(old.body.status, "ready");
+  assert.equal(old.body.summary.roomCount, 1);
+}));
+
+test("actual multi-staff template imports seven numbered rooms", { skip: !process.env.MULTI_STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
+  const addRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+  addRoom.run("02", "Champion儿童官旗", "old", 0);
+  addRoom.run("03", "MLB童装旗舰店", "old", 1);
+  addRoom.run("04", "三枪官方旗舰店", "old", 2);
+  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('champion儿童官方旗舰店','02')").run();
+  db.prepare(`INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host)
+    VALUES ('old','03','2026-11-25','07:00','08:00',?,?, '原主播')`)
+    .run(Date.parse("2026-11-25T07:00:00+08:00"), Date.parse("2026-11-25T08:00:00+08:00"));
+  const ready = await preview(await readFile(process.env.MULTI_STAFF_IMPORT_XLSX));
+  assert.equal(ready.status, 200, JSON.stringify(ready.body));
+  assert.equal(ready.body.status, "ready");
+  assert.deepEqual(ready.body.summary, {
+    roomCount: 7, dateCount: 13, firstDate: "2026-11-25", lastDate: "2026-11-27",
+    scheduleCount: 38, directorShiftCount: 31, skippedCount: 1,
+  });
+  assert.deepEqual(ready.body.rooms.map(({ code }) => code).sort(), ["06", "08", "09", "11", "12", "15", "21"]);
+  const shared = ready.body.rooms.find(({ code }) => code === "06");
+  assert.equal(shared.sourceNames.length, 2);
+  assert.equal(shared.dates[0].hostShifts.length, 4);
+  for (const [code, oldCode] of [["08", "02"], ["09", "03"], ["11", "04"]]) {
+    assert.deepEqual(ready.body.rooms.find((room) => room.code === code).numberConflicts[0].codes, [oldCode]);
+  }
+  assert.equal((await commit(ready.body.previewId)).status, 200);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM slots WHERE room_code NOT IN ('02','03','04')").get().count, 38);
+  assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='old'").get().room_code, "03");
+  assert.equal(db.prepare("SELECT room_code FROM room_aliases WHERE name_key='champion儿童官方旗舰店'").get().room_code, "02");
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM director_shifts").get().count, 31);
 }));
 
 test("avatar rename preserves the photo and updates only the matching host assignments", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {

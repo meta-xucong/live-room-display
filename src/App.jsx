@@ -900,7 +900,7 @@ function AdminPage({ user, csrfToken, onLogout, theme, onToggleTheme }) {
         <section className="admin-hero">
           <div className="section-kicker">DATA MANAGEMENT</div>
           <h1>排班信息管理</h1>
-          <p>上传员工排班表，按直播间名称和日期更新排班。</p>
+          <p>上传员工排班表，按直播间和日期更新排班。</p>
         </section>
         <div className="admin-tabs" role="tablist" aria-label="管理内容">
           <button type="button" role="tab" aria-selected={activeTab === "schedule"} className={activeTab === "schedule" ? "admin-tab active" : "admin-tab"} onClick={() => setActiveTab("schedule")}>排班 Excel</button>

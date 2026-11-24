@@ -36,6 +36,9 @@ function ShiftDetails({ label, shifts, previous }) {
               <time>{shift.start}–{shift.overnight && "次日 "}{shift.end}</time>
               <strong>{shift.person}</strong>
               <small>{shift.sourceSheet} 第 {shift.sourceRow} 行</small>
+              {shift.assistant && (
+                <span className="staff-shift-merch"><small>助播</small> <span>{shift.assistant}</span></span>
+              )}
               {shift.featuredProducts?.length > 0 && (
                 <span className="staff-shift-merch"><small>主推商品</small> <span>{shift.featuredProducts.join("、")}</span></span>
               )}
@@ -68,7 +71,14 @@ function ImportPreview({ preview }) {
         {preview.rooms.map((room) => (
           <section className="staff-preview-room" key={room.code}>
             <h4>{room.code} 号 · {room.name}{room.isNew && <small>首次录入</small>}</h4>
-            {room.name !== room.sourceName && <p>表内名称：{room.sourceName}</p>}
+            {(room.sourceNames?.length > 1 || room.name !== room.sourceName) && (
+              <p>表内名称：{room.sourceNames?.length ? room.sourceNames.join("、") : room.sourceName}</p>
+            )}
+            {room.numberConflicts?.map((item) => (
+              <p key={item.name}>
+                <strong>请核对编号</strong> · {item.sheet} 第 {item.row} 行的「{item.name}」曾登记在 {item.codes.join("、")} 号，本次按表内的 {room.code} 号导入。
+              </p>
+            ))}
             {room.dates.map((day) => (
               <details className="staff-import-day" key={day.date}>
                 <summary>
@@ -169,7 +179,8 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
 
   const selectedCodes = sheet?.sourceRooms.map((room) => room.automatic ? room.code : assignments[room.sourceRoomKey]) ?? [];
   const allChosen = selectedCodes.every(Boolean);
-  const duplicate = selectedCodes.some((code, index) => code && selectedCodes.indexOf(code) !== index);
+  const duplicate = selectedCodes.some((code, index) =>
+    code && !sheet.sourceRooms[index].automatic && selectedCodes.indexOf(code) !== selectedCodes.lastIndexOf(code));
 
   async function upload(action) {
     if (request.current || !file) return;
@@ -237,7 +248,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
     <section className="admin-card" role="tabpanel" hidden={hidden}>
       <div className="admin-card-heading">
         <div className="admin-icon" aria-hidden="true">↥</div>
-        <div><h2>导入员工排班表</h2><p>按直播间名称和日期导入。主推商品用逗号分隔，目标销售额按原文展示。</p></div>
+        <div><h2>导入员工排班表</h2><p>支持一个工作簿包含多位负责人的排班，按表内直播间号码或名称及日期汇总。</p></div>
       </div>
       {!result && (
         <form className={"upload-form staff-import-form" + (!preview && needsMatching ? " staff-matching-active" : "")}
@@ -260,7 +271,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
           </button>}
         </form>
       )}
-      {duplicate && !preview && <div role="alert" className="form-message form-error">每个表内名称需选择不同的直播间编号。</div>}
+      {duplicate && !preview && <div role="alert" className="form-message form-error">手动选择的直播间编号不能与其他匹配项重复。</div>}
       {message && <div role={failed ? "alert" : "status"} className={"form-message" + (failed ? " form-error" : "")}>{message}</div>}
       {preview && <ImportPreview preview={preview} />}
       <ImportIssues errors={errors} warnings={warnings} />
