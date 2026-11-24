@@ -368,7 +368,7 @@ button { cursor: pointer; }
 .room-management-actions button { min-height: 32px; font-size: 11px; }
 .room-management-form { grid-column: 1 / -1; align-items: end; }
 .room-management-form label { display: grid; flex: 1 1 180px; gap: 5px; color: #52647b; font-size: 11px; }
-.room-management-form input { width: 100%; min-height: 34px; padding: 0 9px; border: 1px solid rgba(116,137,163,.28); border-radius: 7px; background: #fff; color: #2d425d; }
+.room-management-form input, .room-management-form select { width: 100%; min-height: 34px; padding: 0 9px; border: 1px solid rgba(116,137,163,.28); border-radius: 7px; background: #fff; color: #2d425d; }
 .room-management > .avatar-empty { margin-top: 18px; }
 .avatar-library { display: grid; gap: 18px; }
 .avatar-upload-card { padding: clamp(18px, 2.8vw, 28px); }
@@ -924,7 +924,7 @@ body { background: #edf2f7; }
 :root[data-theme="dark"] .room-management-row { border-color: rgba(219,227,237,.15); background: rgba(12,17,25,.55); }
 :root[data-theme="dark"] .room-management-identity h3 { color: #edf1f6; }
 :root[data-theme="dark"] .room-management-identity p, :root[data-theme="dark"] .room-management-form label { color: #acb9ca; }
-:root[data-theme="dark"] .room-management-form input { border-color: rgba(219,227,237,.2); background: #171e28; color: #edf1f6; }
+:root[data-theme="dark"] .room-management-form input, :root[data-theme="dark"] .room-management-form select { border-color: rgba(219,227,237,.2); background: #171e28; color: #edf1f6; }
 :root[data-theme="dark"] .room-management-actions .danger { color: #efacac; }
 :root[data-theme="dark"] .admin-tab { color: #a4afbd; }
 :root[data-theme="dark"] .admin-tab:hover { color: #d5e3f6; }

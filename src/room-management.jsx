@@ -85,6 +85,7 @@ export function DisplayRoomPicker({ rooms, value, onChange }) {
 export function RoomManagement({ api, csrfToken }) {
   const [data, setData] = useState(null);
   const [editing, setEditing] = useState(null);
+  const [merging, setMerging] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(null);
   const fileInput = useRef(null);
@@ -99,16 +100,19 @@ export function RoomManagement({ api, csrfToken }) {
     return () => controller.abort();
   }, [api]);
 
-  async function changeRoom(room, { method, avatar = false, body, contentType, success }) {
+  async function changeRoom(room, { method, resource = "", body, contentType, success }) {
     if (busy || !data) return;
     setBusy(true);
     setMessage(null);
-    const path = listPath + "/" + encodeURIComponent(room.code) + (avatar ? "/avatar" : "");
+    const path = listPath + "/" + encodeURIComponent(room.code) + resource;
     const headers = { "x-csrf-token": csrfToken, "if-match": JSON.stringify(data.dataUpdatedAt) };
     if (contentType) headers["content-type"] = contentType;
     try {
       setData(await api(path, { method, headers, body }));
-      if (!avatar) setEditing(null);
+      if (resource !== "/avatar") {
+        setEditing(null);
+        setMerging(null);
+      }
       setMessage({ error: false, text: success });
     } catch (cause) {
       setMessage({ error: true, text: cause.message });
@@ -116,6 +120,7 @@ export function RoomManagement({ api, csrfToken }) {
         try {
           setData(await api(listPath));
           setEditing(null);
+          setMerging(null);
         } catch {}
       }
     } finally {
@@ -141,7 +146,7 @@ export function RoomManagement({ api, csrfToken }) {
       setMessage({ error: true, text: "请选择不超过 8 MB 的 JPG 或 PNG 图片。" });
       return;
     }
-    changeRoom(room, { method: "PUT", avatar: true, body: file, success: "已保存直播间头像。" });
+    changeRoom(room, { method: "PUT", resource: "/avatar", body: file, success: "已保存直播间头像。" });
   }
 
   function deleteRoom(room) {
@@ -149,6 +154,17 @@ export function RoomManagement({ api, csrfToken }) {
       `删除 ${room.code} 号直播间「${room.name}」？\n\n将永久删除该直播间的头像、${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班。`,
     );
     if (confirmed) changeRoom(room, { method: "DELETE", success: "已删除直播间。" });
+  }
+
+  function confirmMerge(event, room) {
+    event.preventDefault();
+    if (!merging?.targetCode) return;
+    const { targetCode } = merging;
+    if (!window.confirm(`保留 ${targetCode} 号「${room.name}」？\n\n${room.code} 号的 ${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班将并入 ${targetCode} 号，完成后列表只显示保留的编号。`)) return;
+    changeRoom(room, {
+      method: "POST", resource: "/merge", contentType: "application/json",
+      body: JSON.stringify({ targetCode }), success: `已合并到 ${targetCode} 号直播间。`,
+    });
   }
 
   return (
@@ -160,43 +176,63 @@ export function RoomManagement({ api, csrfToken }) {
       {message && <p className={"form-message" + (message.error ? " form-error" : "")} role={message.error ? "alert" : "status"}>{message.text}</p>}
       {data?.rooms.length > 0 ? (
         <ul className="room-management-list">
-          {data.rooms.map((room) => (
-            <li className="room-management-row" key={room.code}>
-              <div className="room-management-identity">
-                <RoomAvatar room={room} />
-                <div>
-                  <h3>{room.code} 号 · {room.name}</h3>
-                  <p>{room.scheduleCount} 场主播 · {room.directorShiftCount} 班导演</p>
+          {data.rooms.map((room) => {
+            const targets = (data.duplicateGroups?.find((codes) => codes.includes(room.code)) ?? []).filter((code) => code !== room.code);
+            return (
+              <li className="room-management-row" key={room.code}>
+                <div className="room-management-identity">
+                  <RoomAvatar room={room} />
+                  <div>
+                    <h3>{room.code} 号 · {room.name}</h3>
+                    <p>{room.scheduleCount} 场主播 · {room.directorShiftCount} 班导演</p>
+                  </div>
                 </div>
-              </div>
-              <div className="room-management-actions">
-                <button type="button" className="avatar-secondary-button" disabled={busy}
-                  onClick={() => { setEditing({ code: room.code, name: room.name }); setMessage(null); }}>改名</button>
-                <button type="button" className="avatar-secondary-button" disabled={busy}
-                  onClick={() => { uploadTarget.current = room; fileInput.current.click(); }}>
-                  {room.avatarUrl ? "更换头像" : "添加直播间头像"}
-                </button>
-                {room.avatarUrl && (
-                  <button type="button" className="avatar-text-button" disabled={busy}
-                    onClick={() => changeRoom(room, { method: "DELETE", avatar: true, success: "已恢复默认头像。" })}>恢复默认头像</button>
+                <div className="room-management-actions">
+                  <button type="button" className="avatar-secondary-button" disabled={busy}
+                    onClick={() => { setEditing({ code: room.code, name: room.name }); setMerging(null); setMessage(null); }}>改名</button>
+                  <button type="button" className="avatar-secondary-button" disabled={busy}
+                    onClick={() => { uploadTarget.current = room; fileInput.current.click(); }}>
+                    {room.avatarUrl ? "更换头像" : "添加直播间头像"}
+                  </button>
+                  {room.avatarUrl && (
+                    <button type="button" className="avatar-text-button" disabled={busy}
+                      onClick={() => changeRoom(room, { method: "DELETE", resource: "/avatar", success: "已恢复默认头像。" })}>恢复默认头像</button>
+                  )}
+                  {targets.length > 0 && (
+                    <button type="button" className="avatar-secondary-button" disabled={busy}
+                      onClick={() => { setMerging({ code: room.code, targetCode: "" }); setEditing(null); setMessage(null); }}>合并重名直播间</button>
+                  )}
+                  <button type="button" className="avatar-text-button danger" disabled={busy} onClick={() => deleteRoom(room)}>
+                    删除直播间
+                  </button>
+                </div>
+                {editing?.code === room.code && (
+                  <form className="room-management-form" onSubmit={(event) => saveName(event, room)}>
+                    <label>直播间名称
+                      <input autoFocus maxLength={120} required value={editing.name} disabled={busy}
+                        onChange={(event) => setEditing({ code: room.code, name: event.target.value })} />
+                    </label>
+                    <button type="submit" className="button-primary avatar-choose-button"
+                      disabled={busy || !editing.name.trim() || editing.name.trim() === room.name}>保存名称</button>
+                    <button type="button" className="avatar-secondary-button" disabled={busy} onClick={() => setEditing(null)}>取消</button>
+                  </form>
                 )}
-                <button type="button" className="avatar-text-button danger" disabled={busy} onClick={() => deleteRoom(room)}>
-                  删除直播间
-                </button>
-              </div>
-              {editing?.code === room.code && (
-                <form className="room-management-form" onSubmit={(event) => saveName(event, room)}>
-                  <label>直播间名称
-                    <input autoFocus maxLength={120} required value={editing.name} disabled={busy}
-                      onChange={(event) => setEditing({ code: room.code, name: event.target.value })} />
-                  </label>
-                  <button type="submit" className="button-primary avatar-choose-button"
-                    disabled={busy || !editing.name.trim() || editing.name.trim() === room.name}>保存名称</button>
-                  <button type="button" className="avatar-secondary-button" disabled={busy} onClick={() => setEditing(null)}>取消</button>
-                </form>
-              )}
-            </li>
-          ))}
+                {merging?.code === room.code && (
+                  <form className="room-management-form" onSubmit={(event) => confirmMerge(event, room)}>
+                    <label>要保留的直播间编号
+                      <select autoFocus required value={merging.targetCode} disabled={busy}
+                        onChange={(event) => setMerging({ code: room.code, targetCode: event.target.value })}>
+                        <option value="">请选择</option>
+                        {targets.map((code) => <option key={code} value={code}>{code} 号</option>)}
+                      </select>
+                    </label>
+                    <button type="submit" className="button-primary avatar-choose-button" disabled={busy || !merging.targetCode}>确认合并</button>
+                    <button type="button" className="avatar-secondary-button" disabled={busy} onClick={() => setMerging(null)}>取消</button>
+                  </form>
+                )}
+              </li>
+            );
+          })}
         </ul>
       ) : data ? <div className="avatar-empty">暂无直播间。导入排班后可在这里管理。</div>
         : !message && <div className="avatar-empty">正在读取直播间…</div>}

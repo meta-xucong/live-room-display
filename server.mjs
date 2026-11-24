@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseXlsx, cellHasFormula, cellValue } from "./server/xlsx.mjs";
 import { NUMBERED_ROOM_CODES, normalizeStaffShifts, parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
+import { mergeRoom } from "./server/room-merge.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, "data"));
@@ -601,15 +602,21 @@ function resolveStaffRooms(source, bindings) {
   const targets = new Map();
   const unmatchedRooms = [];
   const sourceRooms = source.map((room) => {
-    const candidates = named.get(room.key) ?? [];
-    const known = room.numberOnly ? null : aliases.get(room.key) ?? (candidates.length === 1 ? candidates[0] : null);
+    const candidates = room.numberOnly ? [] : named.get(room.key) ?? [];
+    const alias = room.numberOnly ? null : aliases.get(room.key);
+    const requestedCodes = [...room.codeSources.keys()];
+    const requestedCode = requestedCodes.length === 1 ? requestedCodes[0] : null;
+    const known = alias ?? (candidates.length === 1 ? candidates[0] : candidates.find((code) => code === requestedCode));
+    const automaticCode = known ?? (candidates.length === 0 ? requestedCode : null);
     const chosen = Object.hasOwn(bindings, room.key) ? bindings[room.key] : null;
-    const automatic = Boolean(room.code || known);
-    const code = room.code ?? known ?? chosen;
-    const otherCodes = room.code && !room.numberOnly ? (known ? [known] : candidates).filter((item) => item !== room.code) : [];
+    const automatic = Boolean(automaticCode);
+    const code = automaticCode ?? chosen;
     const issue = (message) =>
       errors.push({ sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message });
     if (automatic && chosen && code !== chosen) issue("房间匹配已变化，请重新核对当前编号");
+    if (!automatic && chosen && candidates.length && !candidates.includes(chosen)) {
+      issue("该名称已有重名直播间，请选择其中一个已有编号");
+    }
     if (!code) unmatchedRooms.push(room);
     else {
       let target = targets.get(code);
@@ -630,8 +637,10 @@ function resolveStaffRooms(source, bindings) {
           if (target.isNew) target.name = room.name;
         }
         target.sourceNames.push(room.name);
-        if (otherCodes.length) target.numberConflicts.push({ name: room.name, codes: otherCodes, ...room.codeSource });
-        if (!known && !otherCodes.length) target.aliasKeys.push(room.key);
+        for (const [requested, location] of room.codeSources) {
+          if (requested !== code) target.numberConflicts.push({ name: room.name, requestedCode: requested, ...location });
+        }
+        if (!known) target.aliasKeys.push(room.key);
       }
       for (const [date, group] of room.dates) target.dates.set(date, group);
       target.hostShifts.push(...room.hostShifts);
@@ -639,7 +648,8 @@ function resolveStaffRooms(source, bindings) {
     }
     return {
       sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
-      dateCount: room.dates.size, code, automatic, ambiguous: !automatic && candidates.length > 1,
+      dateCount: room.dates.size, code, automatic, requestedCodes,
+      candidateCodes: !automatic && candidates.length > 1 ? candidates : [],
     };
   });
   return { sourceRooms, rooms: [...targets.values()], unmatchedRooms, errors };
@@ -890,6 +900,12 @@ function parseFixedScheduleText(input) {
 
 function validateFixedScheduleText(text) {
   const parsed = parseFixedScheduleText(text);
+  const currentRoom = db.prepare("SELECT name FROM rooms WHERE code=?").get(parsed.roomCode);
+  const key = roomNameKey(parsed.roomName);
+  if (key !== roomNameKey(currentRoom?.name)) {
+    const other = roomNameInUse(parsed.roomCode, key);
+    if (other) fixedTextError(`该名称已登记为 ${other} 号直播间，请使用已有编号`, "直播间名称", 1);
+  }
   const result = validateWorkbook([parsed.sheet]);
   const warnings = result.warnings.filter((warning) => warning.field !== "主播照片");
   warnings.push({
@@ -1147,32 +1163,42 @@ function roomList(includeCounts = false) {
 }
 
 function adminRoomsPayload() {
-  return { rooms: roomList(true), dataUpdatedAt: updatedAtValue() };
+  const rooms = roomList(true);
+  const byName = new Map();
+  for (const room of rooms) {
+    const key = roomNameKey(room.name);
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(room.code);
+  }
+  return { rooms, duplicateGroups: [...byName.values()].filter((codes) => codes.length > 1), dataUpdatedAt: updatedAtValue() };
+}
+
+function roomNameInUse(code, key) {
+  const alias = db.prepare("SELECT room_code FROM room_aliases WHERE name_key=? AND room_code<>?").get(key, code);
+  return alias?.room_code ?? db.prepare("SELECT code,name FROM rooms WHERE code<>?").all(code)
+    .find(({ name }) => roomNameKey(name) === key)?.code;
 }
 
 function renameRoom(room, name) {
   const key = roomNameKey(name);
   const oldKey = roomNameKey(room.name);
   if (key !== oldKey) {
-    const otherNames = new Set(db.prepare("SELECT name FROM rooms WHERE code<>?").all(room.code)
-      .map(({ name }) => roomNameKey(name)));
-    const otherAlias = db.prepare("SELECT room_code FROM room_aliases WHERE name_key=? AND room_code<>?").get(key, room.code);
-    if (otherNames.has(key) || otherAlias) {
+    if (roomNameInUse(room.code, key)) {
       throw Object.assign(new Error("该名称已用于其他直播间，请换一个名称"), { status: 409, code: "ROOM_NAME_CONFLICT" });
     }
-    if (oldKey && !otherNames.has(oldKey)) {
+    if (oldKey && !roomNameInUse(room.code, oldKey)) {
       db.prepare("INSERT OR IGNORE INTO room_aliases(name_key,room_code) VALUES (?,?)").run(oldKey, room.code);
     }
   }
   db.prepare("UPDATE rooms SET name=? WHERE code=?").run(name, room.code);
 }
 
-async function manageRoom(request, response, code, isAvatar) {
+async function manageRoom(request, response, code, resource) {
   const user = requireUser(request, response, "admin");
   if (!user) return;
   if (!csrfValid(request, user)) return error(response, 403, "CSRF_FAILED", "请求校验失败，请刷新页面后重试");
 
-  let name, photo, photoType;
+  let name, photo, photoType, targetCode;
   try {
     if (request.method === "PATCH") {
       const input = await readJson(request);
@@ -1180,6 +1206,11 @@ async function manageRoom(request, response, code, isAvatar) {
       if (!roomNameKey(name) || name.length > 120 || /[\u0000-\u001f\u007f]/.test(name)) {
         return error(response, 422, "ROOM_NAME_INVALID", "请填写有效的直播间名称，最多 120 个字符");
       }
+    }
+    if (resource === "/merge") {
+      const input = await readJson(request);
+      targetCode = typeof input?.targetCode === "string" ? input.targetCode.trim() : "";
+      if (!targetCode || targetCode.length > 40) return error(response, 422, "ROOM_MERGE_TARGET_INVALID", "请选择要保留的直播间编号");
     }
     if (request.method === "PUT") {
       photo = await readBody(request, 8 * 1024 * 1024);
@@ -1197,12 +1228,13 @@ async function manageRoom(request, response, code, isAvatar) {
     if (request.headers["if-match"] !== JSON.stringify(updatedAtValue())) {
       throw Object.assign(new Error("直播间或排班已更新，请核对后重试"), { status: 409, code: "ROOMS_CHANGED" });
     }
-    if (request.method === "PATCH") renameRoom(room, name);
+    if (resource === "/merge") mergeRoom(db, room, targetCode);
+    else if (request.method === "PATCH") renameRoom(room, name);
     else if (request.method === "PUT") {
       db.prepare(`INSERT INTO room_avatars(room_code,photo_type,photo_blob,version) VALUES (?,?,?,?)
         ON CONFLICT(room_code) DO UPDATE SET photo_type=excluded.photo_type,photo_blob=excluded.photo_blob,version=excluded.version`)
         .run(code, photoType, photo, randomBytes(16).toString("hex"));
-    } else if (isAvatar) db.prepare("DELETE FROM room_avatars WHERE room_code=?").run(code);
+    } else if (resource === "/avatar") db.prepare("DELETE FROM room_avatars WHERE room_code=?").run(code);
     else db.prepare("DELETE FROM rooms WHERE code=?").run(code);
     db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
     db.exec("COMMIT");
@@ -2159,11 +2191,12 @@ async function handle(request, response) {
     if (!requireUser(request, response, "admin")) return;
     return json(response, 200, adminRoomsPayload());
   }
-  const adminRoomMatch = pathname.match(/^\/api\/v1\/admin\/rooms\/([^/]+)(\/avatar)?$/);
+  const adminRoomMatch = pathname.match(/^\/api\/v1\/admin\/rooms\/([^/]+)(\/avatar|\/merge)?$/);
   if (adminRoomMatch) {
-    const isAvatar = Boolean(adminRoomMatch[2]);
-    if (request.method === "DELETE" || request.method === (isAvatar ? "PUT" : "PATCH")) {
-      return manageRoom(request, response, adminRoomMatch[1], isAvatar);
+    const resource = adminRoomMatch[2] ?? "";
+    const methods = resource === "/merge" ? ["POST"] : resource === "/avatar" ? ["PUT", "DELETE"] : ["PATCH", "DELETE"];
+    if (methods.includes(request.method)) {
+      return manageRoom(request, response, adminRoomMatch[1], resource);
     }
   }
   const roomAvatarMatch = pathname.match(/^\/api\/v1\/rooms\/([^/]+)\/avatar$/);

@@ -75,8 +75,8 @@ function ImportPreview({ preview }) {
               <p>表内名称：{room.sourceNames?.length ? room.sourceNames.join("、") : room.sourceName}</p>
             )}
             {room.numberConflicts?.map((item) => (
-              <p key={item.name}>
-                <strong>请核对编号</strong> · {item.sheet} 第 {item.row} 行的「{item.name}」曾登记在 {item.codes.join("、")} 号，本次按表内的 {room.code} 号导入。
+              <p key={item.name + item.requestedCode}>
+                <strong>请核对编号</strong> · {item.sheet} 第 {item.row} 行的「{item.name}」填为 {item.requestedCode} 号，本次归入 {room.code} 号。
               </p>
             ))}
             {room.dates.map((day) => (
@@ -108,7 +108,9 @@ function RoomMatches({ sheet, assignments, onSelect, errors, busy }) {
       <p>请为表内的新名称选择对应直播间。确认导入后会记住此次匹配。</p>
       {sheet.sourceRooms.map((room) => (
         <label key={room.sourceRoomKey} className="staff-room-match">
-          <span><strong>{room.name}</strong><small>{room.sheet} 第 {room.row} 行 · {room.dateCount} 天</small></span>
+          <span><strong>{room.name}</strong><small>{room.sheet} 第 {room.row} 行 · {room.dateCount} 天
+            {room.requestedCodes?.length > 1 && ` · 表内填写了 ${room.requestedCodes.join("、")} 号`}
+          </small></span>
           {room.automatic ? (
             <span>已匹配 · {room.code} 号</span>
           ) : (
@@ -116,7 +118,7 @@ function RoomMatches({ sheet, assignments, onSelect, errors, busy }) {
               aria-invalid={errors.some((issue) => issue.room === room.name) || undefined}
               onChange={(event) => onSelect(room.sourceRoomKey, event.target.value)}>
               <option value="">请选择直播间</option>
-              {sheet.roomOptions.map(({ code, name }) => (
+              {sheet.roomOptions.filter(({ code }) => !room.candidateCodes?.length || room.candidateCodes.includes(code)).map(({ code, name }) => (
                 <option value={code} key={code}>{code} 号 · {name ?? "未录入"}</option>
               ))}
             </select>

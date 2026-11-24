@@ -95,7 +95,7 @@ export function parseStaffSchedule(sheets, parseDate) {
       const numberText = text("直播间号码");
       if (roomText || numberText) {
         const code = staffRoomCode(numberText);
-        const numberOnly = !roomText && (!code || room?.code !== code);
+        const numberOnly = !roomText && !room?.codeSources.has(code);
         const name = roomText || (numberOnly ? `${Number(code)}号直播间` : room.name);
         const key = roomNameKey(name);
         room = null;
@@ -105,16 +105,12 @@ export function parseStaffSchedule(sheets, parseDate) {
         else {
           if (!rooms.has(key)) rooms.set(key, {
             key, name, numberOnly, sheetName: sheet.name, sourceRow: row,
-            dates: new Map(), hostShifts: [], directorShifts: [],
+            codeSources: new Map(), dates: new Map(), hostShifts: [], directorShifts: [],
           });
           room = rooms.get(key);
           if (roomText) room.numberOnly = false;
-          if (code && room.code && code !== room.code) {
-            issue(errors, "直播间号码", `同一直播间名称已在 ${room.codeSource.sheet} 第 ${room.codeSource.row} 行填写为 ${room.code} 号`);
-            room = null;
-          } else if (code && !room.code) {
-            room.code = code;
-            room.codeSource = { sheet: sheet.name, row, column: columns.get("直播间号码") };
+          if (code && !room.codeSources.has(code)) {
+            room.codeSources.set(code, { sheet: sheet.name, row, column: columns.get("直播间号码") });
           }
         }
       }
