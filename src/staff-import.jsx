@@ -112,7 +112,7 @@ function RoomMatches({ sheet, assignments, onSelect, errors, busy }) {
             {room.requestedCodes?.length > 1 && ` · 表内填写了 ${room.requestedCodes.join("、")} 号`}
           </small></span>
           {room.automatic ? (
-            <span>已匹配 · {room.code} 号</span>
+            <span>{room.isNew ? "新增 · 按顺序分配房号" : `已匹配 · ${room.code} 号`}</span>
           ) : (
             <select value={assignments[room.sourceRoomKey] ?? ""} disabled={busy}
               aria-invalid={errors.some((issue) => issue.room === room.name) || undefined}

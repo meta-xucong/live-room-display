@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseXlsx, cellHasFormula, cellValue } from "./server/xlsx.mjs";
 import { NUMBERED_ROOM_CODES, normalizeStaffShifts, parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
 import { mergeRoom } from "./server/room-merge.mjs";
+import { availableRoomCodes, compactRoomCodes, compareRoomCodes } from "./server/room-numbers.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, "data"));
@@ -39,6 +40,16 @@ db.exec(`
     room_code TEXT PRIMARY KEY REFERENCES rooms(code) ON DELETE CASCADE,
     photo_type TEXT NOT NULL, photo_blob BLOB NOT NULL, version TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS room_identities (
+    room_code TEXT PRIMARY KEY REFERENCES rooms(code) ON DELETE CASCADE,
+    id TEXT NOT NULL UNIQUE, legacy_code TEXT
+  );
+  CREATE TRIGGER IF NOT EXISTS assign_room_identity AFTER INSERT ON rooms
+  BEGIN
+    INSERT INTO room_identities(room_code,id) VALUES (new.code,lower(hex(randomblob(16))));
+  END;
+  INSERT OR IGNORE INTO room_identities(room_code,id,legacy_code)
+    SELECT code,lower(hex(randomblob(16))),code FROM rooms;
   CREATE TABLE IF NOT EXISTS room_aliases (
     name_key TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE
   );
@@ -103,7 +114,6 @@ const restoreHostAvatarName = db.prepare("DELETE FROM deleted_host_avatar_names 
 const failures = new Map();
 const uploadWindows = new Map();
 const integrationWindows = new Map();
-const roomCodeCollator = new Intl.Collator("zh-CN", { numeric: true });
 const cookieName = "lrd_session";
 const cookieSecure = process.env.NODE_ENV === "production" && process.env.SECURE_COOKIES !== "false";
 const previewCleanup = setInterval(() => {
@@ -139,13 +149,6 @@ function hashToken(token) {
 
 function hostNameKey(name) {
   return String(name ?? "").normalize("NFKC").trim().replace(/\s+/g, "").toLocaleLowerCase("zh-CN");
-}
-
-function compareRoomCodes(left, right) {
-  const leftIsNumber = /^\d+$/.test(left);
-  const rightIsNumber = /^\d+$/.test(right);
-  return Number(rightIsNumber) - Number(leftIsNumber)
-    || roomCodeCollator.compare(left, right) || left.localeCompare(right);
 }
 
 function slotHostAvatar(slot, legacyPhoto = slot.photo_type) {
@@ -615,7 +618,8 @@ function resolveStaffRooms(source, bindings) {
     const requestedCodes = [...room.codeSources.keys()];
     const requestedCode = requestedCodes.length === 1 ? requestedCodes[0] : null;
     const known = alias ?? (candidates.length === 1 ? candidates[0] : candidates.find((code) => code === requestedCode));
-    const automaticCode = known ?? (candidates.length === 0 ? requestedCode : null);
+    const requestedIsAvailable = room.numberOnly || !byCode.has(requestedCode);
+    const automaticCode = known ?? (candidates.length === 0 && requestedIsAvailable ? requestedCode : null);
     const chosen = Object.hasOwn(bindings, room.key) ? bindings[room.key] : null;
     const automatic = Boolean(automaticCode);
     const code = automaticCode ?? chosen;
@@ -634,7 +638,7 @@ function resolveStaffRooms(source, bindings) {
       if (!target) {
         target = {
           code, name: byCode.get(code)?.name ?? room.name, sourceName: room.name, sheetName: room.sheetName,
-          isNew: !byCode.has(code), automatic, sourceNames: [], aliasKeys: [], numberConflicts: [],
+          isNew: !byCode.has(code), automatic, sourceNames: [], aliasKeys: [], numberSources: [],
           dates: new Map(), hostShifts: [], directorShifts: [],
         };
         targets.set(code, target);
@@ -645,10 +649,10 @@ function resolveStaffRooms(source, bindings) {
           if (target.isNew) target.name = room.name;
         }
         target.sourceNames.push(room.name);
-        for (const [requested, location] of room.codeSources) {
-          if (requested !== code) target.numberConflicts.push({ name: room.name, requestedCode: requested, ...location });
-        }
         if (!known) target.aliasKeys.push(room.key);
+      }
+      for (const [requestedCode, location] of room.codeSources) {
+        target.numberSources.push({ name: room.name, requestedCode, ...location });
       }
       for (const [date, group] of room.dates) target.dates.set(date, group);
       target.hostShifts.push(...room.hostShifts);
@@ -656,11 +660,19 @@ function resolveStaffRooms(source, bindings) {
     }
     return {
       sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
-      dateCount: room.dates.size, code, automatic, requestedCodes,
+      dateCount: room.dates.size, code, automatic, requestedCodes, isNew: Boolean(code && !byCode.has(code)),
       candidateCodes: !automatic && candidates.length > 1 ? candidates : [],
     };
   });
-  const rooms = [...targets.values()].sort((a, b) => compareRoomCodes(a.code, b.code));
+  const nextCode = availableRoomCodes(new Set(byCode.keys()));
+  const rooms = [...targets.values()].sort((a, b) => compareRoomCodes(a.code, b.code))
+    .map(({ numberSources, ...room }) => {
+      if (room.isNew) {
+        room.code = nextCode();
+        if (!room.sourceNames.length) room.name = `${Number(room.code)}号直播间`;
+      }
+      return { ...room, numberConflicts: numberSources.filter(({ requestedCode }) => requestedCode !== room.code) };
+    }).sort((a, b) => compareRoomCodes(a.code, b.code));
   return { sourceRooms, rooms, unmatchedRooms, errors };
 }
 
@@ -909,12 +921,12 @@ function parseFixedScheduleText(input) {
 
 function validateFixedScheduleText(text) {
   const parsed = parseFixedScheduleText(text);
-  const currentRoom = db.prepare("SELECT name FROM rooms WHERE code=?").get(parsed.roomCode);
-  const key = roomNameKey(parsed.roomName);
-  if (key !== roomNameKey(currentRoom?.name)) {
-    const other = roomNameInUse(parsed.roomCode, key);
-    if (other) fixedTextError(`该名称已登记为 ${other} 号直播间，请使用已有编号`, "直播间名称", 1);
-  }
+  const { code, name } = chooseScheduleRoom(parsed.roomCode, parsed.roomName);
+  parsed.roomCode = code;
+  parsed.roomName = name;
+  parsed.sheet.name = `API-${code}`;
+  parsed.sheet.rows.get(1).get("E").value = code;
+  parsed.sheet.rows.get(1).get("B").value = name;
   const result = validateWorkbook([parsed.sheet]);
   const warnings = result.warnings.filter((warning) => warning.field !== "主播照片");
   warnings.push({
@@ -1161,8 +1173,8 @@ function roomList(includeCounts = false) {
   const counts = includeCounts ? `,
     (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
     (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount` : "";
-  return db.prepare(`SELECT r.code,r.name,a.version AS avatarVersion${counts}
-    FROM rooms r LEFT JOIN room_avatars a ON a.room_code=r.code`).all()
+  return db.prepare(`SELECT r.code,r.name,a.version AS avatarVersion,i.id AS roomId,i.legacy_code AS legacyCode${counts}
+    FROM rooms r JOIN room_identities i ON i.room_code=r.code LEFT JOIN room_avatars a ON a.room_code=r.code`).all()
     .sort((a, b) => compareRoomCodes(a.code, b.code))
     .map(({ avatarVersion, ...room }, sortOrder) => ({
       ...room, sortOrder, avatarUrl: avatarVersion ? `/api/v1/rooms/${encodeURIComponent(room.code)}/avatar?v=${avatarVersion}` : null,
@@ -1184,6 +1196,23 @@ function roomNameInUse(code, key) {
   const alias = db.prepare("SELECT room_code FROM room_aliases WHERE name_key=? AND room_code<>?").get(key, code);
   return alias?.room_code ?? db.prepare("SELECT code,name FROM rooms WHERE code<>?").all(code)
     .find(({ name }) => roomNameKey(name) === key)?.code;
+}
+
+function chooseScheduleRoom(code, name) {
+  const existing = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(code);
+  const key = roomNameKey(name);
+  if (existing) {
+    if (key && key !== roomNameKey(existing.name) &&
+      !db.prepare("SELECT 1 FROM room_aliases WHERE room_code=? AND name_key=?").get(code, key)) {
+      fixedTextError(`${code} 号直播间当前为「${existing.name}」，请先核对直播间名称和房号`, "直播间名称", 1);
+    }
+    return existing;
+  }
+  if (!key) fixedTextError("新增直播间时请补充直播间名称", "直播间名称", 1);
+  const other = roomNameInUse(code, key);
+  if (other) fixedTextError(`该名称已登记为 ${other} 号直播间，请使用已有编号`, "直播间名称", 1);
+  const occupied = new Set(db.prepare("SELECT code FROM rooms").all().map((room) => room.code));
+  return { code: availableRoomCodes(occupied)(), name };
 }
 
 function renameRoom(room, name) {
@@ -1235,14 +1264,20 @@ async function manageRoom(request, response, code, resource) {
     if (request.headers["if-match"] !== JSON.stringify(updatedAtValue())) {
       throw Object.assign(new Error("直播间或排班已更新，请核对后重试"), { status: 409, code: "ROOMS_CHANGED" });
     }
-    if (resource === "/merge") mergeRoom(db, room, targetCode);
+    if (resource === "/merge") {
+      mergeRoom(db, room, targetCode);
+      compactRoomCodes(db);
+    }
     else if (request.method === "PATCH") renameRoom(room, name);
     else if (request.method === "PUT") {
       db.prepare(`INSERT INTO room_avatars(room_code,photo_type,photo_blob,version) VALUES (?,?,?,?)
         ON CONFLICT(room_code) DO UPDATE SET photo_type=excluded.photo_type,photo_blob=excluded.photo_blob,version=excluded.version`)
         .run(code, photoType, photo, randomBytes(16).toString("hex"));
     } else if (resource === "/avatar") db.prepare("DELETE FROM room_avatars WHERE room_code=?").run(code);
-    else db.prepare("DELETE FROM rooms WHERE code=?").run(code);
+    else {
+      db.prepare("DELETE FROM rooms WHERE code=?").run(code);
+      compactRoomCodes(db);
+    }
     db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
     db.exec("COMMIT");
   } catch (cause) {
@@ -1328,16 +1363,14 @@ function cleanMcpField(value, label, maxLength = 500) {
 
 function fixedScheduleTextFromMcp(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("请提供排班内容");
-  const roomCode = cleanMcpField(args.roomCode, "直播间编号", 40);
+  const requestedCode = cleanMcpField(args.roomCode, "直播间编号", 40);
   const date = cleanMcpField(args.date, "日期", 10);
-  if (!roomCode) throw new Error("请先确认直播间编号");
+  if (!requestedCode) throw new Error("请先确认直播间编号");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("请提供有效排班日期，格式为 YYYY-MM-DD");
   if (!Array.isArray(args.directorShifts) || !Array.isArray(args.hostShifts)) throw new Error("请分别提供 directorShifts 和 hostShifts 两份完整排班");
   const assignmentCount = args.directorShifts.length + args.hostShifts.length;
   if (assignmentCount < 1 || assignmentCount > 100) throw new Error("导演和主播排班合计请提供 1 至 100 个时段");
-  const existingRoom = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(roomCode);
-  const roomName = existingRoom?.name ?? cleanMcpField(args.roomName, "直播间名称", 120);
-  if (!roomName) throw new Error("新增直播间时请补充直播间名称");
+  const { code: roomCode, name: roomName } = chooseScheduleRoom(requestedCode, cleanMcpField(args.roomName, "直播间名称", 120));
   const lines = [`直播间编号：${roomCode}`, `直播间名称：${roomName}`, `排班日期：${date}`];
   for (const [index, shift] of args.directorShifts.entries()) {
     if (!shift || typeof shift !== "object" || Array.isArray(shift)) throw new Error(`第 ${index + 1} 个导演时段格式不正确`);
@@ -1439,14 +1472,12 @@ function validateMcpRoomSchedulesPayload(payload) {
 }
 
 function buildMcpRoomSchedulesPayload(args) {
-  const roomCode = cleanMcpField(args?.roomCode, "直播间编号", 40);
-  if (!roomCode) throw new Error("请先确认直播间编号");
+  const requestedCode = cleanMcpField(args?.roomCode, "直播间编号", 40);
+  if (!requestedCode) throw new Error("请先确认直播间编号");
   if (!Array.isArray(args?.schedules) || args.schedules.length < 1 || args.schedules.length > 100) {
     throw new Error("请提供 1 至 100 个日期的完整排班");
   }
-  const existingRoom = db.prepare("SELECT name FROM rooms WHERE code=?").get(roomCode);
-  const roomName = existingRoom?.name ?? cleanMcpField(args.roomName, "直播间名称", 120);
-  if (!roomName) throw new Error("新增直播间时请补充直播间名称");
+  const { code: roomCode, name: roomName } = chooseScheduleRoom(requestedCode, cleanMcpField(args.roomName, "直播间名称", 120));
   const schedules = args.schedules.map((item) => {
     const date = cleanMcpField(item?.date, "日期", 10);
     return {
@@ -2207,8 +2238,11 @@ async function handle(request, response) {
   const roomAvatarMatch = pathname.match(/^\/api\/v1\/rooms\/([^/]+)\/avatar$/);
   if (request.method === "GET" && roomAvatarMatch) {
     if (!requireUser(request, response)) return;
-    const avatar = db.prepare("SELECT photo_type,photo_blob FROM room_avatars WHERE room_code=?").get(roomAvatarMatch[1]);
-    if (!avatar) return error(response, 404, "MEDIA_NOT_FOUND", "直播间未配置头像");
+    const avatar = db.prepare("SELECT photo_type,photo_blob,version FROM room_avatars WHERE room_code=?").get(roomAvatarMatch[1]);
+    const version = url.searchParams.get("v");
+    if (!avatar || (version !== null && version !== avatar.version)) {
+      return error(response, 404, "MEDIA_NOT_FOUND", "直播间头像不存在或已更新");
+    }
     response.writeHead(200, { "content-type": avatar.photo_type, "cache-control": "private, max-age=300", "x-content-type-options": "nosniff" });
     return response.end(avatar.photo_blob);
   }
@@ -2217,7 +2251,8 @@ async function handle(request, response) {
   if (request.method === "GET" && displayMatch) {
     if (!requireUser(request, response)) return;
     const code = displayMatch[1];
-    const room = db.prepare("SELECT code,name FROM rooms WHERE code=?").get(code);
+    const room = db.prepare(`SELECT r.code,r.name,i.id AS roomId FROM rooms r JOIN room_identities i
+      ON i.room_code=r.code WHERE r.code=?`).get(code);
     if (!room) return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
     const { today, yesterday } = currentShanghaiDay();
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date IN (?,?) ORDER BY starts_at").all(code, today, yesterday).map(publicSlot);
@@ -2445,6 +2480,17 @@ const server = createServer((request, response) => {
     else response.destroy();
   });
 });
+
+db.exec("BEGIN IMMEDIATE");
+try {
+  if (compactRoomCodes(db)) {
+    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(nextDataUpdatedAt());
+  }
+  db.exec("COMMIT");
+} catch (cause) {
+  db.exec("ROLLBACK");
+  throw cause;
+}
 
 const port = Number(process.env.PORT || 4174);
 const host = process.env.HOST || "0.0.0.0";

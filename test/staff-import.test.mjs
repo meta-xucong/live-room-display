@@ -62,9 +62,13 @@ function scheduleWorkbook(sheets, date1904 = false) {
   return zip(entries);
 }
 
-async function withServer(run) {
+async function withServer(run, prepareDatabase) {
   const root = resolve(tmpdir());
   const data = await mkdtemp(join(root, "lrd-test-staff-"));
+  if (prepareDatabase) {
+    const fixture = new DatabaseSync(join(data, "live-room.sqlite"));
+    try { prepareDatabase(fixture); } finally { fixture.close(); }
+  }
   const child = spawn(process.execPath, ["server.mjs"], {
     env: { ...process.env, DATA_DIR: data, NODE_ENV: "development", HOST: "127.0.0.1", PORT: "0" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -118,12 +122,12 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   const room = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
   room.run("01", "Alpha", "Old", 0);
   room.run("02", "Beta", "Old", 1);
-  room.run("27", "Outside", "Old", 2);
+  room.run("03", "Outside", "Old", 2);
   const start = Date.parse("2026-11-19T08:00:00+08:00");
   const end = Date.parse("2026-11-19T12:00:00+08:00");
   const addHost = db.prepare("INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host,assistant,products_json,sales_target_cents,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
   addHost.run("keep", "01", "2026-11-19", "08:00", "12:00", start, end, "Host A", "Assistant", '["Product"]', 50000, "Note");
-  addHost.run("outside", "27", "2026-11-19", "08:00", "12:00", start, end, "Outside", "", "[]", null, "");
+  addHost.run("outside", "03", "2026-11-19", "08:00", "12:00", start, end, "Outside", "", "[]", null, "");
   addHost.run("blank-day", "01", "2026-11-21", "08:00", "12:00", start + 2 * 86400000, end + 2 * 86400000, "Retained", "", "[]", null, "");
   db.prepare("INSERT INTO director_shifts VALUES (?,?,?,?,?,?,?,?)")
     .run("old-director", "01", "2026-11-20", "08:00", "12:00", start + 86400000, end + 86400000, "Old");
@@ -148,7 +152,7 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   assert.equal(matched.body.roomOptions.length, 27);
   assert.equal((await preview(data, { "beta name": "01", gamma: "03" })).status, 422);
   assert.equal((await preview(data, { "beta name": "99", gamma: "03" })).status, 422);
-  const mapping = { "beta name": "02", gamma: "03" };
+  const mapping = { "beta name": "02", gamma: "04" };
   const ready = await preview(data, mapping);
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.equal(ready.body.status, "ready");
@@ -173,7 +177,7 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   assert.equal(same.sales_target_cents, 50000);
   assert.equal(same.notes, "Note");
   assert.equal(db.prepare("SELECT name FROM rooms WHERE code='02'").get().name, "Beta");
-  assert.equal(db.prepare("SELECT name FROM rooms WHERE code='03'").get().name, "Gamma");
+  assert.equal(db.prepare("SELECT name FROM rooms WHERE code='04'").get().name, "Gamma");
   assert.equal((await preview(data)).body.status, "ready");
 
   const overlaps = workbook([
@@ -245,7 +249,7 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
 }));
 
 test("staff sheets merge by room number, skip blanks and deduplicate identical shifts", () => withServer(async ({ db, viewer, request, preview, commit }) => {
-  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('06','后台房间名','Existing',0)").run();
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','后台房间名','Existing',0)").run();
   const headers = ["日期", "星期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演", "助播时间", "助播", "休"];
   const sheet = (name, rows) => ({ name, headers, rows });
   const first = sheet("甲", [
@@ -267,7 +271,7 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   assert.deepEqual(needsNumber.body.sourceRooms[0].requestedCodes, ["06", "07"]);
   const matched = await preview(multipleNumbers, { 店铺甲: "06" });
   assert.equal(matched.body.status, "ready");
-  assert.deepEqual(matched.body.rooms.map(({ code }) => code), ["06"]);
+  assert.deepEqual(matched.body.rooms.map(({ code }) => code), ["02"]);
   assert.equal(matched.body.rooms[0].dates[0].hostShifts.length, 3);
   const invalidCode = await preview(scheduleWorkbook([sheet("范围", [["46351", "", "店铺", "28", "16:00-20:00", "主播丙"]])]));
   assert.equal(invalidCode.status, 422);
@@ -276,7 +280,7 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
     ["46351", "", "后台房间名", "07", "16:00-20:00", "主播丙"],
   ])]));
   assert.equal(conflictingCatalog.body.status, "ready");
-  assert.equal(conflictingCatalog.body.rooms[0].code, "06");
+  assert.equal(conflictingCatalog.body.rooms[0].code, "01");
   assert.deepEqual(conflictingCatalog.body.rooms[0].numberConflicts, [
     { name: "后台房间名", requestedCode: "07", sheet: "系统编号", row: 2, column: "D" },
   ]);
@@ -296,7 +300,7 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   const ready = await preview(file);
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.equal(ready.body.status, "ready");
-  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["06", "12"]);
+  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["02", "03"]);
   assert.deepEqual(ready.body.rooms[0].sourceNames, ["店铺甲", "店铺乙"]);
   assert.deepEqual(ready.body.summary, {
     roomCount: 2, dateCount: 3, firstDate: "2026-11-25", lastDate: "2026-11-26",
@@ -307,9 +311,9 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   assert.equal(ready.body.rooms[0].dates[0].directorShifts.length, 1);
   assert.equal(ready.body.rooms[0].dates[1].directorShifts.length, 1);
   assert.equal((await commit(ready.body.previewId)).status, 200);
-  assert.deepEqual(db.prepare("SELECT name_key,room_code FROM room_aliases WHERE room_code='06' ORDER BY name_key").all()
+  assert.deepEqual(db.prepare("SELECT name_key,room_code FROM room_aliases WHERE room_code='02' ORDER BY name_key").all()
     .map(({ name_key }) => name_key), ["店铺乙", "店铺甲"]);
-  const displayed = await request("/api/v1/rooms/06/schedule?date=2026-11-25", { headers: viewer });
+  const displayed = await request("/api/v1/rooms/02/schedule?date=2026-11-25", { headers: viewer });
   assert.equal(displayed.body.schedule[0].assistant, "助播甲");
   assert.equal(displayed.body.schedule.length, 3);
 
@@ -323,6 +327,7 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
 
 test("actual multi-staff template reuses registered rooms with the same name", { skip: !process.env.MULTI_STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
   const addRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+  addRoom.run("01", "其他直播间", "old", 3);
   addRoom.run("02", "Champion儿童官旗", "old", 0);
   addRoom.run("03", "MLB童装旗舰店", "old", 1);
   addRoom.run("04", "三枪官方旗舰店", "old", 2);
@@ -337,8 +342,8 @@ test("actual multi-staff template reuses registered rooms with the same name", {
     roomCount: 7, dateCount: 13, firstDate: "2026-11-25", lastDate: "2026-11-27",
     scheduleCount: 38, directorShiftCount: 31, skippedCount: 1,
   });
-  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["02", "03", "04", "06", "12", "15", "21"]);
-  const shared = ready.body.rooms.find(({ code }) => code === "06");
+  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["02", "03", "04", "05", "06", "07", "08"]);
+  const shared = ready.body.rooms.find(({ code }) => code === "05");
   assert.equal(shared.sourceNames.length, 2);
   assert.equal(shared.dates[0].hostShifts.length, 4);
   for (const [code, requested] of [["02", "08"], ["03", "09"], ["04", "11"]]) {
@@ -346,45 +351,59 @@ test("actual multi-staff template reuses registered rooms with the same name", {
   }
   assert.equal((await commit(ready.body.previewId)).status, 200);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM slots WHERE date>='2026-11-25'").get().count, 38);
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rooms WHERE code IN ('08','09','11')").get().count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rooms WHERE code IN ('09','11')").get().count, 0);
   assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='old'").get().room_code, "03");
   assert.equal(db.prepare("SELECT room_code FROM room_aliases WHERE name_key='champion儿童官方旗舰店'").get().room_code, "02");
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM director_shifts").get().count, 31);
 }));
 
-test("room lists are ordered by number and close position gaps after deletion", () => withServer(async ({ db, admin, viewer, request }) => {
-  const addRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
-  for (const [code, order] of [["11", 0], ["06", 3], ["2", 1], ["01", 8]]) {
-    addRoom.run(code, "直播间 " + code, "test", order);
-  }
-
+test("startup and deletion compact room numbers while preserving identities and linked data", () => withServer(async ({ db, admin, viewer, request, preview }) => {
   const date = "2026-11-19";
   const start = Date.parse(date + "T08:00:00+08:00");
   const end = Date.parse(date + "T12:00:00+08:00");
   db.prepare(`INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host)
-    VALUES ('host','11',?,'08:00','12:00',?,?,'主播')`).run(date, start, end);
+    VALUES ('host','04',?,'08:00','12:00',?,?,'主播')`).run(date, start, end);
   db.prepare(`INSERT INTO director_shifts(id,room_code,date,start_time,end_time,starts_at,ends_at,director)
-    VALUES ('director','06',?,'08:00','12:00',?,?,'导演')`).run(date, start, end);
+    VALUES ('director','03',?,'08:00','12:00',?,?,'导演')`).run(date, start, end);
+  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('别名','03')").run();
+  db.prepare("INSERT INTO room_avatars(room_code,photo_type,photo_blob,version) VALUES ('03','image/png',?,'third')")
+    .run(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
 
   const roomList = (response) => response.body.rooms.map(({ code, sortOrder }) => [code, sortOrder]);
-  const expected = [["01", 0], ["2", 1], ["06", 2], ["11", 3]];
+  const expected = [["01", 0], ["02", 1], ["03", 2], ["04", 3]];
   const adminRooms = await request("/api/v1/admin/rooms", { headers: admin });
   assert.deepEqual(roomList(adminRooms), expected);
+  assert.deepEqual(adminRooms.body.rooms.map(({ legacyCode }) => legacyCode), ["01", "2", "06", "11"]);
+  const third = adminRooms.body.rooms[2];
+  const fourth = adminRooms.body.rooms[3];
   assert.deepEqual(roomList(await request("/api/v1/rooms", { headers: viewer })), expected);
   const schedule = await request("/api/v1/admin/schedules", { headers: admin });
   assert.deepEqual(roomList(schedule), expected);
-  assert.deepEqual(schedule.body.groups.map(({ roomCode }) => roomCode), ["06", "11"]);
+  assert.deepEqual(schedule.body.groups.map(({ roomCode }) => roomCode), ["03", "04"]);
 
-  const removed = await request("/api/v1/admin/rooms/2", {
+  const removed = await request("/api/v1/admin/rooms/02", {
     method: "DELETE", headers: { ...admin, "if-match": JSON.stringify(adminRooms.body.dataUpdatedAt) },
   });
   assert.equal(removed.status, 200);
-  const remaining = [["01", 0], ["06", 1], ["11", 2]];
+  const remaining = [["01", 0], ["02", 1], ["03", 2]];
   assert.deepEqual(roomList(removed), remaining);
   assert.deepEqual(roomList(await request("/api/v1/rooms", { headers: viewer })), remaining);
-  const display = await request("/api/v1/rooms/06/display", { headers: viewer });
-  assert.equal(display.body.room.code, "06");
-  assert.equal(db.prepare("SELECT room_code FROM director_shifts WHERE id='director'").get().room_code, "06");
+  assert.deepEqual(removed.body.rooms.slice(1).map(({ roomId }) => roomId), [third.roomId, fourth.roomId]);
+  assert.match(removed.body.rooms[1].avatarUrl, /rooms\/02\/avatar\?v=third$/);
+  assert.equal((await request(third.avatarUrl, { headers: viewer })).status, 404);
+  const display = await request("/api/v1/rooms/02/display", { headers: viewer });
+  assert.equal(display.body.room.roomId, third.roomId);
+  assert.equal(display.body.room.name, "直播间 06");
+  assert.equal(db.prepare("SELECT room_code FROM director_shifts WHERE id='director'").get().room_code, "02");
+  assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='host'").get().room_code, "03");
+  const matchingAlias = await preview(workbook([["46353", "", "别名", "08:00-12:00", "主播"]]));
+  assert.equal(matchingAlias.body.rooms[0].code, "02");
+  const unknown = await preview(scheduleWorkbook([{
+    name: "旧号码",
+    headers: ["日期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演"],
+    rows: [["46353", "未登记的新名称", "02", "08:00-12:00", "主播"]],
+  }]));
+  assert.equal(unknown.body.status, "needs_mapping");
 
   const token = "lrd_live_" + randomBytes(32).toString("base64url");
   db.prepare("INSERT INTO api_tokens(id,name,token_hash,created_at) VALUES ('order-test','test',?,?)")
@@ -394,6 +413,21 @@ test("room lists are ordered by number and close position gaps after deletion", 
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_rooms", arguments: {} } }),
   });
   assert.deepEqual(roomList({ body: JSON.parse(listed.body.result.content[0].text) }), remaining);
+  const prepared = await request("/mcp", {
+    method: "POST", headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+      name: "preview_schedule_update", arguments: { roomCode: "11", roomName: "追加房间", date,
+        hostShifts: [], directorShifts: [{ start: "08:00", end: "12:00", director: "导演" }] },
+    } }),
+  });
+  const result = JSON.parse(prepared.body.result.content[0].text);
+  assert.equal(result.preview.roomCode, "04");
+}, (db) => {
+  db.exec("CREATE TABLE rooms (code TEXT PRIMARY KEY, name TEXT NOT NULL, sheet_name TEXT NOT NULL, sort_order INTEGER NOT NULL)");
+  const addRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+  for (const [code, order] of [["11", 0], ["06", 3], ["2", 1], ["01", 8]]) {
+    addRoom.run(code, "直播间 " + code, "test", order);
+  }
 }));
 
 test("room management protects changes, retains name matching and removes only the confirmed room", () => withServer(async ({
@@ -413,7 +447,10 @@ test("room management protects changes, retains name matching and removes only t
   const avatarPath = roomPath + "/avatar";
   const list = await request(listPath, { headers: admin });
   assert.equal((await request(listPath, { headers: viewer })).status, 403);
-  assert.deepEqual(list.body.rooms[0], {
+  const { roomId: firstRoomId, legacyCode, ...firstRoom } = list.body.rooms[0];
+  assert.match(firstRoomId, /^[a-f0-9]{32}$/);
+  assert.equal(legacyCode, null);
+  assert.deepEqual(firstRoom, {
     code: "01", name: "店铺甲", sortOrder: 0, scheduleCount: 1, directorShiftCount: 1, avatarUrl: null,
   });
   const rename = (name, version, headers = admin) => request(roomPath, {
@@ -469,14 +506,15 @@ test("room management protects changes, retains name matching and removes only t
   assert.equal((await remove(reset.body.dataUpdatedAt)).body.error.code, "ROOMS_CHANGED");
   const removed = await remove(withAvatar.body.dataUpdatedAt);
   assert.equal(removed.status, 200);
-  assert.deepEqual(removed.body.rooms.map(({ code }) => code), ["02"]);
+  assert.deepEqual(removed.body.rooms.map(({ code, name }) => [code, name]), [["01", "店铺乙"]]);
   assert.equal((await commit(stalePreview.body.previewId)).status, 409);
-  assert.equal((await request("/api/v1/rooms/01/display", { headers: viewer })).status, 404);
+  assert.equal((await request("/api/v1/rooms/02/display", { headers: viewer })).status, 404);
   assert.equal((await request(withAvatar.body.rooms[0].avatarUrl, { headers: viewer })).status, 404);
-  for (const table of ["slots", "director_shifts", "room_aliases", "room_avatars"]) {
-    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE room_code='01'`).get().count, 0);
+  for (const table of ["slots", "director_shifts", "room_aliases", "room_avatars", "room_identities"]) {
+    assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE room_code='02'`).get().count, 0);
   }
-  assert.equal(db.prepare("SELECT host FROM slots WHERE room_code='02'").get().host, "主播乙");
+  assert.equal(db.prepare("SELECT host FROM slots WHERE room_code='01'").get().host, "主播乙");
+  assert.equal(db.prepare("SELECT 1 FROM room_identities WHERE id=?").get(firstRoomId), undefined);
 }));
 
 test("merge keeps existing shifts and aliases and reuses the retained room for future imports", () => withServer(async ({
@@ -524,16 +562,16 @@ test("merge keeps existing shifts and aliases and reuses the retained room for f
   const merged = await merge("11");
   assert.equal(merged.status, 200);
   assert.deepEqual(merged.body.duplicateGroups, []);
-  assert.deepEqual(merged.body.rooms.map(({ code }) => code), ["11", "12"]);
+  assert.deepEqual(merged.body.rooms.map(({ code }) => code), ["01", "02"]);
   assert.equal(merged.body.rooms[0].scheduleCount, 2);
   assert.equal(merged.body.rooms[0].directorShiftCount, 1);
-  assert.match(merged.body.rooms[0].avatarUrl, /rooms\/11\/avatar/);
-  assert.equal(db.prepare("SELECT notes FROM slots WHERE id='older' AND room_code='11'").get().notes, "保留原场次");
-  assert.deepEqual(db.prepare("SELECT DISTINCT room_code FROM room_aliases").all().map(({ room_code }) => room_code), ["11"]);
+  assert.match(merged.body.rooms[0].avatarUrl, /rooms\/01\/avatar/);
+  assert.equal(db.prepare("SELECT notes FROM slots WHERE id='older' AND room_code='01'").get().notes, "保留原场次");
+  assert.deepEqual(db.prepare("SELECT DISTINCT room_code FROM room_aliases").all().map(({ room_code }) => room_code), ["01"]);
   assert.equal((await commit(stalePreview.body.previewId)).status, 409);
   const ready = await preview(file);
   assert.equal(ready.body.status, "ready");
-  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["11"]);
+  assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["01"]);
   assert.equal(ready.body.rooms[0].dates[0].hostShifts.length, 2);
   assert.equal(ready.body.rooms[0].numberConflicts[0].requestedCode, "04");
   assert.equal((await commit(ready.body.previewId)).status, 200);
@@ -550,7 +588,7 @@ test("merge keeps existing shifts and aliases and reuses the retained room for f
     ].join("\n") }),
   });
   assert.equal(textPreview.status, 422);
-  assert.match(textPreview.body.error.message, /已登记为 11 号/);
+  assert.match(textPreview.body.error.message, /已登记为 01 号/);
 }));
 
 test("avatar rename preserves the photo and updates only the matching host assignments", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {

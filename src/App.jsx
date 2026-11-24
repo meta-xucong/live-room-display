@@ -3,6 +3,8 @@ import { DisplayRoomPicker, RoomManagement } from "./room-management.jsx";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const THEME_STORAGE_KEY = "live-room-theme";
+const ROOM_ID_STORAGE_KEY = "live-room-selected-id";
+const ROOM_CODE_STORAGE_KEY = "live-room-selected";
 
 function initialTheme() {
   if (document.documentElement.dataset.theme === "dark") return "dark";
@@ -927,11 +929,13 @@ export function App() {
   const [user, setUser] = useState(null);
   const [csrfToken, setCsrfToken] = useState("");
   const [rooms, setRooms] = useState([]);
-  const [roomId, setRoomId] = useState("");
+  const [selectedRoomId, setSelectedRoomId] = useState("");
   const [displayData, setDisplayData] = useState(null);
   const [serverOffset, setServerOffset] = useState(0);
   const [realTime, setRealTime] = useState(Date.now());
   const [connectionError, setConnectionError] = useState("");
+  const selectedRoom = rooms.find((room) => room.roomId === selectedRoomId);
+  const roomCode = selectedRoom?.id ?? "";
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -945,26 +949,49 @@ export function App() {
 
   const loadRooms = useCallback(async () => {
     const response = await api("/api/v1/rooms");
-    const mapped = response.rooms.map((room) => ({ id: room.code, name: room.name, avatarUrl: room.avatarUrl }));
+    const mapped = response.rooms.map((room) => ({
+      id: room.code, roomId: room.roomId ?? room.code, legacyCode: room.legacyCode, name: room.name, avatarUrl: room.avatarUrl,
+    }));
+    const rememberedId = window.localStorage.getItem(ROOM_ID_STORAGE_KEY);
+    const rememberedCode = window.localStorage.getItem(ROOM_CODE_STORAGE_KEY);
     setRooms(mapped);
     setConnectionError("");
-    setRoomId((selected) => {
-      const remembered = selected || window.localStorage.getItem("live-room-selected") || "";
-      return mapped.some((room) => room.id === remembered) ? remembered : (mapped[0]?.id ?? "");
+    setSelectedRoomId((current) => {
+      const id = current || rememberedId;
+      if (id) {
+        const room = mapped.find((room) => room.roomId === id);
+        if (room) return room.roomId;
+        return (mapped.find((room) => room.id === rememberedCode) ?? mapped.at(-1))?.roomId ?? "";
+      }
+      const room = mapped.find((room) => room.legacyCode && room.legacyCode === rememberedCode)
+        ?? mapped.find((room) => room.id === rememberedCode) ?? mapped[0];
+      return room?.roomId ?? "";
     });
   }, []);
 
-  const refreshDisplay = useCallback(async (code) => {
+  useEffect(() => {
+    if (roomCode && selectedRoomId) {
+      window.localStorage.setItem(ROOM_ID_STORAGE_KEY, selectedRoomId);
+      window.localStorage.setItem(ROOM_CODE_STORAGE_KEY, roomCode);
+    }
+  }, [roomCode, selectedRoomId]);
+
+  const refreshDisplay = useCallback(async (code, roomId) => {
     if (!code) return;
     try {
       const response = await api(`/api/v1/rooms/${encodeURIComponent(code)}/display`);
+      const responseRoomId = response.room.roomId ?? response.room.code;
+      if (responseRoomId !== roomId) {
+        loadRooms().catch(() => setConnectionError("正在同步直播间列表…"));
+        return;
+      }
       const receivedAt = Date.now();
       setDisplayData((current) => {
-        if (current?.room?.id === response.room.code && current.dataUpdatedAt === response.dataUpdatedAt) {
+        if (current?.room?.roomId === responseRoomId && current.room.id === response.room.code && current.dataUpdatedAt === response.dataUpdatedAt) {
           return { ...current, nextTransitionAt: response.nextTransitionAt };
         }
         return {
-          room: { id: response.room.code, name: response.room.name },
+          room: { id: response.room.code, roomId: responseRoomId, name: response.room.name },
           schedule: response.schedule,
           directorShifts: response.directorShifts,
           nextTransitionAt: response.nextTransitionAt,
@@ -978,7 +1005,7 @@ export function App() {
         setUser(null);
         setDisplayData(null);
       } else if (cause.status === 404) {
-        setDisplayData(null);
+        setDisplayData((current) => current?.room?.roomId === roomId ? null : current);
         loadRooms().catch(() => setConnectionError("正在同步直播间列表…"));
       } else {
         setConnectionError("连接暂时中断，正在尝试恢复；页面保留上次成功加载的信息。");
@@ -1023,9 +1050,9 @@ export function App() {
   }, [user, loadRooms]);
 
   useEffect(() => {
-    if (!roomId || user?.role !== "viewer") return undefined;
-    refreshDisplay(roomId);
-    const update = () => refreshDisplay(roomId);
+    if (!roomCode || user?.role !== "viewer") return undefined;
+    const update = () => refreshDisplay(roomCode, selectedRoomId);
+    update();
     const poll = window.setInterval(update, 30_000);
     const onReturn = () => { if (document.visibilityState === "visible") update(); };
     window.addEventListener("online", update);
@@ -1035,15 +1062,15 @@ export function App() {
       window.removeEventListener("online", update);
       document.removeEventListener("visibilitychange", onReturn);
     };
-  }, [user, roomId, refreshDisplay]);
+  }, [user, roomCode, selectedRoomId, refreshDisplay]);
 
   useEffect(() => {
-    if (!roomId || user?.role !== "viewer" || !displayData?.nextTransitionAt) return undefined;
+    if (!roomCode || user?.role !== "viewer" || !displayData?.nextTransitionAt) return undefined;
     const boundaryDelay = Math.max(250, displayData.nextTransitionAt - (Date.now() + serverOffset) + 100);
     if (boundaryDelay >= 30_000) return undefined;
-    const boundary = window.setTimeout(() => refreshDisplay(roomId), boundaryDelay);
+    const boundary = window.setTimeout(() => refreshDisplay(roomCode, selectedRoomId), boundaryDelay);
     return () => window.clearTimeout(boundary);
-  }, [user, roomId, displayData?.nextTransitionAt, serverOffset, refreshDisplay]);
+  }, [user, roomCode, selectedRoomId, displayData?.nextTransitionAt, serverOffset, refreshDisplay]);
 
   useEffect(() => {
     if (user?.role !== "viewer") return undefined;
@@ -1081,23 +1108,23 @@ export function App() {
     setCsrfToken("");
   }
 
-  function chooseRoom(nextId) {
-    if (nextId === roomId) return;
-    setRoomId(nextId);
+  function chooseRoom(nextCode) {
+    const next = rooms.find((room) => room.id === nextCode);
+    if (!next || next.roomId === selectedRoomId) return;
+    setSelectedRoomId(next.roomId);
     setDisplayData(null);
-    window.localStorage.setItem("live-room-selected", nextId);
   }
 
   const timestamp = realTime + serverOffset;
   const room = useMemo(() => {
-    const selected = rooms.find((item) => item.id === roomId);
-    if (!selected) return null;
+    if (!selectedRoom) return null;
+    const current = displayData?.room?.roomId === selectedRoom.roomId;
     return {
-      ...selected,
-      schedule: displayData?.room?.id === roomId ? displayData.schedule : [],
-      directorShifts: displayData?.room?.id === roomId ? displayData.directorShifts : [],
+      ...selectedRoom,
+      schedule: current ? displayData.schedule : [],
+      directorShifts: current ? displayData.directorShifts : [],
     };
-  }, [rooms, roomId, displayData]);
+  }, [selectedRoom, displayData]);
   const program = useMemo(() => getProgram(room?.schedule, timestamp), [room, timestamp]);
   const directorProgram = useMemo(() => getProgram(room?.directorShifts, timestamp), [room, timestamp]);
   const displayed = program.display;
@@ -1114,7 +1141,7 @@ export function App() {
     <div className="app-shell">
       <header className="topbar">
         <Brand />
-        <DisplayRoomPicker rooms={rooms} value={roomId} onChange={chooseRoom} />
+        <DisplayRoomPicker rooms={rooms} value={roomCode} onChange={chooseRoom} />
         <div className="topbar-right">
           <span className="refresh-indicator" />
           <span>{connectionError ? "正在重连" : "实时同步"}</span>

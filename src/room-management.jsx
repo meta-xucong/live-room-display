@@ -12,17 +12,11 @@ function RoomAvatar({ room }) {
   );
 }
 
-function RoomListPosition({ index }) {
-  return <span className="room-list-position" title="列表序号" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span>;
-}
-
-function RoomPickerLabel({ room, index }) {
+function RoomPickerLabel({ room }) {
   return (
     <>
-      <RoomListPosition index={index} />
       <RoomAvatar room={room} />
-      <span className="room-picker-name">{room.name}</span>
-      <small className="room-picker-code">{room.id}号</small>
+      <span className="room-picker-name">{room.id}号直播间 · {room.name}</span>
     </>
   );
 }
@@ -74,14 +68,14 @@ export function DisplayRoomPicker({ rooms, value, onChange }) {
             if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
           }}>
           <summary className="room-picker-trigger" title={selected.id + "号直播间 · " + selected.name}>
-            <RoomPickerLabel room={selected} index={selectedIndex} />
+            <RoomPickerLabel room={selected} />
           </summary>
           <div className="room-picker-menu" role="group" aria-label="选择直播间">
-            {rooms.map((room, index) => (
-              <button type="button" className="room-picker-option" key={room.id} title={room.id + "号直播间 · " + room.name}
+            {rooms.map((room) => (
+              <button type="button" className="room-picker-option" key={room.roomId ?? room.id} title={room.id + "号直播间 · " + room.name}
                 aria-current={selected.id === room.id ? "true" : undefined}
                 onClick={() => { onChange(room.id); closePicker(); }}>
-                <RoomPickerLabel room={room} index={index} />
+                <RoomPickerLabel room={room} />
               </button>
             ))}
           </div>
@@ -160,7 +154,7 @@ export function RoomManagement({ api, csrfToken }) {
 
   function deleteRoom(room) {
     const confirmed = window.confirm(
-      `删除 ${room.code} 号直播间「${room.name}」？\n\n将永久删除该直播间的头像、${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班。`,
+      `删除 ${room.code} 号直播间「${room.name}」？\n\n将永久删除该直播间的头像、${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班。后面的直播间房号将依次前移。`,
     );
     if (confirmed) changeRoom(room, { method: "DELETE", success: "已删除直播间。" });
   }
@@ -169,28 +163,27 @@ export function RoomManagement({ api, csrfToken }) {
     event.preventDefault();
     if (!merging?.targetCode) return;
     const { targetCode } = merging;
-    if (!window.confirm(`保留 ${targetCode} 号「${room.name}」？\n\n${room.code} 号的 ${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班将并入 ${targetCode} 号，完成后列表只显示保留的编号。`)) return;
+    if (!window.confirm(`合并到当前 ${targetCode} 号「${room.name}」？\n\n${room.code} 号的 ${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班会一并转入。合并后房号会重新排为连续编号。`)) return;
     changeRoom(room, {
       method: "POST", resource: "/merge", contentType: "application/json",
-      body: JSON.stringify({ targetCode }), success: `已合并到 ${targetCode} 号直播间。`,
+      body: JSON.stringify({ targetCode }), success: "已合并直播间并更新房号。",
     });
   }
 
   return (
     <section className="admin-card room-management" id="room-management-panel" role="tabpanel" aria-labelledby="room-management-tab">
       <div className="admin-card-heading">
-        <div><h2>直播间管理</h2><p>按房号排列，左侧序号随列表更新。</p></div>
+        <div><h2>直播间管理</h2><p>房号连续排列。删除直播间后，后面的房号依次前移。</p></div>
       </div>
       <input ref={fileInput} type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" onChange={selectAvatar} hidden />
       {message && <p className={"form-message" + (message.error ? " form-error" : "")} role={message.error ? "alert" : "status"}>{message.text}</p>}
       {data?.rooms.length > 0 ? (
         <ul className="room-management-list">
-          {data.rooms.map((room, index) => {
+          {data.rooms.map((room) => {
             const targets = (data.duplicateGroups?.find((codes) => codes.includes(room.code)) ?? []).filter((code) => code !== room.code);
             return (
-              <li className="room-management-row" key={room.code}>
+              <li className="room-management-row" key={room.roomId ?? room.code}>
                 <div className="room-management-identity">
-                  <RoomListPosition index={index} />
                   <RoomAvatar room={room} />
                   <div>
                     <h3>{room.code} 号 · {room.name}</h3>
