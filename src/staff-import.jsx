@@ -25,20 +25,17 @@ function ImportIssues({ errors, warnings }) {
   ));
 }
 
-function ShiftDetails({ label, shifts, previous }) {
+function ShiftDetails({ label, shifts, previous, preserve = false }) {
   return (
     <div className="staff-shifts">
       <h4>{label}排班</h4>
-      {shifts.length > 0 ? (
+      {preserve ? <p>沿用已录入的助播排班</p> : shifts.length > 0 ? (
         <ul>
           {shifts.map((shift) => (
             <li key={shift.start + "-" + shift.end}>
               <time>{shift.start}–{shift.overnight && "次日 "}{shift.end}</time>
               <strong>{shift.person}</strong>
               <small>{shift.sourceSheet} 第 {shift.sourceRow} 行</small>
-              {shift.assistant && (
-                <span className="staff-shift-merch"><small>助播</small> <span>{shift.assistant}</span></span>
-              )}
               {shift.featuredProducts?.length > 0 && (
                 <span className="staff-shift-merch"><small>主推商品</small> <span>{shift.featuredProducts.join("、")}</span></span>
               )}
@@ -58,13 +55,14 @@ function ImportPreview({ preview }) {
   return (
     <section className="upload-preview" aria-label="排班导入预览">
       <h3>导入预览</h3>
-      <p>确认后，以下房间和日期的主播与导演排班会整体替换。</p>
+      <p>确认后，按直播间、日期和角色替换下列排班。</p>
       <div className="import-summary">
         <span><strong>{summary.roomCount}</strong> 个直播间</span>
         <span><DateRange summary={summary} /></span>
         <span><strong>{summary.dateCount}</strong> 个房间日期组合</span>
         <span>主播 <strong>{summary.scheduleCount}</strong> 场</span>
         <span>导演 <strong>{summary.directorShiftCount}</strong> 班</span>
+        <span>助播 <strong>{summary.assistantShiftCount}</strong> 班</span>
         {summary.skippedCount > 0 && <span>跳过 <strong>{summary.skippedCount}</strong> 项</span>}
       </div>
       <div className="staff-preview-rooms">
@@ -85,12 +83,15 @@ function ImportPreview({ preview }) {
                   <span>{day.date}</span>
                   <span>主播 {day.previousHostCount} → {day.hostShifts.length} 场</span>
                   <span>导演 {day.previousDirectorCount} → {day.directorShifts.length} 班</span>
+                  <span>{day.replacesAssistants ? `助播 ${day.previousAssistantCount} → ${day.assistantShifts.length} 班` : "助播沿用原排班"}</span>
                   {day.previousHostCount > 0 && day.hostShifts.length === 0 && <strong>将清空主播</strong>}
                   {day.previousDirectorCount > 0 && day.directorShifts.length === 0 && <strong>将清空导演</strong>}
+                  {day.replacesAssistants && day.previousAssistantCount > 0 && day.assistantShifts.length === 0 && <strong>将清空助播</strong>}
                 </summary>
                 <div className="staff-shift-grid">
                   <ShiftDetails label="主播" shifts={day.hostShifts} previous={day.previousHostCount} />
                   <ShiftDetails label="导演" shifts={day.directorShifts} previous={day.previousDirectorCount} />
+                  <ShiftDetails label="助播" shifts={day.assistantShifts} previous={day.previousAssistantCount} preserve={!day.replacesAssistants} />
                 </div>
               </details>
             ))}
@@ -250,7 +251,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
     <section className="admin-card" role="tabpanel" hidden={hidden}>
       <div className="admin-card-heading">
         <div className="admin-icon" aria-hidden="true">↥</div>
-        <div><h2>导入员工排班表</h2><p>支持一个工作簿包含多位负责人的排班，按表内直播间号码或名称及日期汇总。</p></div>
+        <div><h2>导入员工排班表</h2><p>按直播间和日期汇总工作簿。主播、导演和助播分别填写自己的时段。</p></div>
       </div>
       {!result && (
         <form className={"upload-form staff-import-form" + (!preview && needsMatching ? " staff-matching-active" : "")}
@@ -289,7 +290,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
       )}
       {result && (
         <div role="status" className="form-message form-success staff-import-success">
-          已导入 {result.roomCount} 个直播间（<DateRange summary={result} />），共 {result.scheduleCount} 场主播、{result.directorShiftCount} 班导演。
+          已导入 {result.roomCount} 个直播间（<DateRange summary={result} />），共 {result.scheduleCount} 场主播、{result.directorShiftCount} 班导演、{result.assistantShiftCount} 班助播。
           <div className="upload-preview-actions">
             <button className="avatar-secondary-button" type="button" onClick={() => resetFile(null)}>继续导入</button>
             <button className="button-primary upload-button" type="button" onClick={onViewRecords}>查看已录入排班</button>

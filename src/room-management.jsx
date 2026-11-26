@@ -154,7 +154,7 @@ export function RoomManagement({ api, csrfToken }) {
 
   function deleteRoom(room) {
     const confirmed = window.confirm(
-      `删除 ${room.code} 号直播间「${room.name}」？\n\n将永久删除该直播间的头像、${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班。后面的直播间房号将依次前移。`,
+      `删除 ${room.code} 号直播间「${room.name}」？\n\n将永久删除该直播间的头像、${room.scheduleCount} 场主播排班、${room.directorShiftCount} 班导演排班和 ${room.assistantShiftCount} 班助播排班。后面的直播间房号将依次前移。`,
     );
     if (confirmed) changeRoom(room, { method: "DELETE", success: "已删除直播间。" });
   }
@@ -163,7 +163,7 @@ export function RoomManagement({ api, csrfToken }) {
     event.preventDefault();
     if (!merging?.targetCode) return;
     const { targetCode } = merging;
-    if (!window.confirm(`合并到当前 ${targetCode} 号「${room.name}」？\n\n${room.code} 号的 ${room.scheduleCount} 场主播排班和 ${room.directorShiftCount} 班导演排班会一并转入。合并后房号会重新排为连续编号。`)) return;
+    if (!window.confirm(`合并到当前 ${targetCode} 号「${room.name}」？\n\n${room.code} 号的 ${room.scheduleCount} 场主播排班、${room.directorShiftCount} 班导演排班和 ${room.assistantShiftCount} 班助播排班会一并转入。合并后房号会重新排为连续编号。`)) return;
     changeRoom(room, {
       method: "POST", resource: "/merge", contentType: "application/json",
       body: JSON.stringify({ targetCode }), success: "已合并直播间并更新房号。",
@@ -187,7 +187,7 @@ export function RoomManagement({ api, csrfToken }) {
                   <RoomAvatar room={room} />
                   <div>
                     <h3>{room.code} 号 · {room.name}</h3>
-                    <p>{room.scheduleCount} 场主播 · {room.directorShiftCount} 班导演</p>
+                    <p>{room.scheduleCount} 场主播 · {room.directorShiftCount} 班导演 · {room.assistantShiftCount} 班助播</p>
                   </div>
                 </div>
                 <div className="room-management-actions">

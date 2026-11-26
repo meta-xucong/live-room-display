@@ -26,7 +26,7 @@ export function compactRoomCodes(db) {
 
   db.exec("PRAGMA defer_foreign_keys=ON");
   const moveRoom = db.prepare("UPDATE rooms SET code=? WHERE code=?");
-  const moveData = ["slots", "director_shifts", "room_avatars", "room_aliases", "room_identities"]
+  const moveData = ["slots", "director_shifts", "assistant_shifts", "room_avatars", "room_aliases", "room_identities"]
     .map((table) => db.prepare(`UPDATE ${table} SET room_code=? WHERE room_code=?`));
   const move = (from, to) => {
     moveRoom.run(to, from);

@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseXlsx, cellHasFormula, cellValue } from "./server/xlsx.mjs";
-import { NUMBERED_ROOM_CODES, normalizeStaffShifts, parseStaffSchedule, roomNameKey } from "./server/staff-schedule.mjs";
+import { NUMBERED_ROOM_CODES, normalizeStaffShifts, parseStaffSchedule, roomNameKey, scheduleRange } from "./server/staff-schedule.mjs";
 import { mergeRoom } from "./server/room-merge.mjs";
 import { availableRoomCodes, compactRoomCodes, compareRoomCodes } from "./server/room-numbers.mjs";
 
@@ -64,6 +64,7 @@ db.exec(`
     products_json TEXT NOT NULL DEFAULT '[]', sales_target_cents INTEGER, sales_target_text TEXT,
     notes TEXT NOT NULL DEFAULT '', photo_type TEXT, photo_blob BLOB
   );
+  CREATE INDEX IF NOT EXISTS slots_room_date_start ON slots(room_code,date,starts_at);
   CREATE TABLE IF NOT EXISTS director_shifts (
     id TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
     date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
@@ -71,6 +72,19 @@ db.exec(`
     director TEXT NOT NULL DEFAULT ''
   );
   CREATE INDEX IF NOT EXISTS director_shifts_room_date_start ON director_shifts(room_code,date,starts_at);
+  CREATE TABLE IF NOT EXISTS assistant_shifts (
+    id TEXT PRIMARY KEY, room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,
+    date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+    starts_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, assistant TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS assistant_shifts_room_date_start ON assistant_shifts(room_code,date,starts_at);
+  CREATE VIEW IF NOT EXISTS effective_assistant_shifts AS
+    SELECT id,room_code,date,start_time,end_time,starts_at,ends_at,assistant FROM assistant_shifts
+    UNION ALL
+    SELECT 'legacy-assistant-' || s.id,s.room_code,s.date,s.start_time,s.end_time,s.starts_at,s.ends_at,s.assistant
+    FROM slots s WHERE TRIM(s.assistant) <> '' AND NOT EXISTS (
+      SELECT 1 FROM assistant_shifts a WHERE a.room_code=s.room_code AND a.date=s.date
+    );
   CREATE TABLE IF NOT EXISTS host_avatars (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
     photo_type TEXT, photo_blob BLOB, photo_hash TEXT,
@@ -639,7 +653,7 @@ function resolveStaffRooms(source, bindings) {
         target = {
           code, name: byCode.get(code)?.name ?? room.name, sourceName: room.name, sheetName: room.sheetName,
           isNew: !byCode.has(code), automatic, sourceNames: [], aliasKeys: [], numberSources: [],
-          dates: new Map(), hostShifts: [], directorShifts: [],
+          dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
         };
         targets.set(code, target);
       }
@@ -654,9 +668,14 @@ function resolveStaffRooms(source, bindings) {
       for (const [requestedCode, location] of room.codeSources) {
         target.numberSources.push({ name: room.name, requestedCode, ...location });
       }
-      for (const [date, group] of room.dates) target.dates.set(date, group);
+      for (const [date, group] of room.dates) {
+        target.dates.set(date, {
+          ...group, managesAssistants: group.managesAssistants || Boolean(target.dates.get(date)?.managesAssistants),
+        });
+      }
       target.hostShifts.push(...room.hostShifts);
       target.directorShifts.push(...room.directorShifts);
+      target.assistantShifts.push(...room.assistantShifts);
     }
     return {
       sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
@@ -682,11 +701,13 @@ function staffImportConflicts(rooms) {
     for (const [incoming, table, role] of [
       [room.directorShifts, "director_shifts", "导演"],
       [room.hostShifts, "slots", "主播"],
+      [room.assistantShifts, "effective_assistant_shifts", "助播"],
     ]) {
       const query = db.prepare("SELECT date,start_time,end_time FROM " + table
         + " WHERE room_code=? AND starts_at<? AND ends_at>?");
       for (const shift of incoming) {
-        const conflict = query.all(room.code, shift.endAt, shift.startAt).find((previous) => !room.dates.has(previous.date));
+        const conflict = query.all(room.code, shift.endAt, shift.startAt).find((previous) => role === "助播"
+          ? !room.dates.get(previous.date)?.managesAssistants : !room.dates.has(previous.date));
         if (conflict) errors.push({
           sheet: shift.sourceSheet, row: shift.sourceRow, field: role + "时间", room: room.sourceName, date: shift.date,
           message: "与未更新日期的现有排班 " + conflict.date + " " + conflict.start_time + "–" + conflict.end_time + " 重叠",
@@ -706,18 +727,56 @@ function staffImportSummary(rooms, warnings) {
     lastDate: days.at(-1),
     scheduleCount: rooms.reduce((sum, room) => sum + room.hostShifts.length, 0),
     directorShiftCount: rooms.reduce((sum, room) => sum + room.directorShifts.length, 0),
+    assistantShiftCount: rooms.reduce((sum, room) => sum + room.assistantShifts.length, 0),
     skippedCount: warnings.length,
   };
 }
 
 const shiftKey = (start, end, person) => JSON.stringify([start, end, person]);
 
+function assistantShiftsFor(roomCode, date, secondDate = date) {
+  return db.prepare(`SELECT * FROM effective_assistant_shifts
+    WHERE room_code=? AND date IN (?,?) ORDER BY starts_at`).all(roomCode, date, secondDate);
+}
+
+function replaceAssistantShifts(roomCode, date, shifts) {
+  const previous = new Map(assistantShiftsFor(roomCode, date).map((shift) => [
+    shiftKey(shift.start_time, shift.end_time, shift.assistant), shift.id,
+  ]));
+  db.prepare("DELETE FROM assistant_shifts WHERE room_code=? AND date=?").run(roomCode, date);
+  db.prepare("UPDATE slots SET assistant='' WHERE room_code=? AND date=? AND assistant<>''").run(roomCode, date);
+  const insert = db.prepare(`INSERT INTO assistant_shifts(
+    id,room_code,date,start_time,end_time,starts_at,ends_at,assistant
+  ) VALUES (?,?,?,?,?,?,?,?)`);
+  for (const shift of shifts) {
+    const id = previous.get(shiftKey(shift.start, shift.end, shift.assistant)) ?? shift.id;
+    insert.run(id, roomCode, date, shift.start, shift.end, shift.startAt, shift.endAt, shift.assistant);
+  }
+}
+
+function editableAssistantShifts(roomCode, date, input) {
+  const shifts = input.map((shift, index) => {
+    const assistant = typeof shift?.assistant === "string" ? cleanMcpField(shift.assistant, "助播姓名", 80) : "";
+    const range = scheduleRange(`${excelTime(shift?.start)}-${excelTime(shift?.end)}`, date);
+    if (!range || !assistant) throw new Error(`第 ${index + 1} 个助播班次须填写有效时段和姓名`);
+    return { ...range, assistant, id: randomBytes(16).toString("hex") };
+  }).sort((a, b) => a.startAt - b.startAt);
+  const findConflict = db.prepare(`SELECT date,start_time,end_time FROM effective_assistant_shifts
+    WHERE room_code=? AND date<>? AND starts_at<? AND ends_at>? LIMIT 1`);
+  for (const [index, shift] of shifts.entries()) {
+    if (index > 0 && shift.startAt < shifts[index - 1].endAt) throw new Error("当天的助播排班时段重叠");
+    const conflict = findConflict.get(roomCode, date, shift.endAt, shift.startAt);
+    if (conflict) throw new Error(`与 ${conflict.date} 的助播排班 ${conflict.start_time}–${conflict.end_time} 重叠`);
+  }
+  return shifts;
+}
+
 function staffPreviewRooms(rooms) {
-  const findHosts = db.prepare(`SELECT start_time,end_time,host,assistant,products_json,sales_target_cents,sales_target_text
+  const findHosts = db.prepare(`SELECT start_time,end_time,host,products_json,sales_target_cents,sales_target_text
     FROM slots WHERE room_code=? AND date=?`);
   const oldDirectorCount = db.prepare("SELECT COUNT(*) AS count FROM director_shifts WHERE room_code=? AND date=?");
-  const displayShift = ({ host, director, start, end, overnight, sourceSheet, sourceRow }) =>
-    ({ person: host ?? director, start, end, overnight, sourceSheet, sourceRow });
+  const displayShift = ({ host, director, assistant, start, end, overnight, sourceSheet, sourceRow }) =>
+    ({ person: host ?? director ?? assistant, start, end, overnight, sourceSheet, sourceRow });
   return rooms.map((room) => ({
     code: room.code, name: room.name, sourceName: room.sourceName, sourceNames: room.sourceNames,
     isNew: room.isNew, numberConflicts: room.numberConflicts,
@@ -728,16 +787,18 @@ function staffPreviewRooms(rooms) {
         date,
         previousHostCount: previousHosts.length,
         previousDirectorCount: oldDirectorCount.get(room.code, date).count,
+        previousAssistantCount: assistantShiftsFor(room.code, date).length,
+        replacesAssistants: room.dates.get(date).managesAssistants,
         hostShifts: room.hostShifts.filter((shift) => shift.date === date).map((shift) => {
           const old = byHost.get(shiftKey(shift.start, shift.end, shift.host));
           return {
             ...displayShift(shift),
-            assistant: shift.assistant ?? old?.assistant ?? "",
             featuredProducts: shift.products ?? JSON.parse(old?.products_json ?? "[]"),
             salesTarget: shift.salesTarget ?? slotSalesTarget(old),
           };
         }),
         directorShifts: room.directorShifts.filter((shift) => shift.date === date).map(displayShift),
+        assistantShifts: room.assistantShifts.filter((shift) => shift.date === date).map(displayShift),
       };
     }),
   }));
@@ -784,20 +845,27 @@ function commitStaffImport(id, userId) {
     for (const room of preview.rooms) {
       if (room.isNew) insertRoom.run(room.code, room.name, room.sheetName, roomOrder++);
       for (const key of room.aliasKeys) insertAlias.run(key, room.code);
-      for (const date of room.dates.keys()) {
+      for (const [date, { managesAssistants }] of room.dates) {
         const oldHosts = new Map(findHosts.all(room.code, date).map((slot) => [
           shiftKey(slot.start_time, slot.end_time, slot.host), slot,
         ]));
         const oldDirectors = new Map(findDirectors.all(room.code, date).map((shift) => [
           shiftKey(shift.start_time, shift.end_time, shift.director), shift,
         ]));
+        if (managesAssistants) {
+          replaceAssistantShifts(room.code, date, room.assistantShifts.filter((shift) => shift.date === date));
+        } else {
+          db.prepare(`INSERT INTO assistant_shifts
+            SELECT * FROM effective_assistant_shifts WHERE room_code=? AND date=? AND id LIKE 'legacy-assistant-%'
+            ON CONFLICT(id) DO NOTHING`).run(room.code, date);
+        }
         deleteHosts.run(room.code, date);
         deleteDirectors.run(room.code, date);
         for (const slot of room.hostShifts.filter((shift) => shift.date === date)) {
           const old = oldHosts.get(shiftKey(slot.start, slot.end, slot.host));
           insertHost.run(
             old?.id ?? slot.id, room.code, date, slot.start, slot.end, slot.startAt, slot.endAt,
-            slot.host, slot.assistant ?? old?.assistant ?? "",
+            slot.host, managesAssistants ? "" : old?.assistant ?? "",
             slot.products === undefined ? old?.products_json ?? "[]" : JSON.stringify(slot.products),
             slot.salesTarget === undefined ? old?.sales_target_cents ?? null : null,
             slot.salesTarget ?? old?.sales_target_text ?? null,
@@ -971,6 +1039,13 @@ function publicDirectorShift(shift) {
   };
 }
 
+function publicAssistantShift(shift) {
+  return {
+    id: shift.id, date: shift.date, start: shift.start_time, end: shift.end_time,
+    assistant: shift.assistant, startsAt: shift.starts_at, endsAt: shift.ends_at,
+  };
+}
+
 function avatarLibraryPayload() {
   const usage = new Map();
   for (const row of db.prepare("SELECT host,COUNT(*) AS count FROM slots WHERE host<>'' GROUP BY host").all()) {
@@ -1002,6 +1077,8 @@ function adminSchedulePayload() {
   const rooms = roomList().map(({ code, name, sortOrder }) => ({ code, name, sortOrder }));
   const rows = db.prepare("SELECT s.*,r.name AS room_name FROM slots s JOIN rooms r ON r.code=s.room_code").all();
   const directorRows = db.prepare("SELECT d.*,r.name AS room_name FROM director_shifts d JOIN rooms r ON r.code=d.room_code").all();
+  const assistantRows = db.prepare(`SELECT a.*,r.name AS room_name
+    FROM effective_assistant_shifts a JOIN rooms r ON r.code=a.room_code`).all();
   const groups = new Map();
   const groupFor = (row) => {
     const key = `${row.room_code}\u0000${row.date}`;
@@ -1014,24 +1091,26 @@ function adminSchedulePayload() {
     const { avatar, hasLegacyPhoto } = slotHostAvatar(row);
     groupFor(row).slots.push({
       id: row.id, kind: "host", start: row.start_time, end: row.end_time,
-      host: row.host, assistant: row.assistant,
+      host: row.host, assistant: "",
       featuredProducts: JSON.parse(row.products_json), salesTarget: slotSalesTarget(row), notes: row.notes,
       hasAvatar: Boolean(avatar?.photo_type) || hasLegacyPhoto,
       avatarSource: avatar?.photo_type ? "头像库" : hasLegacyPhoto ? "本场照片" : "未配置",
     });
   }
-  for (const row of directorRows) {
-    groupFor(row).slots.push({
-      id: row.id, kind: "director", start: row.start_time, end: row.end_time,
-      director: row.director, host: "", assistant: "", featuredProducts: [], salesTarget: "", notes: "",
-      hasAvatar: false, avatarSource: "未配置",
-    });
+  for (const [kind, roleRows] of [["director", directorRows], ["assistant", assistantRows]]) {
+    for (const row of roleRows) {
+      groupFor(row).slots.push({
+        id: row.id, kind, start: row.start_time, end: row.end_time,
+        director: row.director ?? "", host: "", assistant: row.assistant ?? "", featuredProducts: [], salesTarget: "", notes: "",
+        hasAvatar: false, avatarSource: "未配置",
+      });
+    }
   }
   for (const group of groups.values()) group.slots.sort((a, b) => a.start.localeCompare(b.start) || a.kind.localeCompare(b.kind));
   const orderedGroups = [...groups.values()].sort((a, b) => b.date.localeCompare(a.date) || compareRoomCodes(a.roomCode, b.roomCode));
   return {
     rooms, groups: orderedGroups, scheduleCount: rows.length,
-    directorShiftCount: directorRows.length, dataUpdatedAt: updatedAtValue(),
+    directorShiftCount: directorRows.length, assistantShiftCount: assistantRows.length, dataUpdatedAt: updatedAtValue(),
   };
 }
 
@@ -1046,7 +1125,7 @@ const mcpTools = [
   {
     name: "get_room_schedule",
     title: "查看当日排班",
-    description: "查看指定直播间某一天独立的导演排班与主播排班。导演和主播时段不要求一一对应；助播跟随主播。主播头像会按姓名从头像库匹配。日期必须由用户提供或确认。只读。",
+    description: "查看指定直播间某一天的导演、主播和助播排班，各角色按自己的时段列出。主播头像会按姓名从头像库匹配。日期必须由用户提供或确认。只读。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "date"],
       properties: {
@@ -1172,7 +1251,8 @@ function nextDataUpdatedAt() {
 function roomList(includeCounts = false) {
   const counts = includeCounts ? `,
     (SELECT COUNT(*) FROM slots s WHERE s.room_code=r.code) AS scheduleCount,
-    (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount` : "";
+    (SELECT COUNT(*) FROM director_shifts d WHERE d.room_code=r.code) AS directorShiftCount,
+    (SELECT COUNT(*) FROM effective_assistant_shifts a WHERE a.room_code=r.code) AS assistantShiftCount` : "";
   return db.prepare(`SELECT r.code,r.name,a.version AS avatarVersion,i.id AS roomId,i.legacy_code AS legacyCode${counts}
     FROM rooms r JOIN room_identities i ON i.room_code=r.code LEFT JOIN room_avatars a ON a.room_code=r.code`).all()
     .sort((a, b) => compareRoomCodes(a.code, b.code))
@@ -1675,7 +1755,10 @@ async function callMcpTool(name, args, token) {
     const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=? ORDER BY starts_at").all(roomCode, date).map((shift) => ({
       start: shift.start_time, end: shift.end_time, director: shift.director,
     }));
-    return mcpToolResult({ room, date, directorShifts, hostShifts });
+    const assistantShifts = assistantShiftsFor(roomCode, date).map(({ start_time, end_time, assistant }) => ({
+      start: start_time, end: end_time, assistant,
+    }));
+    return mcpToolResult({ room, date, directorShifts, hostShifts, assistantShifts });
   }
   if (name === "preview_schedule_update") {
     const scheduleText = fixedScheduleTextFromMcp(args);
@@ -1916,12 +1999,18 @@ async function handle(request, response) {
     if (!Array.isArray(input.directorShifts) || !Array.isArray(input.hostShifts)) {
       return error(response, 400, "INVALID_REQUEST", "必须分别提供完整的导演班次和主播场次列表");
     }
+    const replacesAssistants = Object.hasOwn(input, "assistantShifts");
+    if (replacesAssistants && !Array.isArray(input.assistantShifts)) {
+      return error(response, 400, "INVALID_REQUEST", "助播排班须以完整列表提供");
+    }
     if (typeof input.dataUpdatedAt !== "string" || input.dataUpdatedAt !== updatedAtValue()) {
       return error(response, 409, "SCHEDULES_CHANGED", "排班数据已被其他操作更新，请刷新列表后重新修改");
     }
 
-    const hostInput = Array.isArray(input.hostShifts) ? input.hostShifts : [];
-    const directorInput = Array.isArray(input.directorShifts) ? input.directorShifts : [];
+    const hostInput = input.hostShifts;
+    const directorInput = input.directorShifts;
+    const count = hostInput.length + directorInput.length + (input.assistantShifts?.length ?? 0);
+    if (count < 1 || count > 100) return error(response, 422, "SCHEDULE_INVALID", "每天请提供 1 至 100 个排班时段");
     const originalNotes = hostInput.map((slot) => typeof slot?.notes === "string" ? slot.notes.trim() : "");
     if (hostInput.some((slot) =>
       (slot?.salesTarget != null && !["string", "number"].includes(typeof slot.salesTarget)) ||
@@ -1945,19 +2034,26 @@ async function handle(request, response) {
       return error(response, 422, "SCHEDULE_INVALID", "备注不能超过 500 个字符");
     }
     let parsed;
-    let preview;
+    let assistantShifts;
     let sourceHostByKey;
     let sourceDirectorByKey;
     try {
-      const scheduleText = fixedScheduleTextFromMcp(editPayload);
-      parsed = validateFixedScheduleText(scheduleText);
+      if (hostInput.length || directorInput.length) {
+        parsed = validateFixedScheduleText(fixedScheduleTextFromMcp(editPayload));
+      } else {
+        const date = cleanMcpField(input.date, "日期", 10);
+        const roomCode = cleanMcpField(input.roomCode, "直播间编号", 40);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("请提供有效排班日期，格式为 YYYY-MM-DD");
+        parsed = { roomCode, date, result: { errors: [], rooms: [{ hostShifts: [], directorShifts: [] }] } };
+      }
       if (parsed.result.errors.length) {
         return json(response, 422, { error: { code: "SCHEDULE_INVALID", message: "排班内容未通过校验，请修正后重试", details: parsed.result.errors } });
       }
       if (!db.prepare("SELECT code FROM rooms WHERE code=?").get(parsed.roomCode)) {
         return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
       }
-      preview = mcpPreviewFor(parsed);
+      if (hostInput.length || directorInput.length) mcpPreviewFor(parsed);
+      if (replacesAssistants) assistantShifts = editableAssistantShifts(parsed.roomCode, parsed.date, input.assistantShifts);
       sourceHostByKey = new Map(hostInput.map((slot, index) => [
         `${excelTime(slot.start)}\u0000${excelTime(slot.end)}\u0000${String(slot.host ?? "").trim()}`,
         { id: slot.id, products: slot.featuredProducts ?? [], salesTarget: String(slot.salesTarget ?? ""), notes: originalNotes[index] },
@@ -1984,6 +2080,7 @@ async function handle(request, response) {
         `${shift.start_time}\u0000${shift.end_time}\u0000${shift.director}`, shift,
       ]));
       const previousDirectorById = new Map(previousDirectors.map((shift) => [shift.id, shift]));
+      if (replacesAssistants) replaceAssistantShifts(parsed.roomCode, parsed.date, assistantShifts);
       db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
       const insertSlot = db.prepare(`INSERT INTO slots(
@@ -2001,7 +2098,7 @@ async function handle(request, response) {
           ?? previousByHostKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
         insertSlot.run(
           previous?.id ?? priorById?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          "", slot.host, slot.assistant, JSON.stringify(source?.products ?? slot.products), source?.salesTarget ?? slot.salesTarget,
+          "", slot.host, replacesAssistants ? "" : slot.assistant, JSON.stringify(source?.products ?? slot.products), source?.salesTarget ?? slot.salesTarget,
           source?.notes ?? slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
@@ -2027,7 +2124,8 @@ async function handle(request, response) {
     }
     return json(response, 200, {
       ok: true, roomCode: parsed.roomCode, date: parsed.date,
-      scheduleCount: preview.scheduleCount, directorShiftCount: preview.directorShiftCount, dataUpdatedAt: updateAt,
+      scheduleCount: hostInput.length, directorShiftCount: directorInput.length,
+      assistantShiftCount: assistantShiftsFor(parsed.roomCode, parsed.date).length, dataUpdatedAt: updateAt,
     });
 
   }
@@ -2257,11 +2355,12 @@ async function handle(request, response) {
     const { today, yesterday } = currentShanghaiDay();
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date IN (?,?) ORDER BY starts_at").all(code, today, yesterday).map(publicSlot);
     const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date IN (?,?) ORDER BY starts_at").all(code, today, yesterday).map(publicDirectorShift);
+    const assistantShifts = assistantShiftsFor(code, today, yesterday).map(publicAssistantShift);
     const dataUpdatedAt = db.prepare("SELECT value FROM app_state WHERE key='data_updated_at'").get().value;
-    const transitions = [...schedule, ...directorShifts].flatMap((shift) => [shift.startsAt, shift.endsAt]).filter((value) => value > Date.now());
+    const transitions = [...schedule, ...directorShifts, ...assistantShifts].flatMap((shift) => [shift.startsAt, shift.endsAt]).filter((value) => value > Date.now());
     return json(response, 200, {
       dataUpdatedAt, serverNow: new Date().toISOString(), timeZone: "Asia/Shanghai",
-      room, schedule, directorShifts, nextTransitionAt: transitions.length ? Math.min(...transitions) : null,
+      room, schedule, directorShifts, assistantShifts, nextTransitionAt: transitions.length ? Math.min(...transitions) : null,
     });
   }
 
@@ -2274,7 +2373,8 @@ async function handle(request, response) {
     if (!room) return error(response, 404, "ROOM_NOT_FOUND", "直播间不存在");
     const schedule = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=? ORDER BY starts_at").all(room.code, date).map(publicSlot);
     const directorShifts = db.prepare("SELECT * FROM director_shifts WHERE room_code=? AND date=? ORDER BY starts_at").all(room.code, date).map(publicDirectorShift);
-    return json(response, 200, { date, schedule, directorShifts });
+    const assistantShifts = assistantShiftsFor(room.code, date).map(publicAssistantShift);
+    return json(response, 200, { date, schedule, directorShifts, assistantShifts });
   }
 
   if (request.method === "POST" && ["/api/v1/integrations/schedule-text/preview", "/api/v1/integrations/schedule-text/commit"].includes(pathname)) {

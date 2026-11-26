@@ -662,6 +662,8 @@ function McpKeyManager({ csrfToken }) {
   );
 }
 
+const scheduleRoleLabels = { host: "主播", director: "导演", assistant: "助播" };
+
 function AdminScheduleLibrary({ csrfToken }) {
   const [data, setData] = useState(null);
   const [now, setNow] = useState(() => Date.now());
@@ -706,7 +708,7 @@ function AdminScheduleLibrary({ csrfToken }) {
       if (roomFilter !== "all" && group.roomCode !== roomFilter) return [];
       if (dateFilter && group.date !== dateFilter) return [];
       const slots = group.slots.filter((slot) => !query || [
-        slot.kind === "director" ? "导演排班" : "主播排班",
+        `${scheduleRoleLabels[slot.kind]}排班`,
         slot.start, slot.end, slot.director, slot.host, slot.assistant, slot.salesTarget, slot.notes,
         ...slot.featuredProducts,
       ].some((value) => String(value ?? "").toLocaleLowerCase("zh-CN").includes(query)));
@@ -764,11 +766,8 @@ function AdminScheduleLibrary({ csrfToken }) {
                     <form className="schedule-edit-form" onSubmit={(event) => saveEdit(event, group, slot)}>
                       <label>开始时间<input type="time" value={editValues.start} onChange={(event) => updateEdit("start", event.target.value)} required /></label>
                       <label>结束时间<input type="time" value={editValues.end} onChange={(event) => updateEdit("end", event.target.value)} required /></label>
-                      {slot.kind === "director" ? (
-                        <label>导演<input value={editValues.director} maxLength={80} onChange={(event) => updateEdit("director", event.target.value)} /></label>
-                      ) : <>
-                        <label>主播<input value={editValues.host} maxLength={80} onChange={(event) => updateEdit("host", event.target.value)} /></label>
-                        <label>助播<input value={editValues.assistant} maxLength={80} onChange={(event) => updateEdit("assistant", event.target.value)} /></label>
+                      <label>{scheduleRoleLabels[slot.kind]}<input value={editValues[slot.kind]} maxLength={80} onChange={(event) => updateEdit(slot.kind, event.target.value)} required /></label>
+                      {slot.kind === "host" && <>
                         <label className="schedule-edit-wide">主推商品（逗号或换行分隔）<textarea value={editValues.products} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
                         <label>目标销售额<textarea value={editValues.salesTarget} rows={2} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="按原文显示" /></label>
                         <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
@@ -779,7 +778,7 @@ function AdminScheduleLibrary({ csrfToken }) {
                 </tr>
               ) : (
                 <tr key={slot.id}>
-                  <td>{slot.kind === "director" ? "导演排班" : "主播排班"}</td><td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
+                  <td>{scheduleRoleLabels[slot.kind]}排班</td><td className="schedule-time-cell">{slot.start}–{slot.end}</td><td>{slot.director || "—"}</td><td>{slot.host || "—"}</td><td>{slot.assistant || "—"}</td>
                   <td className="schedule-products-cell">{slot.featuredProducts.length ? slot.featuredProducts.join("、") : "—"}</td><td className="schedule-target-cell">{slot.salesTarget || "—"}</td>
                   <td>{slot.kind === "host" ? <span className={`schedule-avatar-status${slot.hasAvatar ? " ready" : " missing"}`}>{slot.hasAvatar ? slot.avatarSource : "未配置"}</span> : "—"}</td><td className="schedule-notes-cell">{slot.notes || "—"}</td>
                   <td><button className="avatar-text-button schedule-edit-button" type="button" onClick={() => beginEdit(group, slot)}>编辑</button></td>
@@ -802,22 +801,23 @@ function AdminScheduleLibrary({ csrfToken }) {
     if (saving || !editValues) return;
     setSaving(true);
     setMessage("");
-    const updatedSlot = slot.kind === "director" ? {
-      ...slot, start: editValues.start, end: editValues.end, director: editValues.director,
-    } : {
-      ...slot, start: editValues.start, end: editValues.end, host: editValues.host, assistant: editValues.assistant,
-      featuredProducts: editValues.products === slot.featuredProducts.join("\n")
+    const updatedSlot = { ...slot, start: editValues.start, end: editValues.end, [slot.kind]: editValues[slot.kind] };
+    if (slot.kind === "host") {
+      updatedSlot.featuredProducts = editValues.products === slot.featuredProducts.join("\n")
         ? slot.featuredProducts
-        : editValues.products.split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean),
-      salesTarget: editValues.salesTarget, notes: editValues.notes,
-    };
+        : editValues.products.split(/[\r\n,，]+/).map((item) => item.trim()).filter(Boolean);
+      updatedSlot.salesTarget = editValues.salesTarget;
+      updatedSlot.notes = editValues.notes;
+    }
     // Filters can hide siblings, so submit the complete unfiltered day from the source payload.
     const completeGroup = data.groups.find((item) => item.roomCode === group.roomCode && item.date === group.date);
     const completeSlots = completeGroup.slots.map((item) => item.id === slot.id ? updatedSlot : item);
     const directorShifts = completeSlots.filter((item) => item.kind === "director")
       .map(({ id, start, end, director }) => ({ id, start, end, director }));
     const hostShifts = completeSlots.filter((item) => item.kind === "host")
-      .map(({ id, start, end, host, assistant, featuredProducts, salesTarget, notes }) => ({ id, start, end, host, assistant, featuredProducts, salesTarget, notes }));
+      .map(({ id, start, end, host, featuredProducts, salesTarget, notes }) => ({ id, start, end, host, featuredProducts, salesTarget, notes }));
+    const assistantShifts = completeSlots.filter((item) => item.kind === "assistant")
+      .map(({ start, end, assistant }) => ({ start, end, assistant }));
     try {
       await api("/api/v1/admin/schedules", {
         method: "PUT",
@@ -828,6 +828,7 @@ function AdminScheduleLibrary({ csrfToken }) {
           dataUpdatedAt: data.dataUpdatedAt,
           directorShifts,
           hostShifts,
+          assistantShifts,
         }),
       });
       await loadSchedules();
@@ -863,7 +864,7 @@ function AdminScheduleLibrary({ csrfToken }) {
         <label>直播间<select value={roomFilter} onChange={(event) => setRoomFilter(event.target.value)}><option value="all">全部直播间</option>{(data?.rooms ?? []).map((room) => <option key={room.code} value={room.code}>{room.name}</option>)}</select></label>
         <label>排班日期<input type="date" value={dateFilter} onChange={(event) => setDateFilter(event.target.value)} /></label>
         <label className="schedule-search">搜索导演、主播、商品或备注<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="输入关键词" /></label>
-         <div className="schedule-library-count">{loading && !data ? "读取中…" : `主播 ${data?.scheduleCount ?? 0} 场 · 导演 ${data?.directorShiftCount ?? 0} 班 · 筛选 ${filteredCount} 条 · 已归档 ${archivedCount} 条`}</div>
+         <div className="schedule-library-count">{loading && !data ? "读取中…" : `主播 ${data?.scheduleCount ?? 0} 场 · 导演 ${data?.directorShiftCount ?? 0} 班 · 助播 ${data?.assistantShiftCount ?? 0} 班 · 筛选 ${filteredCount} 条 · 已归档 ${archivedCount} 条`}</div>
       </div>
 
       {message && <div className={`form-message${messageType === "error" ? " form-error" : " form-success"}`} role={messageType === "error" ? "alert" : "status"}>{message}</div>}
@@ -986,14 +987,18 @@ export function App() {
         return;
       }
       const receivedAt = Date.now();
+      const scheduleDate = dateKey(new Date(response.serverNow));
       setDisplayData((current) => {
-        if (current?.room?.roomId === responseRoomId && current.room.id === response.room.code && current.dataUpdatedAt === response.dataUpdatedAt) {
+        if (current?.room?.roomId === responseRoomId && current.room.id === response.room.code &&
+            current.dataUpdatedAt === response.dataUpdatedAt && current.scheduleDate === scheduleDate) {
           return { ...current, nextTransitionAt: response.nextTransitionAt };
         }
         return {
           room: { id: response.room.code, roomId: responseRoomId, name: response.room.name },
           schedule: response.schedule,
           directorShifts: response.directorShifts,
+          assistantShifts: response.assistantShifts,
+          scheduleDate,
           nextTransitionAt: response.nextTransitionAt,
           dataUpdatedAt: response.dataUpdatedAt,
         };
@@ -1123,15 +1128,18 @@ export function App() {
       ...selectedRoom,
       schedule: current ? displayData.schedule : [],
       directorShifts: current ? displayData.directorShifts : [],
+      assistantShifts: current ? displayData.assistantShifts : [],
     };
   }, [selectedRoom, displayData]);
   const program = useMemo(() => getProgram(room?.schedule, timestamp), [room, timestamp]);
   const directorProgram = useMemo(() => getProgram(room?.directorShifts, timestamp), [room, timestamp]);
+  const assistantProgram = useMemo(() => getProgram(room?.assistantShifts, timestamp), [room, timestamp]);
   const displayed = program.display;
   const displayedDirector = directorProgram.display;
+  const displayedAssistant = assistantProgram.display;
   const isLive = Boolean(program.current);
   const nowDate = new Date(timestamp);
-  const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : displayedDirector ? "导演已排班" : "暂无排班";
+  const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : displayedDirector ? "导演已排班" : displayedAssistant ? "助播已排班" : "暂无排班";
 
   if (authLoading) return <div className="system-loading"><div className="loading-orbit" /><span>正在连接展示系统</span></div>;
   if (!user) return <LoginPage onLogin={login} theme={theme} onToggleTheme={toggleTheme} />;
@@ -1184,7 +1192,7 @@ export function App() {
                 })}
               </ol>
             ) : (
-              <div className="empty-schedule">{rooms.length ? "所选直播间今日暂无排班。" : "管理员尚未上传直播间排班。"}</div>
+              <div className="empty-schedule">{rooms.length ? "所选直播间今日暂无主播排班。" : "管理员尚未上传直播间排班。"}</div>
             )}
           </section>
         </aside>
@@ -1202,11 +1210,11 @@ export function App() {
             <div className="portrait-frame">
               {displayed?.photo ? <img src={displayed.photo} alt={`${displayed.host || "本场"} 主播照片`} /> : <div className="portrait-empty"><span>本场尚未添加</span><span>主播照片</span></div>}
             </div>
-            {displayed || displayedDirector ? (
+            {displayed || displayedDirector || displayedAssistant ? (
               <div className="role-grid">
                 <RoleCard label="导演" value={displayedDirector?.director} time={displayedDirector ? `${directorProgram.current ? "当前" : "下一场"} · ${formatRange(displayedDirector)}` : "暂无导演排班"} />
                 <RoleCard label="主播" value={displayed?.host} time={displayed ? `${program.current ? "当前" : "下一场"} · ${formatRange(displayed)}` : "暂无主播排班"} featured />
-                <RoleCard label="助播" value={displayed?.assistant} time={displayed ? formatRange(displayed) : "随主播排班"} />
+                <RoleCard label="助播" value={displayedAssistant?.assistant} time={displayedAssistant ? `${assistantProgram.current ? "当前" : "下一场"} · ${formatRange(displayedAssistant)}` : "暂无助播排班"} />
               </div>
             ) : <div className="no-session">{room ? "当前没有可展示的排班" : "等待管理员上传直播间排班"}</div>}
           </div>

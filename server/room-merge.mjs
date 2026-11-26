@@ -6,7 +6,7 @@ export function mergeRoom(db, room, targetCode) {
   if (!target || target.code === room.code || roomNameKey(target.name) !== roomNameKey(room.name)) {
     throw Object.assign(new Error("请选择一个仍存在的同名直播间"), { status: 409, code: "ROOM_MERGE_TARGET_INVALID" });
   }
-  const roles = [["slots", "主播"], ["director_shifts", "导演"]];
+  const roles = [["slots", "主播"], ["director_shifts", "导演"], ["effective_assistant_shifts", "助播"]];
   for (const [table, role] of roles) {
     const overlapping = db.prepare(`SELECT a.date,a.start_time,a.end_time,b.date AS other_date,b.start_time AS other_start,b.end_time AS other_end
       FROM ${table} a JOIN ${table} b ON a.starts_at<b.ends_at AND a.ends_at>b.starts_at
@@ -23,7 +23,13 @@ export function mergeRoom(db, room, targetCode) {
     throw Object.assign(new Error("两个直播间的头像不同，请先保留要使用的头像再合并"), { status: 409, code: "ROOM_MERGE_AVATAR_CONFLICT" });
   }
 
-  for (const [table] of roles) db.prepare(`UPDATE ${table} SET room_code=? WHERE room_code=?`).run(target.code, room.code);
+  // Preserve legacy assignments if either room's explicit assistant rows would hide them after the merge.
+  db.prepare(`INSERT INTO assistant_shifts
+    SELECT * FROM effective_assistant_shifts WHERE room_code IN (?,?) AND id LIKE 'legacy-assistant-%'
+    ON CONFLICT(id) DO NOTHING`).run(room.code, target.code);
+  for (const table of ["slots", "director_shifts", "assistant_shifts"]) {
+    db.prepare(`UPDATE ${table} SET room_code=? WHERE room_code=?`).run(target.code, room.code);
+  }
   db.prepare("UPDATE room_aliases SET room_code=? WHERE room_code=?").run(target.code, room.code);
   db.prepare(`UPDATE room_avatars SET room_code=? WHERE room_code=?
     AND NOT EXISTS (SELECT 1 FROM room_avatars WHERE room_code=?)`).run(target.code, room.code, target.code);

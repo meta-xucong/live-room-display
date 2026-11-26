@@ -253,8 +253,8 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   const headers = ["日期", "星期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演", "助播时间", "助播", "休"];
   const sheet = (name, rows) => ({ name, headers, rows });
   const first = sheet("甲", [
-    ["46351", "", "店铺甲", "６号直播间", "07:00-11:00", "主播甲", "07:00-15:00", "导演甲", "7:00-11:00", "助播甲"],
-    [],
+    ["46351", "", "店铺甲", "６号直播间", "07:00-11:00", "主播甲", "07:00-15:00", "导演甲", "9:00-13:00", "助播甲"],
+    ["", "", "", "", "", "", "", "", "20:00-23:00", "助播乙"],
     ["", "", "", "", "11:00-15:00", "主播乙", "07:00-15:00", "导演甲"],
     ["46352", "", "未排班直播间", "27号直播间"],
   ]);
@@ -304,9 +304,11 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   assert.deepEqual(ready.body.rooms[0].sourceNames, ["店铺甲", "店铺乙"]);
   assert.deepEqual(ready.body.summary, {
     roomCount: 2, dateCount: 3, firstDate: "2026-11-25", lastDate: "2026-11-26",
-    scheduleCount: 4, directorShiftCount: 2, skippedCount: 2,
+    scheduleCount: 4, directorShiftCount: 2, assistantShiftCount: 2, skippedCount: 2,
   });
-  assert.equal(ready.body.rooms[0].dates[0].hostShifts[0].assistant, "助播甲");
+  assert.deepEqual(ready.body.rooms[0].dates[0].assistantShifts.map(({ start, end, person }) => [start, end, person]), [
+    ["09:00", "13:00", "助播甲"], ["20:00", "23:00", "助播乙"],
+  ]);
   assert.deepEqual(ready.body.rooms[0].dates[0].hostShifts.map(({ sourceSheet }) => sourceSheet), ["甲", "甲", "乙"]);
   assert.equal(ready.body.rooms[0].dates[0].directorShifts.length, 1);
   assert.equal(ready.body.rooms[0].dates[1].directorShifts.length, 1);
@@ -314,7 +316,10 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   assert.deepEqual(db.prepare("SELECT name_key,room_code FROM room_aliases WHERE room_code='02' ORDER BY name_key").all()
     .map(({ name_key }) => name_key), ["店铺乙", "店铺甲"]);
   const displayed = await request("/api/v1/rooms/02/schedule?date=2026-11-25", { headers: viewer });
-  assert.equal(displayed.body.schedule[0].assistant, "助播甲");
+  assert.equal(displayed.body.schedule[0].assistant, "");
+  assert.deepEqual(displayed.body.assistantShifts.map(({ start, end, assistant }) => [start, end, assistant]), [
+    ["09:00", "13:00", "助播甲"], ["20:00", "23:00", "助播乙"],
+  ]);
   assert.equal(displayed.body.schedule.length, 3);
 
   const old = await preview(workbook([
@@ -340,7 +345,7 @@ test("actual multi-staff template reuses registered rooms with the same name", {
   assert.equal(ready.body.status, "ready");
   assert.deepEqual(ready.body.summary, {
     roomCount: 7, dateCount: 13, firstDate: "2026-11-25", lastDate: "2026-11-27",
-    scheduleCount: 38, directorShiftCount: 31, skippedCount: 1,
+    scheduleCount: 38, directorShiftCount: 31, assistantShiftCount: 0, skippedCount: 1,
   });
   assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["02", "03", "04", "05", "06", "07", "08"]);
   const shared = ready.body.rooms.find(({ code }) => code === "05");
@@ -357,6 +362,64 @@ test("actual multi-staff template reuses registered rooms with the same name", {
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM director_shifts").get().count, 31);
 }));
 
+test("assistant-only schedules can be edited and retain their own overnight boundaries", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {
+  const today = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" });
+  const date = today.format(new Date());
+  const nextDay = today.format(new Date(Date.now() + 86_400_000));
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','店铺','现有',0)").run();
+  const headers = ["日期", "直播间", "主播时间", "主播", "导演时间", "导演", "助播时间", "助播"];
+  const file = (rows) => scheduleWorkbook([{ name: "助播表", headers, rows }]);
+  const missingTime = await preview(file([[date, "店铺", "08:00-12:00", "主播甲", "", "", "", "助播甲"]]));
+  assert.equal(missingTime.status, 422);
+  assert.equal(missingTime.body.errors[0].field, "助播时间");
+  const overlapping = await preview(file([
+    [date, "店铺", "", "", "", "", "21:00-00:30", "助播甲"],
+    [nextDay, "店铺", "", "", "", "", "00:15-02:00", "助播乙"],
+  ]));
+  assert.equal(overlapping.status, 422);
+  assert.match(overlapping.body.errors[0].message, /同角色排班重叠/);
+
+  const ready = await preview(file([[date, "店铺", "", "", "", "", "21:00-00:30", "助播甲"]]));
+  assert.equal(ready.body.status, "ready");
+  assert.equal(ready.body.rooms[0].dates[0].assistantShifts[0].overnight, true);
+  const saved = await commit(ready.body.previewId);
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  const nextDayConflict = await preview(file([[nextDay, "店铺", "", "", "", "", "00:15-02:00", "助播乙"]]));
+  assert.equal(nextDayConflict.status, 422);
+  assert.match(nextDayConflict.body.errors[0].message, /未更新日期/);
+
+  const edit = (assistantShifts) => request("/api/v1/admin/schedules", {
+    method: "PUT", headers: { ...admin, "content-type": "application/json" },
+    body: JSON.stringify({ roomCode: "01", date, dataUpdatedAt: saved.body.dataUpdatedAt, hostShifts: [], directorShifts: [], assistantShifts }),
+  });
+  const changed = await edit([{ start: "19:00", end: "01:00", assistant: "助播乙" }]);
+  assert.equal(changed.status, 200, JSON.stringify(changed.body));
+  const adminSchedule = await request("/api/v1/admin/schedules", { headers: admin });
+  assert.deepEqual(adminSchedule.body.groups[0].slots.map(({ kind, start, end, assistant }) => [kind, start, end, assistant]), [
+    ["assistant", "19:00", "01:00", "助播乙"],
+  ]);
+  const display = await request("/api/v1/rooms/01/display", { headers: viewer });
+  assert.equal(display.body.schedule.length, 0);
+  assert.equal(display.body.assistantShifts[0].endsAt, Date.parse(nextDay + "T01:00:00+08:00"));
+  assert.equal(display.body.nextTransitionAt, [
+    Date.parse(date + "T19:00:00+08:00"), Date.parse(nextDay + "T01:00:00+08:00"),
+  ].find((time) => time > Date.parse(display.body.serverNow)));
+
+  const oldWorkbook = await preview(workbook([[date, "", "店铺", "08:00-12:00", "主播甲"]]));
+  assert.equal(oldWorkbook.body.rooms[0].dates[0].replacesAssistants, false);
+  assert.equal((await commit(oldWorkbook.body.previewId)).status, 200);
+  const schedulePath = `/api/v1/rooms/01/schedule?date=${date}`;
+  const preserved = await request(schedulePath, { headers: viewer });
+  assert.equal(preserved.body.assistantShifts[0].assistant, "助播乙");
+  assert.equal(preserved.body.schedule[0].end, "12:00");
+
+  const blank = await preview(file([[date, "店铺", "08:00-12:00", "主播甲"]]));
+  assert.equal(blank.body.rooms[0].dates[0].previousAssistantCount, 1);
+  assert.equal(blank.body.rooms[0].dates[0].replacesAssistants, true);
+  assert.equal((await commit(blank.body.previewId)).status, 200);
+  assert.deepEqual((await request(schedulePath, { headers: viewer })).body.assistantShifts, []);
+}));
+
 test("startup and deletion compact room numbers while preserving identities and linked data", () => withServer(async ({ db, admin, viewer, request, preview }) => {
   const date = "2026-11-19";
   const start = Date.parse(date + "T08:00:00+08:00");
@@ -365,6 +428,7 @@ test("startup and deletion compact room numbers while preserving identities and 
     VALUES ('host','04',?,'08:00','12:00',?,?,'主播')`).run(date, start, end);
   db.prepare(`INSERT INTO director_shifts(id,room_code,date,start_time,end_time,starts_at,ends_at,director)
     VALUES ('director','03',?,'08:00','12:00',?,?,'导演')`).run(date, start, end);
+  db.prepare(`INSERT INTO assistant_shifts VALUES ('assistant','03',?,'08:00','12:00',?,?,'助播')`).run(date, start, end);
   db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('别名','03')").run();
   db.prepare("INSERT INTO room_avatars(room_code,photo_type,photo_blob,version) VALUES ('03','image/png',?,'third')")
     .run(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
@@ -395,6 +459,7 @@ test("startup and deletion compact room numbers while preserving identities and 
   assert.equal(display.body.room.roomId, third.roomId);
   assert.equal(display.body.room.name, "直播间 06");
   assert.equal(db.prepare("SELECT room_code FROM director_shifts WHERE id='director'").get().room_code, "02");
+  assert.equal(db.prepare("SELECT room_code FROM assistant_shifts WHERE id='assistant'").get().room_code, "02");
   assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='host'").get().room_code, "03");
   const matchingAlias = await preview(workbook([["46353", "", "别名", "08:00-12:00", "主播"]]));
   assert.equal(matchingAlias.body.rooms[0].code, "02");
@@ -451,7 +516,7 @@ test("room management protects changes, retains name matching and removes only t
   assert.match(firstRoomId, /^[a-f0-9]{32}$/);
   assert.equal(legacyCode, null);
   assert.deepEqual(firstRoom, {
-    code: "01", name: "店铺甲", sortOrder: 0, scheduleCount: 1, directorShiftCount: 1, avatarUrl: null,
+    code: "01", name: "店铺甲", sortOrder: 0, scheduleCount: 1, directorShiftCount: 1, assistantShiftCount: 0, avatarUrl: null,
   });
   const rename = (name, version, headers = admin) => request(roomPath, {
     method: "PATCH",
@@ -548,6 +613,12 @@ test("merge keeps existing shifts and aliases and reuses the retained room for f
   assert.equal((await merge("12")).body.error.code, "ROOM_MERGE_TARGET_INVALID");
   assert.equal((await merge("11")).body.error.code, "ROOM_MERGE_OVERLAP");
   db.prepare("DELETE FROM slots WHERE id='overlap'").run();
+  db.prepare("UPDATE slots SET assistant='原助播' WHERE id='older'").run();
+  db.prepare(`INSERT INTO assistant_shifts VALUES ('assistant','11','2026-11-19','11:00','14:00',?,?,'新助播')`)
+    .run(Date.parse("2026-11-19T11:00:00+08:00"), Date.parse("2026-11-19T14:00:00+08:00"));
+  assert.match((await merge("11")).body.error.message, /助播排班重叠/);
+  db.prepare("UPDATE assistant_shifts SET starts_at=?,start_time='12:00' WHERE id='assistant'")
+    .run(Date.parse("2026-11-19T12:00:00+08:00"));
   assert.equal((await merge("11")).body.error.code, "ROOM_MERGE_AVATAR_CONFLICT");
   assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='older'").get().room_code, "04");
   db.prepare("DELETE FROM room_avatars WHERE room_code='11'").run();
@@ -565,6 +636,7 @@ test("merge keeps existing shifts and aliases and reuses the retained room for f
   assert.deepEqual(merged.body.rooms.map(({ code }) => code), ["01", "02"]);
   assert.equal(merged.body.rooms[0].scheduleCount, 2);
   assert.equal(merged.body.rooms[0].directorShiftCount, 1);
+  assert.equal(merged.body.rooms[0].assistantShiftCount, 2);
   assert.match(merged.body.rooms[0].avatarUrl, /rooms\/01\/avatar/);
   assert.equal(db.prepare("SELECT notes FROM slots WHERE id='older' AND room_code='01'").get().notes, "保留原场次");
   assert.deepEqual(db.prepare("SELECT DISTINCT room_code FROM room_aliases").all().map(({ room_code }) => room_code), ["01"]);
@@ -730,7 +802,7 @@ test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.deepEqual(ready.body.summary, {
     roomCount: 3, dateCount: 12, firstDate: "2026-11-19", lastDate: "2026-11-22",
-    scheduleCount: 33, directorShiftCount: 26, skippedCount: productColumn ? 4 : 2,
+    scheduleCount: 33, directorShiftCount: 26, assistantShiftCount: 0, skippedCount: productColumn ? 4 : 2,
   });
   if (productColumn && targetColumn) {
     const firstSlot = ready.body.rooms[0].dates[0].hostShifts[0];

@@ -9,6 +9,7 @@ export const NUMBERED_ROOM_CODES = Array.from({ length: 27 }, (_, index) => Stri
 const roles = [
   { role: "主播", name: "host", records: "hostShifts" },
   { role: "导演", name: "director", records: "directorShifts" },
+  { role: "助播", name: "assistant", records: "assistantShifts" },
 ];
 
 export function roomNameKey(name) {
@@ -21,7 +22,7 @@ function staffRoomCode(value) {
   return NUMBERED_ROOM_CODES.includes(code) ? code : null;
 }
 
-function scheduleRange(value, date) {
+export function scheduleRange(value, date) {
   const range = value.normalize("NFKC").match(/^(\d{1,2}:\d{2})\s*[-–—－~至到]\s*(\d{1,2}:\d{2})$/);
   if (!range) return null;
   const [, startText, endText] = range;
@@ -69,6 +70,7 @@ export function parseStaffSchedule(sheets, parseDate) {
       continue;
     }
 
+    const managesAssistants = columns.has("助播时间") && columns.has("助播");
     let date = "";
     let room = null;
     for (const [row] of rows.slice(1)) {
@@ -105,7 +107,7 @@ export function parseStaffSchedule(sheets, parseDate) {
         else {
           if (!rooms.has(key)) rooms.set(key, {
             key, name, numberOnly, sheetName: sheet.name, sourceRow: row,
-            codeSources: new Map(), dates: new Map(), hostShifts: [], directorShifts: [],
+            codeSources: new Map(), dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
           });
           room = rooms.get(key);
           if (roomText) room.numberOnly = false;
@@ -114,8 +116,10 @@ export function parseStaffSchedule(sheets, parseDate) {
           }
         }
       }
-      if (room && date && !room.dates.has(date)) room.dates.set(date, { sheet: sheet.name, row, count: 0 });
-      let hostShift;
+      if (room && date) {
+        if (!room.dates.has(date)) room.dates.set(date, { sheet: sheet.name, row, count: 0, managesAssistants });
+        if (managesAssistants) room.dates.get(date).managesAssistants = true;
+      }
       for (const entry of roles) {
         const { role } = entry;
         const timeField = `${role}时间`;
@@ -126,7 +130,7 @@ export function parseStaffSchedule(sheets, parseDate) {
           issue(errors, !date ? "日期" : "直播间", "该排班行缺少所属日期或直播间");
           break;
         }
-        const range = time ? scheduleRange(time, date) : null;
+        const range = scheduleRange(time, date);
         if (!range) issue(errors, timeField, "请填写有效的起止时间，例如 08:00-12:00");
         else if (!person) issue(warnings, role, "有时段但缺少姓名，已跳过此班次");
         else if (person.length > 80) issue(errors, role, "姓名不能超过 80 个字符");
@@ -138,7 +142,6 @@ export function parseStaffSchedule(sheets, parseDate) {
           if (entry.name === "host") {
             if (columns.has("主推商品")) shift.products = text("主推商品").split(/[,，]/).map((item) => item.trim()).filter(Boolean);
             if (columns.has("目标销售额")) shift.salesTarget = String(raw("目标销售额"));
-            hostShift = shift;
           }
           room[entry.records].push(shift);
           room.dates.get(date).count += 1;
@@ -147,19 +150,6 @@ export function parseStaffSchedule(sheets, parseDate) {
       const merchandiseField = merchandise.find((field) => text(field));
       if (merchandiseField && (!text("主播时间") || !text("主播"))) {
         issue(warnings, merchandiseField, "本行没有主播场次，已跳过主推商品和目标销售额");
-      }
-      const assistant = text("助播");
-      const assistantTime = text("助播时间");
-      if (assistant || assistantTime) {
-        if (!hostShift) issue(warnings, "助播", "本行没有有效主播场次，已跳过助播");
-        else if (!assistant) issue(warnings, "助播", "有助播时段但缺少姓名，已跳过助播");
-        else if (assistant.length > 80) issue(errors, "助播", "姓名不能超过 80 个字符");
-        else {
-          const range = assistantTime ? scheduleRange(assistantTime, date) : hostShift;
-          if (range?.startAt !== hostShift.startAt || range?.endAt !== hostShift.endAt) {
-            issue(errors, "助播时间", "助播跟随本行主播，请填写同一时段或留空");
-          } else hostShift.assistant = assistant;
-        }
       }
     }
   }
@@ -188,7 +178,7 @@ export function normalizeStaffShifts(rooms, warnings) {
       let previous = null;
       for (const shift of sorted) {
         const key = JSON.stringify([
-          shift.date, shift.start, shift.end, shift[name], shift.assistant, shift.products, shift.salesTarget,
+          shift.date, shift.start, shift.end, shift[name], shift.products, shift.salesTarget,
         ]);
         const duplicate = seen.get(key);
         if (duplicate) {
