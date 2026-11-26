@@ -72,11 +72,6 @@ function ImportPreview({ preview }) {
             {(room.sourceNames?.length > 1 || room.name !== room.sourceName) && (
               <p>表内名称：{room.sourceNames?.length ? room.sourceNames.join("、") : room.sourceName}</p>
             )}
-            {room.numberConflicts?.map((item) => (
-              <p key={item.name + item.requestedCode}>
-                <strong>请核对编号</strong> · {item.sheet} 第 {item.row} 行的「{item.name}」填为 {item.requestedCode} 号，本次归入 {room.code} 号。
-              </p>
-            ))}
             {room.dates.map((day) => (
               <details className="staff-import-day" key={day.date}>
                 <summary>
@@ -102,40 +97,10 @@ function ImportPreview({ preview }) {
   );
 }
 
-function RoomMatches({ sheet, assignments, onSelect, errors, busy }) {
-  return (
-    <section className="staff-room-matches" aria-label="匹配直播间">
-      <h3>匹配直播间</h3>
-      <p>请为表内的新名称选择对应直播间。确认导入后会记住此次匹配。</p>
-      {sheet.sourceRooms.map((room) => (
-        <label key={room.sourceRoomKey} className="staff-room-match">
-          <span><strong>{room.name}</strong><small>{room.sheet} 第 {room.row} 行 · {room.dateCount} 天
-            {room.requestedCodes?.length > 1 && ` · 表内填写了 ${room.requestedCodes.join("、")} 号`}
-          </small></span>
-          {room.automatic ? (
-            <span>{room.isNew ? "新增 · 按顺序分配房号" : `已匹配 · ${room.code} 号`}</span>
-          ) : (
-            <select value={assignments[room.sourceRoomKey] ?? ""} disabled={busy}
-              aria-invalid={errors.some((issue) => issue.room === room.name) || undefined}
-              onChange={(event) => onSelect(room.sourceRoomKey, event.target.value)}>
-              <option value="">请选择直播间</option>
-              {sheet.roomOptions.filter(({ code }) => !room.candidateCodes?.length || room.candidateCodes.includes(code)).map(({ code, name }) => (
-                <option value={code} key={code}>{code} 号 · {name ?? "未录入"}</option>
-              ))}
-            </select>
-          )}
-        </label>
-      ))}
-    </section>
-  );
-}
-
 export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
   const input = useRef(null);
   const request = useRef(null);
   const [file, setFile] = useState(null);
-  const [sheet, setSheet] = useState(null);
-  const [assignments, setAssignments] = useState(() => Object.create(null));
   const [preview, setPreview] = useState(null);
   const [result, setResult] = useState(null);
   const [warnings, setWarnings] = useState([]);
@@ -154,10 +119,10 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
 
   function resetFile(next) {
     request.current?.abort();
+    request.current = null;
+    setBusy("");
     setFile(next);
     if (!next && input.current) input.current.value = "";
-    setSheet(null);
-    setAssignments(Object.create(null));
     setPreview(null);
     setResult(null);
     setWarnings([]);
@@ -172,23 +137,12 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
       return;
     }
     resetFile(next);
+    if (next) upload("preview", next);
   }
 
-  function changeAssignment(key, code) {
-    setAssignments((current) => Object.assign(Object.create(null), current, { [key]: code }));
-    setPreview(null);
-    clearFeedback();
-  }
-
-  const selectedCodes = sheet?.sourceRooms.map((room) => room.automatic ? room.code : assignments[room.sourceRoomKey]) ?? [];
-  const allChosen = selectedCodes.every(Boolean);
-  const duplicate = selectedCodes.some((code, index) =>
-    code && !sheet.sourceRooms[index].automatic && selectedCodes.indexOf(code) !== selectedCodes.lastIndexOf(code));
-
-  async function upload(action) {
-    if (request.current || !file) return;
+  async function upload(action, workbook = file) {
+    if (request.current || !workbook) return;
     if (action === "commit" && !preview) return;
-    if (action === "preview" && (!allChosen || duplicate)) return;
     const controller = new AbortController();
     request.current = controller;
     setBusy(action);
@@ -201,8 +155,7 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
     } else {
       setPreview(null);
       body = new FormData();
-      body.append("file", file);
-      body.append("roomBindings", JSON.stringify(Object.fromEntries(Object.entries(assignments).filter(([, code]) => code))));
+      body.append("file", workbook);
     }
 
     try {
@@ -213,10 +166,8 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
       if (action === "commit") {
         setResult(response);
         setPreview(null);
-        setSheet(null);
         return;
       }
-      setSheet(response);
       setWarnings(response.warnings ?? []);
       setPreview(response.status === "ready" ? response : null);
     } catch (cause) {
@@ -229,12 +180,6 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
         if (action === "preview") {
           setErrors(cause.body?.errors ?? []);
           setWarnings(cause.body?.warnings ?? []);
-          if (cause.body?.sourceRooms) {
-            setSheet(cause.body);
-            const editable = new Set(cause.body.sourceRooms.filter((room) => !room.automatic).map((room) => room.sourceRoomKey));
-            setAssignments((current) => Object.assign(Object.create(null),
-              Object.fromEntries(Object.entries(current).filter(([key]) => editable.has(key)))));
-          }
         }
         setMessage(cause.body?.errors?.length ? "请修正以下问题后重新校验。" : cause.message || "请求失败，请重试。");
       }
@@ -246,15 +191,14 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
     }
   }
 
-  const needsMatching = sheet?.sourceRooms.some((room) => !room.automatic);
   return (
     <section className="admin-card" role="tabpanel" hidden={hidden}>
       <div className="admin-card-heading">
         <div className="admin-icon" aria-hidden="true">↥</div>
-        <div><h2>导入员工排班表</h2><p>按直播间和日期汇总工作簿。主播、导演和助播分别填写自己的时段。</p></div>
+        <div><h2>导入员工排班表</h2><p>选择文件后自动按直播间名称和日期生成预览。</p></div>
       </div>
       {!result && (
-        <form className={"upload-form staff-import-form" + (!preview && needsMatching ? " staff-matching-active" : "")}
+        <form className="upload-form staff-import-form"
           onSubmit={(event) => { event.preventDefault(); upload("preview"); }}>
           <label className={"upload-dropzone" + (file ? " upload-selected" : "")} htmlFor="staff-workbook">
             <span className="upload-glyph" aria-hidden="true">⌁</span>
@@ -265,23 +209,16 @@ export function StaffScheduleImport({ api, csrfToken, onViewRecords, hidden }) {
             accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             aria-label="选择员工排班表" disabled={Boolean(busy)}
             onChange={(event) => selectFile(event.target.files?.[0] ?? null)} />
-          {!preview && needsMatching && (
-            <RoomMatches sheet={sheet} assignments={assignments} onSelect={changeAssignment} errors={errors} busy={busy} />
-          )}
-          {!preview && <button className="button-primary upload-button" type="submit"
-            disabled={!file || Boolean(busy) || !allChosen || duplicate}>
-            {busy === "preview" ? "正在读取排班表…" : needsMatching ? "生成预览" : "校验并预览"}
+          {file && !preview && <button className="button-primary upload-button" type="submit" disabled={Boolean(busy)}>
+            {busy === "preview" ? "正在读取排班表…" : "重新校验"}
           </button>}
         </form>
       )}
-      {duplicate && !preview && <div role="alert" className="form-message form-error">手动选择的直播间编号不能与其他匹配项重复。</div>}
       {message && <div role={failed ? "alert" : "status"} className={"form-message" + (failed ? " form-error" : "")}>{message}</div>}
       {preview && <ImportPreview preview={preview} />}
       <ImportIssues errors={errors} warnings={warnings} />
       {preview && (
         <div className="upload-preview-actions">
-          {needsMatching && <button className="avatar-secondary-button" type="button" disabled={Boolean(busy)}
-            onClick={() => { setPreview(null); clearFeedback(); }}>返回修改匹配</button>}
           <button className="avatar-secondary-button" type="button" disabled={Boolean(busy)} onClick={() => resetFile(null)}>取消</button>
           <button className="button-primary upload-button" type="button" disabled={Boolean(busy)} onClick={() => upload("commit")}>
             {busy === "commit" ? "正在导入…" : "确认导入"}

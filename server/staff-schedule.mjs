@@ -3,8 +3,8 @@ import { cellHasFormula, cellValue } from "./xlsx.mjs";
 
 const required = ["日期", "直播间", "主播时间", "主播", "导演时间", "导演"];
 const merchandise = ["主推商品", "目标销售额"];
-const fields = [...required, ...merchandise, "直播间号码", "助播时间", "助播"];
-const headerAliases = new Map([["直播间名称", "直播间"], ["直播间编号", "直播间号码"]]);
+const fields = [...required, ...merchandise, "助播时间", "助播"];
+const headerAliases = new Map([["直播间名称", "直播间"]]);
 export const NUMBERED_ROOM_CODES = Array.from({ length: 27 }, (_, index) => String(index + 1).padStart(2, "0"));
 const roles = [
   { role: "主播", name: "host", records: "hostShifts" },
@@ -14,12 +14,6 @@ const roles = [
 
 export function roomNameKey(name) {
   return String(name ?? "").normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function staffRoomCode(value) {
-  const match = value.normalize("NFKC").match(/^(\d{1,2})(?:\s*号(?:\s*直播间)?)?$/);
-  const code = match?.[1].padStart(2, "0");
-  return NUMBERED_ROOM_CODES.includes(code) ? code : null;
 }
 
 export function scheduleRange(value, date) {
@@ -48,11 +42,6 @@ export function parseStaffSchedule(sheets, parseDate) {
       (cell) => cell.formula || String(cell.value ?? "").trim(),
     )).sort(([a], [b]) => a - b);
     if (!rows.length) continue;
-    rowCount += rows.length - 1;
-    if (rowCount > 5000) {
-      report(errors, sheet.name, "", "", "排班行数", "一次最多导入 5,000 行排班，请拆成多个工作簿");
-      break;
-    }
     const [headerRow, cells] = rows[0];
     const columns = new Map();
     for (const [column, cell] of cells) {
@@ -69,11 +58,21 @@ export function parseStaffSchedule(sheets, parseDate) {
       report(errors, sheet.name, headerRow, "", "表头", `缺少：${missing.join("、")}`);
       continue;
     }
+    const usedColumns = [...columns.values()];
+    const scheduleRows = rows.slice(1).filter(([, cells]) => usedColumns.some((column) => {
+      const cell = cells.get(column);
+      return cell?.formula || String(cell?.value ?? "").trim();
+    }));
+    rowCount += scheduleRows.length;
+    if (rowCount > 5000) {
+      report(errors, sheet.name, "", "", "排班行数", "一次最多导入 5,000 行排班，请拆成多个工作簿");
+      break;
+    }
 
     const managesAssistants = columns.has("助播时间") && columns.has("助播");
     let date = "";
     let room = null;
-    for (const [row] of rows.slice(1)) {
+    for (const [row] of scheduleRows) {
       const raw = (field) => cellValue(sheet, row, columns.get(field));
       const text = (field) => String(raw(field)).trim();
       const issue = (list, field, message) => report(list, sheet.name, row, columns.get(field), field, message, date, room?.name);
@@ -81,7 +80,7 @@ export function parseStaffSchedule(sheets, parseDate) {
       if (formulas.length) {
         for (const field of formulas) issue(errors, field, "请填写固定值");
         if (formulas.includes("日期")) date = "";
-        if (formulas.some((field) => ["日期", "直播间", "直播间号码"].includes(field))) room = null;
+        if (formulas.includes("日期") || formulas.includes("直播间")) room = null;
         continue;
       }
       if (text("日期")) {
@@ -93,27 +92,18 @@ export function parseStaffSchedule(sheets, parseDate) {
         date = next;
         if (!date) issue(errors, "日期", "请填写有效日期，例如 2026-11-19");
       }
-      const roomText = text("直播间");
-      const numberText = text("直播间号码");
-      if (roomText || numberText) {
-        const code = staffRoomCode(numberText);
-        const numberOnly = !roomText && !room?.codeSources.has(code);
-        const name = roomText || (numberOnly ? `${Number(code)}号直播间` : room.name);
+      const name = text("直播间");
+      if (name) {
         const key = roomNameKey(name);
         room = null;
-        if (numberText && !code) issue(errors, "直播间号码", "请填写 01–27 之间的编号，例如 8 号直播间");
-        else if (roomText.length > 120 || !key) issue(errors, "直播间", "直播间名称须为 1–120 个字符");
+        if (name.length > 120 || !key) issue(errors, "直播间", "直播间名称须为 1–120 个字符");
         else if (!date) issue(errors, "日期", "直播间所属日期缺失");
         else {
           if (!rooms.has(key)) rooms.set(key, {
-            key, name, numberOnly, sheetName: sheet.name, sourceRow: row,
-            codeSources: new Map(), dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
+            key, name, sheetName: sheet.name, sourceRow: row,
+            dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
           });
           room = rooms.get(key);
-          if (roomText) room.numberOnly = false;
-          if (code && !room.codeSources.has(code)) {
-            room.codeSources.set(code, { sheet: sheet.name, row, column: columns.get("直播间号码") });
-          }
         }
       }
       if (room && date) {

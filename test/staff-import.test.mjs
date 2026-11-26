@@ -56,8 +56,12 @@ function scheduleWorkbook(sheets, date1904 = false) {
   };
   for (const [index, { headers, rows }] of sheets.entries()) {
     entries[`xl/worksheets/sheet${index + 1}.xml`] = "<worksheet><sheetData>" + [headers, ...rows].map((row, r) =>
-      "<row>" + row.map((value, column) => value ? `<c r="${String.fromCharCode(65 + column)}${r + 1}" t="inlineStr"><is><t>` +
-        value + "</t></is></c>" : "").join("") + "</row>").join("") + "</sheetData></worksheet>";
+      "<row>" + row.map((value, column) => {
+        if (!value) return "";
+        const address = `${String.fromCharCode(65 + column)}${r + 1}`;
+        if (value.formula) return `<c r="${address}"><f>${value.formula}</f><v>0</v></c>`;
+        return `<c r="${address}" t="inlineStr"><is><t>${value}</t></is></c>`;
+      }).join("") + "</row>").join("") + "</sheetData></worksheet>";
   }
   return zip(entries);
 }
@@ -146,9 +150,10 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   assert.equal((await request("/api/v1/admin/schedule-upload/rooms")).status, 401);
   const matched = await preview(data);
   assert.equal(matched.status, 200);
-  assert.equal(matched.body.status, "needs_mapping");
-  assert(!matched.body.previewId);
+  assert.equal(matched.body.status, "ready");
+  assert.ok(matched.body.previewId);
   assert.equal(matched.body.sourceRooms[0].code, "01");
+  assert.equal(matched.body.sourceRooms.find(({ name }) => name === "Beta Name").code, "04");
   assert.equal(matched.body.roomOptions.length, 27);
   assert.equal((await preview(data, { "beta name": "01", gamma: "03" })).status, 422);
   assert.equal((await preview(data, { "beta name": "99", gamma: "03" })).status, 422);
@@ -248,8 +253,9 @@ test("room mapping, date scope, independent roles and idempotent commit", () => 
   assert.deepEqual(JSON.parse(stored.products_json), []);
 }));
 
-test("staff sheets merge by room number, skip blanks and deduplicate identical shifts", () => withServer(async ({ db, viewer, request, preview, commit }) => {
-  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','后台房间名','Existing',0)").run();
+test("staff sheets resolve names and aliases, skip blanks and deduplicate identical shifts", () => withServer(async ({ db, viewer, request, preview, commit }) => {
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','后台房间名','Existing',0),('02','店铺甲','Existing',1)").run();
+  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('店铺甲','02'),('店铺乙','02')").run();
   const headers = ["日期", "星期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演", "助播时间", "助播", "休"];
   const sheet = (name, rows) => ({ name, headers, rows });
   const first = sheet("甲", [
@@ -260,32 +266,40 @@ test("staff sheets merge by room number, skip blanks and deduplicate identical s
   ]);
   const second = sheet("乙", [
     ["46351", "", "店铺乙", "06", "16:00-20:00", "主播丙"],
-    ["46352", "", "", "6", "", "", "8:00-12:00", "导演乙"],
+    ["46352", "", "店铺乙", "6", "", "", "8:00-12:00", "导演乙"],
     ["46352", "", "店铺丙", "12号", "09:00-13:00", "主播丁"],
   ]);
   const multipleNumbers = scheduleWorkbook([first, sheet("编号冲突", [
     ["46351", "", "店铺甲", "07", "16:00-20:00", "主播丙"],
   ])]);
-  const needsNumber = await preview(multipleNumbers);
-  assert.equal(needsNumber.body.status, "needs_mapping");
-  assert.deepEqual(needsNumber.body.sourceRooms[0].requestedCodes, ["06", "07"]);
-  const matched = await preview(multipleNumbers, { 店铺甲: "06" });
+  const matched = await preview(multipleNumbers);
   assert.equal(matched.body.status, "ready");
   assert.deepEqual(matched.body.rooms.map(({ code }) => code), ["02"]);
   assert.equal(matched.body.rooms[0].dates[0].hostShifts.length, 3);
-  const invalidCode = await preview(scheduleWorkbook([sheet("范围", [["46351", "", "店铺", "28", "16:00-20:00", "主播丙"]])]));
-  assert.equal(invalidCode.status, 422);
-  assert.equal(invalidCode.body.errors[0].column, "D");
-  const conflictingCatalog = await preview(scheduleWorkbook([sheet("系统编号", [
-    ["46351", "", "后台房间名", "07", "16:00-20:00", "主播丙"],
+  const sameSourceNumber = await preview(scheduleWorkbook([first, sheet("同号新店", [
+    ["46351", "", "新店", "06", "07:00-11:00", "主播丙"],
   ])]));
-  assert.equal(conflictingCatalog.body.status, "ready");
-  assert.equal(conflictingCatalog.body.rooms[0].code, "01");
-  assert.deepEqual(conflictingCatalog.body.rooms[0].numberConflicts, [
-    { name: "后台房间名", requestedCode: "07", sheet: "系统编号", row: 2, column: "D" },
-  ]);
+  assert.equal(sameSourceNumber.body.status, "ready");
+  assert.deepEqual(sameSourceNumber.body.rooms.map(({ code, name }) => [code, name]), [["02", "店铺甲"], ["03", "新店"]]);
+  const ignoredNumbers = await preview(scheduleWorkbook([{
+    name: "房号列不参与校验", headers: [...headers, "直播间编号", "直播间号码"],
+    rows: [
+      ["46351", "", "后台房间名", "99", "08:00-12:00", "主播甲", "", "", "", "", "", { formula: "1/0" }, "任意备注"],
+      ["", "", "", "02", "12:00-16:00", "主播乙"],
+      ["", "", "", "随便填写"],
+    ],
+  }]));
+  assert.equal(ignoredNumbers.body.status, "ready");
+  assert.deepEqual(ignoredNumbers.body.rooms.map(({ code }) => code), ["01"]);
+  assert.equal(ignoredNumbers.body.summary.scheduleCount, 2);
+  assert.equal(ignoredNumbers.body.summary.skippedCount, 0);
+  const missingName = await preview(scheduleWorkbook([sheet("仅填房号", [
+    ["46351", "", "", "01", "08:00-12:00", "主播甲"],
+  ])]));
+  assert.equal(missingName.status, 422);
+  assert.equal(missingName.body.errors[0].field, "直播间");
   const overlapping = await preview(scheduleWorkbook([first, sheet("并班", [
-    ["46351", "", "不同表内名", "6", "14:00-20:00", "主播丙"],
+    ["46351", "", "店铺乙", "6", "14:00-20:00", "主播丙"],
   ])]));
   assert.equal(overlapping.status, 422);
   assert.equal(overlapping.body.errors[0].sheet, "并班");
@@ -336,7 +350,8 @@ test("actual multi-staff template reuses registered rooms with the same name", {
   addRoom.run("02", "Champion儿童官旗", "old", 0);
   addRoom.run("03", "MLB童装旗舰店", "old", 1);
   addRoom.run("04", "三枪官方旗舰店", "old", 2);
-  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('champion儿童官方旗舰店','02')").run();
+  addRoom.run("05", "pidan木薯直播间", "old", 4);
+  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('champion儿童官方旗舰店','02'),('pidan天猫/拼多多','05')").run();
   db.prepare(`INSERT INTO slots(id,room_code,date,start_time,end_time,starts_at,ends_at,host)
     VALUES ('old','03','2026-11-19','07:00','08:00',?,?, '原主播')`)
     .run(Date.parse("2026-11-19T07:00:00+08:00"), Date.parse("2026-11-19T08:00:00+08:00"));
@@ -351,15 +366,72 @@ test("actual multi-staff template reuses registered rooms with the same name", {
   const shared = ready.body.rooms.find(({ code }) => code === "05");
   assert.equal(shared.sourceNames.length, 2);
   assert.equal(shared.dates[0].hostShifts.length, 4);
-  for (const [code, requested] of [["02", "08"], ["03", "09"], ["04", "11"]]) {
-    assert.equal(ready.body.rooms.find((room) => room.code === code).numberConflicts[0].requestedCode, requested);
-  }
   assert.equal((await commit(ready.body.previewId)).status, 200);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM slots WHERE date>='2026-11-25'").get().count, 38);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rooms WHERE code IN ('09','11')").get().count, 0);
   assert.equal(db.prepare("SELECT room_code FROM slots WHERE id='old'").get().room_code, "03");
   assert.equal(db.prepare("SELECT room_code FROM room_aliases WHERE name_key='champion儿童官方旗舰店'").get().room_code, "02");
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM director_shifts").get().count, 31);
+}));
+
+test("actual revised workbook imports every populated shift without choosing rooms", { skip: !process.env.REVISED_STAFF_IMPORT_XLSX }, () => withServer(async ({ db, preview, commit }) => {
+  const file = await readFile(process.env.REVISED_STAFF_IMPORT_XLSX);
+  const sheets = parseXlsx(file);
+  const codes = new Map([
+    ["MLB服饰旗舰店", "01"], ["pidan木薯直播间", "02"], ["Champion儿童官方旗舰店", "03"],
+    ["MLB童装旗舰店", "04"], ["三枪官方旗舰店", "05"], ["pidan豆腐直播间", "06"],
+    ["pidan混合直播间", "07"], ["海堤官方旗舰店", "08"], ["MLB苏豪专卖店", "09"], ["MLB服饰账号", "10"],
+    ["pidan天猫/拼多多", "02"],
+  ]);
+  const addRoom = db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)");
+  [...codes.entries()].slice(0, 8).forEach(([name, code], index) => addRoom.run(code, name, "现有", index));
+  db.prepare("INSERT INTO room_aliases(name_key,room_code) VALUES ('pidan天猫/拼多多','02')").run();
+  const ready = await preview(file);
+  assert.equal(ready.status, 200, JSON.stringify(ready.body));
+  assert.equal(ready.body.status, "ready");
+  assert.deepEqual(ready.body.summary, {
+    roomCount: 10, dateCount: 34, firstDate: "2026-11-25", lastDate: "2026-11-30",
+    scheduleCount: 99, directorShiftCount: 81, assistantShiftCount: 9, skippedCount: 0,
+  });
+  assert.deepEqual(new Map(ready.body.sourceRooms.map(({ name, code }) => [name, code])), codes);
+  assert.deepEqual(ready.body.rooms.filter(({ isNew }) => isNew).map(({ code, name }) => [code, name]), [["09", "MLB苏豪专卖店"], ["10", "MLB服饰账号"]]);
+  const columns = Array.from("ABCDEFGHIJK");
+  const altered = scheduleWorkbook(sheets.map((sheet) => ({
+    name: sheet.name,
+    headers: columns.map((column) => cellValue(sheet, 1, column)),
+    rows: Array.from({ length: Math.max(...sheet.rows.keys()) - 1 }, (_, index) => columns.map((column) =>
+      column === "D" ? ["999", "随便写", "", { formula: "1/0" }][index % 4] : cellValue(sheet, index + 2, column))),
+  })));
+  const alteredPreview = await preview(altered);
+  assert.equal(alteredPreview.body.status, "ready");
+  assert.deepEqual(alteredPreview.body.rooms, ready.body.rooms);
+  assert.deepEqual(alteredPreview.body.summary, ready.body.summary);
+  assert.equal((await commit(ready.body.previewId)).status, 200);
+
+  const columnsByRole = [["E", "F", "slots", "host"], ["G", "H", "director_shifts", "director"], ["I", "J", "assistant_shifts", "assistant"]];
+  for (const [timeColumn, nameColumn, table, personColumn] of columnsByRole) {
+    const expected = [];
+    for (const sheet of sheets) {
+      let date;
+      let room;
+      for (const [row] of sheet.rows) {
+        if (row <= 1) continue;
+        const day = cellValue(sheet, row, "A");
+        if (day) date = new Date(Date.UTC(1899, 11, 30) + Number(day) * 86_400_000).toISOString().slice(0, 10);
+        const name = cellValue(sheet, row, "C");
+        if (name) room = codes.get(name);
+        const time = cellValue(sheet, row, timeColumn);
+        const person = cellValue(sheet, row, nameColumn);
+        if (!time && !person) continue;
+        assert.ok(room && date && time && person, [sheet.name, row].join(" "));
+        const [start, end] = time.split("-").map((part) => part.trim().padStart(5, "0").replace("24:00", "00:00"));
+        expected.push([room, date, start, end, person].join("|"));
+      }
+    }
+    const saved = db.prepare(`SELECT room_code,date,start_time,end_time,${personColumn} AS person FROM ${table}`).all()
+      .map(({ room_code, date, start_time, end_time, person }) => [room_code, date, start_time, end_time, person].join("|"));
+    assert.deepEqual(saved.sort(), expected.sort(), table);
+  }
 }));
 
 test("assistant-only schedules can be edited and retain their own overnight boundaries", () => withServer(async ({ db, admin, viewer, request, preview, commit }) => {
@@ -566,7 +638,9 @@ test("startup and deletion compact room numbers while preserving identities and 
     headers: ["日期", "直播间名称", "直播间号码", "主播时间", "主播", "导演时间", "导演"],
     rows: [["46353", "未登记的新名称", "02", "08:00-12:00", "主播"]],
   }]));
-  assert.equal(unknown.body.status, "needs_mapping");
+  assert.equal(unknown.body.status, "ready");
+  assert.equal(unknown.body.rooms[0].code, "04");
+  assert.equal(unknown.body.rooms[0].isNew, true);
 
   const token = "lrd_live_" + randomBytes(32).toString("base64url");
   db.prepare("INSERT INTO api_tokens(id,name,token_hash,created_at) VALUES ('order-test','test',?,?)")
@@ -743,7 +817,6 @@ test("merge keeps existing shifts and aliases and reuses the retained room for f
   assert.equal(ready.body.status, "ready");
   assert.deepEqual(ready.body.rooms.map(({ code }) => code), ["01"]);
   assert.equal(ready.body.rooms[0].dates[0].hostShifts.length, 2);
-  assert.equal(ready.body.rooms[0].numberConflicts[0].requestedCode, "04");
   assert.equal((await commit(ready.body.previewId)).status, 200);
   assert.equal(db.prepare("SELECT COUNT(*) AS count FROM rooms WHERE code='04'").get().count, 0);
 
@@ -892,11 +965,7 @@ test("actual staff workbook imports all four dates", { skip: !process.env.STAFF_
   const headers = [...sheet.rows.get(1)];
   const productColumn = headers.find(([, cell]) => cell.value === "主推商品")?.[0];
   const targetColumn = headers.find(([, cell]) => cell.value === "目标销售额")?.[0];
-  const first = await preview(bytes);
-  assert.equal(first.status, 200, JSON.stringify(first.body));
-  assert.equal(first.body.status, "needs_mapping");
-  const bindings = Object.fromEntries(first.body.sourceRooms.map(({ sourceRoomKey }, index) => [sourceRoomKey, "0" + (index + 1)]));
-  const ready = await preview(bytes, bindings);
+  const ready = await preview(bytes);
   assert.equal(ready.status, 200, JSON.stringify(ready.body));
   assert.deepEqual(ready.body.summary, {
     roomCount: 3, dateCount: 12, firstDate: "2026-11-19", lastDate: "2026-11-22",

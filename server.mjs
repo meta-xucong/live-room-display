@@ -608,17 +608,20 @@ function staffRoomCatalog() {
 
 function resolveStaffRooms(source, bindings) {
   const existing = db.prepare("SELECT code,name FROM rooms").all();
-  const named = new Map();
   const byCode = new Map(existing.map((room) => [room.code, room]));
+  const names = new Map();
   const aliases = new Map(db.prepare("SELECT name_key,room_code FROM room_aliases").all()
     .map(({ name_key, room_code }) => [name_key, room_code]));
   for (const { code, name } of existing) {
     const key = roomNameKey(name);
-    if (!named.has(key)) named.set(key, []);
-    named.get(key).push(code);
+    if (!names.has(key)) names.set(key, []);
+    names.get(key).push(code);
   }
-  const keys = new Set(source.map((room) => room.key));
   const errors = [];
+  const issue = (room, message) => errors.push({
+    sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message,
+  });
+  const keys = new Set(source.map((room) => room.key));
   for (const [key, code] of Object.entries(bindings)) {
     if (!keys.has(key) || !NUMBERED_ROOM_CODES.includes(code)) {
       errors.push({ field: "直播间匹配", message: "匹配项不属于当前文件或直播间编号无效" });
@@ -626,74 +629,50 @@ function resolveStaffRooms(source, bindings) {
   }
 
   const targets = new Map();
-  const unmatchedRooms = [];
+  const nextCode = availableRoomCodes(new Set(byCode.keys()));
   const sourceRooms = source.map((room) => {
-    const candidates = room.numberOnly ? [] : named.get(room.key) ?? [];
-    const alias = room.numberOnly ? null : aliases.get(room.key);
-    const requestedCodes = [...room.codeSources.keys()];
-    const requestedCode = requestedCodes.length === 1 ? requestedCodes[0] : null;
-    const known = alias ?? (candidates.length === 1 ? candidates[0] : candidates.find((code) => code === requestedCode));
-    const requestedIsAvailable = room.numberOnly || !byCode.has(requestedCode);
-    const automaticCode = known ?? (candidates.length === 0 && requestedIsAvailable ? requestedCode : null);
+    const candidates = names.get(room.key) ?? [];
     const chosen = Object.hasOwn(bindings, room.key) ? bindings[room.key] : null;
-    const automatic = Boolean(automaticCode);
-    const code = automaticCode ?? chosen;
-    const issue = (message) =>
-      errors.push({ sheet: room.sheetName, row: room.sourceRow, field: "直播间匹配", room: room.name, message });
-    if (automatic && chosen && code !== chosen) issue("房间匹配已变化，请重新核对当前编号");
-    if (!automatic && chosen && candidates.length && !candidates.includes(chosen)) {
-      issue("该名称已有重名直播间，请选择其中一个已有编号");
+    const known = aliases.get(room.key) ?? (candidates.length === 1 ? candidates[0] : null);
+    if (known && chosen && known !== chosen) issue(room, "该名称已有对应直播间，请按当前房间名称归档");
+    if (!known && candidates.length > 1 && !candidates.includes(chosen)) {
+      issue(room, "系统中存在多个同名直播间，请在直播间管理合并同名房间后重试");
     }
-    if (!code) unmatchedRooms.push(room);
-    else {
-      let target = targets.get(code);
-      if (target && (!automatic || !target.automatic)) {
-        issue(`与“${target.sourceName}”选中了同一编号，请为相关名称填写正确的直播间号码或更正匹配`);
-      }
-      if (!target) {
-        target = {
-          code, name: byCode.get(code)?.name ?? room.name, sourceName: room.name, sheetName: room.sheetName,
-          isNew: !byCode.has(code), automatic, sourceNames: [], aliasKeys: [], numberSources: [],
-          dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
-        };
-        targets.set(code, target);
-      }
-      if (!room.numberOnly) {
-        if (!target.sourceNames.length) {
-          target.sourceName = room.name;
-          if (target.isNew) target.name = room.name;
-        }
-        target.sourceNames.push(room.name);
-        if (!known) target.aliasKeys.push(room.key);
-      }
-      for (const [requestedCode, location] of room.codeSources) {
-        target.numberSources.push({ name: room.name, requestedCode, ...location });
-      }
-      for (const [date, group] of room.dates) {
-        target.dates.set(date, {
-          ...group, managesAssistants: group.managesAssistants || Boolean(target.dates.get(date)?.managesAssistants),
-        });
-      }
-      target.hostShifts.push(...room.hostShifts);
-      target.directorShifts.push(...room.directorShifts);
-      target.assistantShifts.push(...room.assistantShifts);
+    const existingCode = known ?? (byCode.has(chosen) ? chosen : null);
+    const key = existingCode ? "room:" + existingCode : chosen ? "pending:" + chosen : "name:" + room.key;
+    const explicit = !known && Boolean(chosen);
+    let target = targets.get(key);
+    if (target && (explicit || target.explicit)) {
+      issue(room, "不止一个表内名称手动指定到同一直播间，请撤销指定后按名称重新导入");
     }
+    if (!target) {
+      const code = existingCode ?? nextCode();
+      if (!NUMBERED_ROOM_CODES.includes(code)) issue(room, "直播间总数已达 27 个，无法新增此房间");
+      target = {
+        code, name: byCode.get(code)?.name ?? room.name,
+        sourceName: room.name, sheetName: room.sheetName, isNew: !existingCode, explicit,
+        sourceNames: [], aliasKeys: [],
+        dates: new Map(), hostShifts: [], directorShifts: [], assistantShifts: [],
+      };
+      targets.set(key, target);
+    }
+    target.sourceNames.push(room.name);
+    if (!known) target.aliasKeys.push(room.key);
+    for (const [date, group] of room.dates) {
+      target.dates.set(date, {
+        ...group, managesAssistants: group.managesAssistants || Boolean(target.dates.get(date)?.managesAssistants),
+      });
+    }
+    target.hostShifts.push(...room.hostShifts);
+    target.directorShifts.push(...room.directorShifts);
+    target.assistantShifts.push(...room.assistantShifts);
     return {
       sourceRoomKey: room.key, name: room.name, sheet: room.sheetName, row: room.sourceRow,
-      dateCount: room.dates.size, code, automatic, requestedCodes, isNew: Boolean(code && !byCode.has(code)),
-      candidateCodes: !automatic && candidates.length > 1 ? candidates : [],
+      dateCount: room.dates.size, code: target.code, automatic: !explicit, isNew: target.isNew,
     };
   });
-  const nextCode = availableRoomCodes(new Set(byCode.keys()));
-  const rooms = [...targets.values()].sort((a, b) => compareRoomCodes(a.code, b.code))
-    .map(({ numberSources, ...room }) => {
-      if (room.isNew) {
-        room.code = nextCode();
-        if (!room.sourceNames.length) room.name = `${Number(room.code)}号直播间`;
-      }
-      return { ...room, numberConflicts: numberSources.filter(({ requestedCode }) => requestedCode !== room.code) };
-    }).sort((a, b) => compareRoomCodes(a.code, b.code));
-  return { sourceRooms, rooms, unmatchedRooms, errors };
+  const rooms = [...targets.values()].sort((a, b) => compareRoomCodes(a.code, b.code));
+  return { sourceRooms, rooms, errors };
 }
 
 function staffImportConflicts(rooms) {
@@ -794,7 +773,7 @@ function staffPreviewRooms(rooms) {
     ({ person: host ?? director ?? assistant, start, end, overnight, sourceSheet, sourceRow });
   return rooms.map((room) => ({
     code: room.code, name: room.name, sourceName: room.sourceName, sourceNames: room.sourceNames,
-    isNew: room.isNew, numberConflicts: room.numberConflicts,
+    isNew: room.isNew,
     dates: [...room.dates.keys()].sort().map((date) => {
       const previousHosts = findHosts.all(room.code, date);
       const byHost = new Map(previousHosts.map((slot) => [shiftKey(slot.start_time, slot.end_time, slot.host), slot]));
@@ -2533,19 +2512,12 @@ async function handle(request, response) {
     }
     const parsed = parseStaffSchedule(workbook, excelDate);
     if (parsed.errors.length) return json(response, 422, { errors: parsed.errors, warnings: parsed.warnings });
-    const { sourceRooms, rooms, unmatchedRooms, errors } = resolveStaffRooms(parsed.rooms, bindings);
-    const grouped = [...rooms, ...unmatchedRooms];
-    if (grouped.length > NUMBERED_ROOM_CODES.length) {
-      errors.push({ field: "直播间", message: "一次最多导入 27 个直播间" });
-    }
-    const conflicts = errors.length ? errors : normalizeStaffShifts(grouped, parsed.warnings);
+    const { sourceRooms, rooms, errors } = resolveStaffRooms(parsed.rooms, bindings);
+    const conflicts = errors.length ? errors : normalizeStaffShifts(rooms, parsed.warnings);
     if (conflicts.length) return json(response, 422, {
       errors: conflicts, warnings: parsed.warnings, sourceRooms, roomOptions: staffRoomCatalog(),
     });
-    const summary = staffImportSummary(grouped, parsed.warnings);
-    if (unmatchedRooms.length) return json(response, 200, {
-      status: "needs_mapping", sourceRooms, roomOptions: staffRoomCatalog(), summary, warnings: parsed.warnings,
-    });
+    const summary = staffImportSummary(rooms, parsed.warnings);
     const existingConflicts = staffImportConflicts(rooms);
     if (existingConflicts.length) return json(response, 422, { errors: existingConflicts, warnings: parsed.warnings });
     const previewId = randomBytes(24).toString("hex");
