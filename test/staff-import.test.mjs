@@ -420,6 +420,104 @@ test("assistant-only schedules can be edited and retain their own overnight boun
   assert.deepEqual((await request(schedulePath, { headers: viewer })).body.assistantShifts, []);
 }));
 
+test("MCP previews and commits independent assistants for one or multiple dates", () => withServer(async ({ db, request }) => {
+  db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES ('01','验证直播间','测试',0)").run();
+  const makeToken = (id) => {
+    const token = "lrd_live_" + randomBytes(32).toString("base64url");
+    db.prepare("INSERT INTO api_tokens(id,name,token_hash,created_at) VALUES (?,?,?,?)")
+      .run(id, id, createHash("sha256").update(token).digest("hex"), Date.now());
+    return token;
+  };
+  const token = makeToken("mcp-test");
+  const otherToken = makeToken("mcp-other");
+  async function rpc(method, params, { key = token, modern = false } = {}) {
+    const headers = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+    if (modern) {
+      headers["mcp-protocol-version"] = "2026-07-28";
+      headers["mcp-method"] = method;
+      if (params.name) headers["mcp-name"] = params.name;
+      params = { ...params, _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } };
+    }
+    const response = await request("/mcp", { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.ok(response.body.result, JSON.stringify(response.body));
+    return response.body.result;
+  }
+  const invoke = async (name, args, options) => {
+    const result = await rpc("tools/call", { name, arguments: args }, options);
+    return { failed: Boolean(result.isError), ...JSON.parse(result.content[0].text) };
+  };
+  const { tools } = await rpc("tools/list", {}, { modern: true });
+  const single = tools.find(({ name }) => name === "preview_schedule_update");
+  const batch = tools.find(({ name }) => name === "preview_room_schedules_update");
+  assert.ok(single.inputSchema.properties.assistantShifts);
+  assert.ok(batch.inputSchema.properties.schedules.items.properties.assistantShifts);
+
+  const roomCode = "01";
+  const date = "2026-12-01";
+  const nextDate = "2026-12-02";
+  const newDate = "2026-12-03";
+  const primary = { hostShifts: [{ start: "08:00", end: "12:00", host: "主播甲" }], directorShifts: [] };
+  const assistant = { start: "09:00", end: "14:00", assistant: "助播甲" };
+  const overnight = { start: "22:00", end: "01:00", assistant: "助播乙" };
+  const mcpPreview = (args, options) => invoke(single.name, { roomCode, date, ...primary, ...args }, options);
+  const mcpBatch = (schedules) => invoke(batch.name, { roomCode, schedules }, { modern: true });
+  const readback = (day = date) => invoke("get_room_schedule", { roomCode, date: day });
+  const commit = (previewId, options) => invoke("commit_schedule_update", { previewId }, options);
+
+  const preview = await mcpPreview({ assistantShifts: [overnight, assistant] });
+  assert.equal(preview.failed, false, JSON.stringify(preview));
+  assert.equal(preview.preview.scheduleCount, 1);
+  assert.equal(preview.preview.assistantShiftCount, 2);
+  assert.deepEqual(preview.preview.assistantShifts, [assistant, overnight]);
+  assert.equal(preview.preview.replacingAssistantShifts, 0);
+  assert.equal((await readback()).assistantShifts.length, 0);
+  assert.equal((await commit(preview.previewId, { key: otherToken })).failed, true);
+  assert.equal((await commit(preview.previewId)).assistantShiftCount, 2);
+  assert.equal((await commit(preview.previewId)).failed, true);
+  const saved = await readback();
+  assert.deepEqual(saved.assistantShifts, [assistant, overnight]);
+  assert.equal(saved.hostShifts[0].end, "12:00");
+  assert.equal(saved.hostShifts[0].assistant, "");
+
+  const collision = { start: "00:30", end: "02:00", assistant: "助播丙" };
+  const withPreservedDate = await mcpBatch([
+    { date, ...primary }, { date: nextDate, ...primary, assistantShifts: [collision] },
+  ]);
+  assert.equal(withPreservedDate.failed, true);
+  assert.match(withPreservedDate.details[0].message, /现有助播排班/);
+  const acrossBatch = await mcpBatch([
+    { date, ...primary, assistantShifts: [overnight] }, { date: nextDate, ...primary, assistantShifts: [collision] },
+  ]);
+  assert.equal(acrossBatch.failed, true);
+  assert.match(acrossBatch.error, /多日期助播排班/);
+
+  const overlapping = await mcpPreview({ assistantShifts: [assistant, { ...assistant, start: "11:00", assistant: "助播乙" }] });
+  assert.match(overlapping.error, /助播排班时段重叠/);
+  assert.match((await mcpPreview({ assistantShifts: [{ assistant: "助播丙" }] })).error, /有效时段和姓名/);
+  assert.match((await mcpPreview({ hostShifts: [{ ...primary.hostShifts[0], assistant: "旧字段" }], assistantShifts: [assistant] })).error, /统一填写/);
+
+  const replace = await mcpBatch([
+    { date, ...primary, assistantShifts: [] },
+    { date: nextDate, hostShifts: [], directorShifts: [], assistantShifts: [collision] },
+  ]);
+  assert.equal(replace.failed, false, JSON.stringify(replace));
+  assert.equal(replace.preview.replacingAssistantShifts, 2);
+  assert.deepEqual(replace.preview.dates.map(({ assistantShiftCount }) => assistantShiftCount), [0, 1]);
+  const batchCommit = await commit(replace.previewId, { modern: true });
+  assert.equal(batchCommit.ok, true, JSON.stringify(batchCommit));
+  assert.equal(batchCommit.dates[1].assistantShiftCount, 1);
+  assert.deepEqual((await readback()).assistantShifts, []);
+  assert.deepEqual((await readback(nextDate)).assistantShifts, [collision]);
+
+  const legacy = await mcpPreview({ date: newDate, hostShifts: [{ ...primary.hostShifts[0], assistant: "旧版助播" }] });
+  assert.equal((await commit(legacy.previewId)).ok, true);
+  const preserve = await mcpPreview({ date: newDate, hostShifts: [{ start: "13:00", end: "16:00", host: "主播乙" }] });
+  assert.equal(preserve.preview.replacesAssistantShifts, false);
+  assert.equal((await commit(preserve.previewId)).ok, true);
+  assert.deepEqual((await readback(newDate)).assistantShifts, [{ start: "08:00", end: "12:00", assistant: "旧版助播" }]);
+}));
+
 test("startup and deletion compact room numbers while preserving identities and linked data", () => withServer(async ({ db, admin, viewer, request, preview }) => {
   const date = "2026-11-19";
   const start = Date.parse(date + "T08:00:00+08:00");

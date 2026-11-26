@@ -119,6 +119,7 @@ const MIME = {
 const STAFF_PREVIEW_TTL = 10 * 60_000;
 const staffPreviews = new Map();
 const MCP_ROOM_BATCH_PREVIEW_PREFIX = "mcp-room-schedules-v1\n";
+const MCP_SCHEDULE_PREVIEW_PREFIX = "mcp-room-schedules-v2\n";
 const sessions = db.prepare("SELECT s.token_hash,s.csrf_token,s.expires_at,u.id,u.username,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND u.enabled=1");
 const integrationTokens = db.prepare("SELECT id,name FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL");
 const hostAvatarByNameKey = db.prepare("SELECT id,name,photo_type,updated_at FROM host_avatars WHERE name_key=?");
@@ -754,21 +755,35 @@ function replaceAssistantShifts(roomCode, date, shifts) {
   }
 }
 
-function editableAssistantShifts(roomCode, date, input) {
+function parseAssistantShifts(date, input) {
   const shifts = input.map((shift, index) => {
     const assistant = typeof shift?.assistant === "string" ? cleanMcpField(shift.assistant, "助播姓名", 80) : "";
-    const range = scheduleRange(`${excelTime(shift?.start)}-${excelTime(shift?.end)}`, date);
+    const range = typeof shift?.start === "string" && typeof shift.end === "string"
+      ? scheduleRange(`${shift.start.trim()}-${shift.end.trim()}`, date) : null;
     if (!range || !assistant) throw new Error(`第 ${index + 1} 个助播班次须填写有效时段和姓名`);
-    return { ...range, assistant, id: randomBytes(16).toString("hex") };
+    return { ...range, assistant, sourceRow: index + 1, id: randomBytes(16).toString("hex") };
   }).sort((a, b) => a.startAt - b.startAt);
+  if (shifts.some((shift, index) => index > 0 && shift.startAt < shifts[index - 1].endAt)) {
+    throw new Error(`当天（${date}）的助播排班时段重叠`);
+  }
+  return shifts;
+}
+
+function editableAssistantShifts(roomCode, date, input) {
+  const shifts = parseAssistantShifts(date, input);
   const findConflict = db.prepare(`SELECT date,start_time,end_time FROM effective_assistant_shifts
     WHERE room_code=? AND date<>? AND starts_at<? AND ends_at>? LIMIT 1`);
-  for (const [index, shift] of shifts.entries()) {
-    if (index > 0 && shift.startAt < shifts[index - 1].endAt) throw new Error("当天的助播排班时段重叠");
+  for (const shift of shifts) {
     const conflict = findConflict.get(roomCode, date, shift.endAt, shift.startAt);
     if (conflict) throw new Error(`与 ${conflict.date} 的助播排班 ${conflict.start_time}–${conflict.end_time} 重叠`);
   }
   return shifts;
+}
+
+function preserveAssistantShifts(roomCode, date) {
+  db.prepare(`INSERT INTO assistant_shifts
+    SELECT * FROM effective_assistant_shifts WHERE room_code=? AND date=? AND id LIKE 'legacy-assistant-%'
+    ON CONFLICT(id) DO NOTHING`).run(roomCode, date);
 }
 
 function staffPreviewRooms(rooms) {
@@ -855,9 +870,7 @@ function commitStaffImport(id, userId) {
         if (managesAssistants) {
           replaceAssistantShifts(room.code, date, room.assistantShifts.filter((shift) => shift.date === date));
         } else {
-          db.prepare(`INSERT INTO assistant_shifts
-            SELECT * FROM effective_assistant_shifts WHERE room_code=? AND date=? AND id LIKE 'legacy-assistant-%'
-            ON CONFLICT(id) DO NOTHING`).run(room.code, date);
+          preserveAssistantShifts(room.code, date);
         }
         deleteHosts.run(room.code, date);
         deleteDirectors.run(room.code, date);
@@ -916,13 +929,13 @@ function parseFixedFields(section, blockNumber, allowed, required) {
   return fields;
 }
 
-function parseFixedScheduleText(input) {
+function parseFixedScheduleText(input, allowEmpty = false) {
   const text = String(input ?? "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").trim();
   if (!text) fixedTextError("请提供排班文本");
   if (text.length > 60_000) fixedTextError("排班文本不能超过 60,000 个字符");
   const sections = text.split(/^[ \t]*---[ \t]*$/m);
   while (sections.length && !sections.at(-1).trim()) sections.pop();
-  if (sections.length < 2) fixedTextError("请先填写直播间信息，再分别填写导演排班和主播排班");
+  if (!allowEmpty && sections.length < 2) fixedTextError("请先填写直播间信息，再分别填写导演排班和主播排班");
   if (sections.length > 101) fixedTextError("一次最多提交 100 个导演或主播时段");
 
   const metadata = parseFixedFields(
@@ -987,8 +1000,8 @@ function parseFixedScheduleText(input) {
   };
 }
 
-function validateFixedScheduleText(text) {
-  const parsed = parseFixedScheduleText(text);
+function validateFixedScheduleText(text, allowEmpty = false) {
+  const parsed = parseFixedScheduleText(text, allowEmpty);
   const { code, name } = chooseScheduleRoom(parsed.roomCode, parsed.roomName);
   parsed.roomCode = code;
   parsed.roomName = name;
@@ -1114,6 +1127,19 @@ function adminSchedulePayload() {
   };
 }
 
+const mcpAssistantShiftsSchema = {
+  type: "array", maxItems: 100,
+  description: "该日期完整的独立助播排班。明确无助播时传空数组；沿用已有助播排班时省略。",
+  items: {
+    type: "object", additionalProperties: false, required: ["start", "end", "assistant"],
+    properties: {
+      start: { type: "string", description: "助播开始时间，24 小时制" },
+      end: { type: "string", description: "助播结束时间，24 小时制" },
+      assistant: { type: "string", description: "助播姓名" },
+    },
+  },
+};
+
 const mcpTools = [
   {
     name: "list_rooms",
@@ -1138,7 +1164,7 @@ const mcpTools = [
   {
     name: "preview_schedule_update",
     title: "预览排班修改",
-    description: "预览一个直播间单个日期的完整排班，不会写入数据。导演排班与主播排班分别填写、分别校验，不需要一一对应；助播跟随主播时段。同一直播间多日更新请调用 preview_room_schedules_update。必须先展示预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
+    description: "预览一个直播间单个日期的完整排班。导演、主播和助播各填自己的时间。独立助播用 assistantShifts。同一直播间多日更新请调用 preview_room_schedules_update。先展示各角色完整预览和替换数量，得到用户明确确认后才提交。缺少信息时先询问。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "date", "directorShifts", "hostShifts"],
       properties: {
@@ -1159,20 +1185,21 @@ const mcpTools = [
         },
         hostShifts: {
           type: "array", maxItems: 100,
-          description: "该日期完整的主播排班列表；助播跟随主播时段",
+          description: "该日期完整的主播排班列表",
           items: {
             type: "object", additionalProperties: false, required: ["start", "end", "host"],
             properties: {
               start: { type: "string", description: "主播开始时间，24 小时制" },
               end: { type: "string", description: "主播结束时间，24 小时制" },
               host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
-              assistant: { type: "string", description: "助播，随主播排班" },
+              assistant: { type: "string", description: "旧版同场助播字段。新录入请用独立的 assistantShifts。" },
               featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
               salesTarget: { description: "目标销售额原文，按填写内容显示", oneOf: [{ type: "string" }, { type: "number" }] },
               notes: { type: "string" },
             },
           },
         },
+        assistantShifts: mcpAssistantShiftsSchema,
       },
     },
     annotations: { title: "预览排班修改", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -1180,7 +1207,7 @@ const mcpTools = [
   {
     name: "preview_room_schedules_update",
     title: "预览单直播间多日期排班",
-    description: "一次整理一个直播间多个日期的完整排班。每个日期分别包含完整的导演排班和主播排班；两类时段相互独立，助播跟随主播。只预览不写入；必须先展示每一天的完整预览并等待用户明确确认，才能调用 commit_schedule_update。不得补造用户没有提供的日期、时段或人员。",
+    description: "一次预览一个直播间多日排班。每天分别给出各角色的完整班次和各自的时间，独立助播用 assistantShifts。先逐日展示预览和替换数量，得到用户明确确认后才提交。缺少信息时先询问。",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["roomCode", "schedules"],
       properties: {
@@ -1188,7 +1215,7 @@ const mcpTools = [
         roomName: { type: "string", description: "新增直播间时必填；已有直播间会使用系统中的名称" },
         schedules: {
           type: "array", minItems: 1, maxItems: 100,
-          description: "该直播间要更新的日期列表；每个日期的 directorShifts 与 hostShifts 都是当天完整列表，未列出的日期保持不变",
+          description: "要更新的日期，每天分别提供各角色的完整班次",
           items: {
             type: "object", additionalProperties: false, required: ["date", "directorShifts", "hostShifts"],
             properties: {
@@ -1207,20 +1234,21 @@ const mcpTools = [
               },
               hostShifts: {
                 type: "array", maxItems: 100,
-                description: "该日期的完整主播排班列表；助播跟随主播时段",
+                description: "该日期的完整主播排班列表",
                 items: {
                   type: "object", additionalProperties: false, required: ["start", "end", "host"],
                   properties: {
                     start: { type: "string", description: "主播开始时间，24 小时制" },
                     end: { type: "string", description: "主播结束时间，24 小时制" },
                     host: { type: "string", description: "主播姓名；系统按姓名自动匹配头像库" },
-                    assistant: { type: "string", description: "助播，随主播排班" },
+                    assistant: { type: "string", description: "旧版同场助播字段。新录入请用独立的 assistantShifts。" },
                     featuredProducts: { type: "array", items: { type: "string" }, maxItems: 30 },
                     salesTarget: { description: "目标销售额原文，按填写内容显示", oneOf: [{ type: "string" }, { type: "number" }] },
                     notes: { type: "string" },
                   },
                 },
               },
+              assistantShifts: mcpAssistantShiftsSchema,
             },
           },
         },
@@ -1368,7 +1396,7 @@ async function manageRoom(request, response, code, resource) {
   return json(response, 200, adminRoomsPayload());
 }
 
-function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
+function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date]), replacedAssistantDates = replacedDates) {
   const roomSchedule = parsed.result.rooms[0];
   const directorShifts = roomSchedule.directorShifts;
   const hostShifts = roomSchedule.hostShifts;
@@ -1378,14 +1406,17 @@ function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
     throw cause;
   }
   const conflicts = [];
-  for (const [shifts, table, role] of [
-    [directorShifts, "director_shifts", "导演"],
-    [hostShifts, "slots", "主播"],
-  ]) {
+  const roles = [
+    [directorShifts, "director_shifts", "导演", replacedDates],
+    [hostShifts, "slots", "主播", replacedDates],
+  ];
+  const assistantPlan = parsed.assistantPlan;
+  if (assistantPlan?.replaces) roles.push([assistantPlan.shifts, "effective_assistant_shifts", "助播", replacedAssistantDates]);
+  for (const [shifts, table, role, dates] of roles) {
     const adjacent = db.prepare(`SELECT date,start_time,end_time,starts_at,ends_at FROM ${table}
       WHERE room_code=? AND date IN (?,?)`).all(
       parsed.roomCode, calendarDayOffset(parsed.date, -1), calendarDayOffset(parsed.date, 1),
-    ).filter((shift) => !replacedDates.has(shift.date));
+    ).filter((shift) => !dates.has(shift.date));
     for (const shift of shifts) {
       for (const existing of adjacent) {
         if (shift.startAt < existing.ends_at && existing.starts_at < shift.endAt) conflicts.push({
@@ -1396,7 +1427,7 @@ function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
     }
   }
   if (conflicts.length) {
-    const cause = new Error("导演或主播排班与相邻日期的跨日时段冲突，请先处理冲突后重新预览");
+    const cause = new Error("排班与相邻日期的同角色跨日时段冲突，请先处理冲突后重新预览");
     cause.details = conflicts;
     throw cause;
   }
@@ -1409,7 +1440,7 @@ function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
     const hasAvatar = Boolean(avatar?.photo_type) || hasLegacyPhoto;
     return {
       start: slot.start, end: slot.end, host: slot.host,
-      assistant: slot.assistant, featuredProducts: slot.products,
+      assistant: assistantPlan?.separate ? "" : slot.assistant, featuredProducts: slot.products,
       salesTarget: slot.salesTarget, notes: slot.notes,
       hasAvatar, avatarSource: avatar?.photo_type ? "头像库" : hasAvatar ? "本场已有照片" : "未配置",
       row: index + 4,
@@ -1422,11 +1453,21 @@ function mcpPreviewFor(parsed, replacedDates = new Set([parsed.date])) {
     roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
     replacingSlots, replacingDirectorShifts,
     scheduleCount: hostShifts.length, directorShiftCount: directorShifts.length,
-    assignmentCount: hostShifts.length + directorShifts.length,
+    assignmentCount: hostShifts.length + directorShifts.length + (assistantPlan?.shifts.length ?? 0),
     directorShifts: directorRows,
     hostShifts: scheduleRows.map(({ row, ...slot }) => slot),
+    ...(assistantPlan && {
+      assistantShifts: assistantPlan.shifts.map(({ start, end, assistant }) => ({ start, end, assistant })),
+      assistantShiftCount: assistantPlan.shifts.length,
+      replacingAssistantShifts: assistantPlan.replaces ? assistantPlan.existing.length : 0,
+      replacesAssistantShifts: assistantPlan.replaces,
+    }),
     warnings: [
-      ...parsed.warnings.filter((warning) => warning.field !== "主播头像"),
+      ...parsed.warnings.filter((warning) => warning.field !== "主播头像" && (!assistantPlan || warning.field !== "助播")),
+      ...(assistantPlan && !assistantPlan.replaces && hostShifts.some((shift) => shift.assistant) ? [{
+        sheet: parsed.sheet.name, field: "助播",
+        message: "已保留当天的独立助播排班。需要改助播时，请单独提供完整助播班次。",
+      }] : []),
       ...scheduleRows.filter((slot) => !slot.hasAvatar).map((slot) => ({
         sheet: `API-${parsed.roomCode}`, row: slot.row, field: "主播头像",
         message: slot.host ? `头像库中没有“${slot.host}”的头像，管理员可在主播头像库上传` : "本时段未填写主播，无法关联头像",
@@ -1448,8 +1489,10 @@ function fixedScheduleTextFromMcp(args) {
   if (!requestedCode) throw new Error("请先确认直播间编号");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || excelDate(date) !== date) throw new Error("请提供有效排班日期，格式为 YYYY-MM-DD");
   if (!Array.isArray(args.directorShifts) || !Array.isArray(args.hostShifts)) throw new Error("请分别提供 directorShifts 和 hostShifts 两份完整排班");
-  const assignmentCount = args.directorShifts.length + args.hostShifts.length;
-  if (assignmentCount < 1 || assignmentCount > 100) throw new Error("导演和主播排班合计请提供 1 至 100 个时段");
+  const hasAssistantList = Object.hasOwn(args, "assistantShifts");
+  if (hasAssistantList && !Array.isArray(args.assistantShifts)) throw new Error("助播排班须以完整列表提供");
+  const assignmentCount = args.directorShifts.length + args.hostShifts.length + (args.assistantShifts?.length ?? 0);
+  if ((!hasAssistantList && !assignmentCount) || assignmentCount > 100) throw new Error("每天最多提交 100 个时段，请提供完整排班");
   const { code: roomCode, name: roomName } = chooseScheduleRoom(requestedCode, cleanMcpField(args.roomName, "直播间名称", 120));
   const lines = [`直播间编号：${roomCode}`, `直播间名称：${roomName}`, `排班日期：${date}`];
   for (const [index, shift] of args.directorShifts.entries()) {
@@ -1479,6 +1522,24 @@ function fixedScheduleTextFromMcp(args) {
   return lines.join("\n");
 }
 
+function planMcpAssistantShifts(parsed, item) {
+  const { roomCode, date } = parsed;
+  const legacy = parsed.result.rooms[0].hostShifts.filter((shift) => shift.assistant);
+  const existing = assistantShiftsFor(roomCode, date);
+  if (Object.hasOwn(item, "assistantShifts")) {
+    if (!Array.isArray(item.assistantShifts)) throw new Error(`请提供 ${date} 的完整助播列表`);
+    if (legacy.length) throw new Error(`${date} 的助播请统一填写在 assistantShifts`);
+    const shifts = parseAssistantShifts(date, item.assistantShifts);
+    return { shifts, existing, replaces: true, separate: true };
+  }
+  const hasIndependent = db.prepare("SELECT 1 FROM assistant_shifts WHERE room_code=? AND date=? LIMIT 1").get(roomCode, date);
+  if (item.preserveAssistants || hasIndependent) {
+    const shifts = existing.map(({ start_time, end_time, assistant }) => ({ start: start_time, end: end_time, assistant }));
+    return { shifts, existing, replaces: false, separate: true };
+  }
+  return { shifts: legacy, existing, replaces: true, separate: false };
+}
+
 function validateMcpRoomSchedulesPayload(payload) {
   const roomCode = cleanMcpField(payload?.roomCode, "直播间编号", 40);
   const roomName = cleanMcpField(payload?.roomName, "直播间名称", 120);
@@ -1493,7 +1554,7 @@ function validateMcpRoomSchedulesPayload(payload) {
     seenDates.add(date);
     const text = String(item?.text ?? "");
     if (!text.trim() || text.length > 60_000) throw new Error("单个日期的排班内容为空或超过 60,000 个字符");
-    const parsed = validateFixedScheduleText(text);
+    const parsed = validateFixedScheduleText(text, Object.hasOwn(item, "assistantShifts"));
     if (parsed.roomCode !== roomCode || parsed.date !== date || parsed.roomName !== roomName) {
       throw new Error("多日期排班预览与目标直播间信息不一致，请重新预览");
     }
@@ -1502,12 +1563,14 @@ function validateMcpRoomSchedulesPayload(payload) {
       cause.details = parsed.result.errors;
       throw cause;
     }
-    return { date, text, parsed };
+    parsed.assistantPlan = planMcpAssistantShifts(parsed, item);
+    return { date, parsed };
   }).sort((a, b) => a.date.localeCompare(b.date));
 
   for (const [role, selectShifts] of [
     ["导演", (parsed) => parsed.result.rooms[0].directorShifts],
     ["主播", (parsed) => parsed.result.rooms[0].hostShifts],
+    ["助播", (parsed) => parsed.assistantPlan.replaces ? parsed.assistantPlan.shifts : []],
   ]) {
     const incoming = parsedSchedules.flatMap(({ date, parsed }) => selectShifts(parsed).map((shift) => ({ ...shift, date })));
     incoming.sort((a, b) => a.startAt - b.startAt);
@@ -1530,7 +1593,8 @@ function validateMcpRoomSchedulesPayload(payload) {
   }
 
   const replacedDates = new Set(seenDates);
-  const dates = parsedSchedules.map(({ parsed }) => mcpPreviewFor(parsed, replacedDates));
+  const replacedAssistantDates = new Set(parsedSchedules.filter(({ parsed }) => parsed.assistantPlan.replaces).map(({ date }) => date));
+  const dates = parsedSchedules.map(({ parsed }) => mcpPreviewFor(parsed, replacedDates, replacedAssistantDates));
   return {
     roomCode,
     roomName,
@@ -1542,34 +1606,38 @@ function validateMcpRoomSchedulesPayload(payload) {
       scheduleCount: dates.reduce((count, day) => count + day.scheduleCount, 0),
       hostShiftCount: dates.reduce((count, day) => count + day.scheduleCount, 0),
       directorShiftCount: dates.reduce((count, day) => count + day.directorShiftCount, 0),
+      assistantShiftCount: dates.reduce((count, day) => count + day.assistantShiftCount, 0),
       assignmentCount: dates.reduce((count, day) => count + day.assignmentCount, 0),
       replacingSlots: dates.reduce((count, day) => count + day.replacingSlots, 0),
       replacingDirectorShifts: dates.reduce((count, day) => count + day.replacingDirectorShifts, 0),
+      replacingAssistantShifts: dates.reduce((count, day) => count + day.replacingAssistantShifts, 0),
       dates,
       warnings: dates.flatMap((day) => day.warnings),
     },
   };
 }
 
-function buildMcpRoomSchedulesPayload(args) {
+function buildMcpRoomSchedulesPayload(args, single) {
   const requestedCode = cleanMcpField(args?.roomCode, "直播间编号", 40);
   if (!requestedCode) throw new Error("请先确认直播间编号");
-  if (!Array.isArray(args?.schedules) || args.schedules.length < 1 || args.schedules.length > 100) {
+  const input = single ? [args] : args?.schedules;
+  if (!Array.isArray(input) || input.length < 1 || input.length > 100) {
     throw new Error("请提供 1 至 100 个日期的完整排班");
   }
   const { code: roomCode, name: roomName } = chooseScheduleRoom(requestedCode, cleanMcpField(args.roomName, "直播间名称", 120));
-  const schedules = args.schedules.map((item) => {
+  const schedules = input.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("请提供有效的单日排班内容");
     const date = cleanMcpField(item?.date, "日期", 10);
+    const assistantList = Object.hasOwn(item, "assistantShifts") ? { assistantShifts: item.assistantShifts } : {};
+    const text = fixedScheduleTextFromMcp({
+      roomCode, roomName, date, directorShifts: item.directorShifts, hostShifts: item.hostShifts, ...assistantList,
+    });
     return {
-      date,
-      text: fixedScheduleTextFromMcp({
-        roomCode, roomName, date,
-        directorShifts: item?.directorShifts,
-        hostShifts: item?.hostShifts,
-      }),
+      date, text, ...assistantList,
+      preserveAssistants: !item.hostShifts.some((shift) => Object.hasOwn(shift, "assistant")),
     };
   });
-  const payload = { roomCode, roomName, schedules };
+  const payload = { roomCode, roomName, schedules, single };
   return { payload, ...validateMcpRoomSchedulesPayload(payload) };
 }
 
@@ -1585,13 +1653,7 @@ function mcpToolFailure(cause) {
   return mcpToolResult({ error: cause.message, details: cause.details ?? [] }, true);
 }
 
-function commitMcpRoomSchedulesPreview(row, tokenId) {
-  let payload;
-  try {
-    payload = JSON.parse(row.schedule_text.slice(MCP_ROOM_BATCH_PREVIEW_PREFIX.length));
-  } catch {
-    throw new Error("多日期预览已损坏，请重新预览");
-  }
+function commitMcpRoomSchedulesPreview(row, tokenId, payload) {
   const { roomCode, roomName, parsedSchedules, preview } = validateMcpRoomSchedulesPayload(payload);
   const updateAt = nextDataUpdatedAt();
   let preservedPhotos = 0;
@@ -1601,11 +1663,12 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     const currentTicket = db.prepare("SELECT id FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(row.id, tokenId, Date.now());
     if (!currentTicket || row.data_updated_at !== updatedAtValue()) throw new Error("预览已失效，请重新预览");
     const existingRoom = db.prepare("SELECT sort_order FROM rooms WHERE code=?").get(roomCode);
+    const source = payload.single ? "MCP 自然语言更新" : "MCP 多日期排班更新";
     if (existingRoom) {
-      db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?").run(roomName, "MCP 多日期排班更新", roomCode);
+      db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?").run(roomName, source, roomCode);
     } else {
       const order = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
-      db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(roomCode, roomName, "MCP 多日期排班更新", order);
+      db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(roomCode, roomName, source, order);
     }
     const insertSlot = db.prepare(`INSERT INTO slots(
       id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
@@ -1617,6 +1680,9 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     for (const { date, parsed } of parsedSchedules) {
       const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(roomCode, date);
       const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
+      const assistantPlan = parsed.assistantPlan;
+      if (!assistantPlan.replaces) preserveAssistantShifts(roomCode, date);
+      else if (assistantPlan.separate) replaceAssistantShifts(roomCode, date, assistantPlan.shifts);
       db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(roomCode, date);
       db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(roomCode, date);
       let dayPreservedPhotos = 0;
@@ -1629,7 +1695,7 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
         }
         insertSlot.run(
           previous?.id ?? slot.id, roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-          "", slot.host, slot.assistant, JSON.stringify(slot.products), slot.salesTarget,
+          "", slot.host, assistantPlan.separate ? "" : slot.assistant, JSON.stringify(slot.products), slot.salesTarget,
           slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
         );
       }
@@ -1646,25 +1712,29 @@ function commitMcpRoomSchedulesPreview(row, tokenId) {
     try { db.exec("ROLLBACK"); } catch {}
     throw new Error(cause.message === "预览已失效，请重新预览" ? cause.message : "提交失败，排班数据没有完成修改");
   }
+  const dates = preview.dates.map((day) => ({
+    date: day.date,
+    replacingSlots: day.replacingSlots,
+    replacingDirectorShifts: day.replacingDirectorShifts,
+    replacingAssistantShifts: day.replacingAssistantShifts,
+    replacesAssistantShifts: day.replacesAssistantShifts,
+    scheduleCount: day.scheduleCount,
+    directorShiftCount: day.directorShiftCount,
+    assistantShiftCount: day.assistantShiftCount,
+    assignmentCount: day.assignmentCount,
+    preservedPhotos: preservedByDate.get(day.date) ?? 0,
+  }));
   return {
     ok: true,
     roomCode,
     roomName,
-    dateCount: preview.dateCount,
+    ...(payload.single ? { date: dates[0].date } : { dateCount: preview.dateCount, dates }),
     scheduleCount: preview.scheduleCount,
     hostShiftCount: preview.hostShiftCount,
     directorShiftCount: preview.directorShiftCount,
+    assistantShiftCount: preview.assistantShiftCount,
     assignmentCount: preview.assignmentCount,
     preservedPhotos,
-    dates: preview.dates.map((day) => ({
-      date: day.date,
-      replacingSlots: day.replacingSlots,
-      replacingDirectorShifts: day.replacingDirectorShifts,
-      scheduleCount: day.scheduleCount,
-      directorShiftCount: day.directorShiftCount,
-      assignmentCount: day.assignmentCount,
-      preservedPhotos: preservedByDate.get(day.date) ?? 0,
-    })),
     warnings: preview.warnings,
     dataUpdatedAt: updateAt,
   };
@@ -1676,59 +1746,17 @@ function commitMcpPreview(previewId, tokenId) {
   const row = db.prepare("SELECT * FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(previewId, tokenId, now);
   if (!row) throw new Error("预览编号不存在、已使用或已过期，请重新预览");
   if (row.data_updated_at !== updatedAtValue()) throw new Error("预览后排班数据有更新，为避免覆盖新内容，请重新预览");
-  if (row.schedule_text.startsWith(MCP_ROOM_BATCH_PREVIEW_PREFIX)) return commitMcpRoomSchedulesPreview(row, tokenId);
-  const parsed = validateFixedScheduleText(row.schedule_text);
-  const preview = mcpPreviewFor(parsed);
-  let preservedPhotos = 0;
-  const updateAt = nextDataUpdatedAt();
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    const currentTicket = db.prepare("SELECT id FROM mcp_previews WHERE id=? AND token_id=? AND expires_at>? ").get(previewId, tokenId, Date.now());
-    if (!currentTicket || row.data_updated_at !== updatedAtValue()) throw new Error("预览已失效，请重新预览");
-    const existingRoom = db.prepare("SELECT sort_order FROM rooms WHERE code=?").get(parsed.roomCode);
-    const previousSlots = db.prepare("SELECT * FROM slots WHERE room_code=? AND date=?").all(parsed.roomCode, parsed.date);
-    const previousByKey = new Map(previousSlots.map((slot) => [`${slot.start_time}\u0000${slot.end_time}\u0000${slot.host}`, slot]));
-    if (existingRoom) {
-      db.prepare("UPDATE rooms SET name=?,sheet_name=? WHERE code=?").run(parsed.roomName, "MCP 自然语言更新", parsed.roomCode);
-    } else {
-      const order = db.prepare("SELECT COALESCE(MAX(sort_order),-1)+1 AS next FROM rooms").get().next;
-      db.prepare("INSERT INTO rooms(code,name,sheet_name,sort_order) VALUES (?,?,?,?)").run(parsed.roomCode, parsed.roomName, "MCP 自然语言更新", order);
-    }
-    db.prepare("DELETE FROM slots WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
-    db.prepare("DELETE FROM director_shifts WHERE room_code=? AND date=?").run(parsed.roomCode, parsed.date);
-    const insertSlot = db.prepare(`INSERT INTO slots(
-      id,room_code,date,start_time,end_time,starts_at,ends_at,director,host,assistant,
-      products_json,sales_target_text,notes,photo_type,photo_blob
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    const insertDirector = db.prepare(`INSERT INTO director_shifts(
-      id,room_code,date,start_time,end_time,starts_at,ends_at,director
-    ) VALUES (?,?,?,?,?,?,?,?)`);
-    const schedule = parsed.result.rooms[0];
-    for (const slot of schedule.hostShifts) {
-      const previous = previousByKey.get(`${slot.start}\u0000${slot.end}\u0000${slot.host}`);
-      if (previous?.photo_blob) preservedPhotos += 1;
-      insertSlot.run(
-        previous?.id ?? slot.id, parsed.roomCode, slot.date, slot.start, slot.end, slot.startAt, slot.endAt,
-        "", slot.host, slot.assistant, JSON.stringify(slot.products),
-        slot.salesTarget, slot.notes, previous?.photo_type ?? null, previous?.photo_blob ?? null,
-      );
-    }
-    for (const shift of schedule.directorShifts) insertDirector.run(
-      shift.id, parsed.roomCode, shift.date, shift.start, shift.end, shift.startAt, shift.endAt, shift.director,
-    );
-    seedUniqueHostAvatars(schedule.hostShifts);
-    db.prepare("UPDATE app_state SET value=? WHERE key='data_updated_at'").run(updateAt);
-    db.prepare("DELETE FROM mcp_previews WHERE id=?").run(previewId);
-    db.exec("COMMIT");
-  } catch (cause) {
-    try { db.exec("ROLLBACK"); } catch {}
-    throw new Error(cause.message === "预览已失效，请重新预览" ? cause.message : "提交失败，排班数据没有完成修改");
+  const prefix = [MCP_SCHEDULE_PREVIEW_PREFIX, MCP_ROOM_BATCH_PREVIEW_PREFIX]
+    .find((candidate) => row.schedule_text.startsWith(candidate));
+  let payload;
+  if (prefix) {
+    try { payload = JSON.parse(row.schedule_text.slice(prefix.length)); }
+    catch { throw new Error("预览已损坏，请重新预览"); }
+  } else {
+    const { roomCode, roomName, date } = parseFixedScheduleText(row.schedule_text);
+    payload = { roomCode, roomName, single: true, schedules: [{ date, text: row.schedule_text }] };
   }
-  return {
-    ok: true, roomCode: parsed.roomCode, roomName: parsed.roomName, date: parsed.date,
-    scheduleCount: preview.scheduleCount, directorShiftCount: preview.directorShiftCount,
-    assignmentCount: preview.assignmentCount, preservedPhotos, warnings: preview.warnings, dataUpdatedAt: updateAt,
-  };
+  return commitMcpRoomSchedulesPreview(row, tokenId, payload);
 }
 
 async function callMcpTool(name, args, token) {
@@ -1760,29 +1788,17 @@ async function callMcpTool(name, args, token) {
     }));
     return mcpToolResult({ room, date, directorShifts, hostShifts, assistantShifts });
   }
-  if (name === "preview_schedule_update") {
-    const scheduleText = fixedScheduleTextFromMcp(args);
-    const parsed = validateFixedScheduleText(scheduleText);
-    const preview = mcpPreviewFor(parsed);
+  if (name === "preview_schedule_update" || name === "preview_room_schedules_update") {
+    const single = name === "preview_schedule_update";
+    const { payload, preview } = buildMcpRoomSchedulesPayload(args, single);
     const now = Date.now();
     db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(now);
     db.prepare("DELETE FROM mcp_previews WHERE token_id=? AND id IN (SELECT id FROM mcp_previews WHERE token_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 20)").run(token.id, token.id);
     const previewId = randomBytes(24).toString("hex");
     const expiresAt = now + 10 * 60_000;
     db.prepare("INSERT INTO mcp_previews(id,token_id,schedule_text,data_updated_at,created_at,expires_at) VALUES (?,?,?,?,?,?)")
-      .run(previewId, token.id, scheduleText, updatedAtValue(), now, expiresAt);
-    return mcpToolResult({ previewId, expiresAt: new Date(expiresAt).toISOString(), preview });
-  }
-  if (name === "preview_room_schedules_update") {
-    const { payload, preview } = buildMcpRoomSchedulesPayload(args);
-    const now = Date.now();
-    db.prepare("DELETE FROM mcp_previews WHERE expires_at<=?").run(now);
-    db.prepare("DELETE FROM mcp_previews WHERE token_id=? AND id IN (SELECT id FROM mcp_previews WHERE token_id=? ORDER BY created_at DESC LIMIT -1 OFFSET 20)").run(token.id, token.id);
-    const previewId = randomBytes(24).toString("hex");
-    const expiresAt = now + 10 * 60_000;
-    db.prepare("INSERT INTO mcp_previews(id,token_id,schedule_text,data_updated_at,created_at,expires_at) VALUES (?,?,?,?,?,?)")
-      .run(previewId, token.id, `${MCP_ROOM_BATCH_PREVIEW_PREFIX}${JSON.stringify(payload)}`, updatedAtValue(), now, expiresAt);
-    return mcpToolResult({ previewId, expiresAt: new Date(expiresAt).toISOString(), preview });
+      .run(previewId, token.id, `${MCP_SCHEDULE_PREVIEW_PREFIX}${JSON.stringify(payload)}`, updatedAtValue(), now, expiresAt);
+    return mcpToolResult({ previewId, expiresAt: new Date(expiresAt).toISOString(), preview: single ? preview.dates[0] : preview });
   }
   if (name === "commit_schedule_update") {
     return mcpToolResult(commitMcpPreview(cleanMcpField(args?.previewId, "预览编号", 48), token.id));
