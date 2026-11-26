@@ -138,7 +138,7 @@ function MerchandisingInfo({ products = [], salesTarget = "" }) {
       <section className="merch-card target-card" aria-label="目标销售额">
         <span className="merch-kicker">SALES TARGET</span>
         <span className="target-label">目标销售额</span>
-        <strong className="target-value" title={salesTarget || undefined}>{salesTarget || "待设置"}</strong>
+        <strong className="target-value">{salesTarget || "待设置"}</strong>
       </section>
     </div>
   );
@@ -769,7 +769,11 @@ function AdminScheduleLibrary({ csrfToken }) {
                       <label>{scheduleRoleLabels[slot.kind]}<input value={editValues[slot.kind]} maxLength={80} onChange={(event) => updateEdit(slot.kind, event.target.value)} required /></label>
                       {slot.kind === "host" && <>
                         <label className="schedule-edit-wide">主推商品（逗号或换行分隔）<textarea value={editValues.products} rows={3} onChange={(event) => updateEdit("products", event.target.value)} /></label>
-                        <label>目标销售额<textarea value={editValues.salesTarget} rows={2} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="按原文显示" /></label>
+                        <label>目标销售额
+                          <span className="schedule-target-field" data-value={editValues.salesTarget}>
+                            <textarea className="schedule-target-input" value={editValues.salesTarget} rows={2} onChange={(event) => updateEdit("salesTarget", event.target.value)} placeholder="按原文显示" />
+                          </span>
+                        </label>
                         <label className="schedule-edit-wide">备注<textarea value={editValues.notes} maxLength={500} rows={2} onChange={(event) => updateEdit("notes", event.target.value)} /></label>
                       </>}
                       <div className="schedule-edit-actions"><button className="avatar-secondary-button" type="button" onClick={cancelEdit} disabled={saving}>取消</button><button className="button-primary schedule-save-button" type="submit" disabled={saving}>{saving ? "正在保存…" : "保存修改"}</button></div>

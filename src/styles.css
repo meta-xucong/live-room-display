@@ -83,9 +83,9 @@ button { cursor: pointer; }
 .topbar-divider { height: 15px; width: 1px; background: #dfd4c3; margin: 0 5px; }
 
 .workspace {
+  --workspace-height: max(500px, calc(100vh - 138px));
   width: calc(100% - 56px);
-  height: calc(100vh - 138px);
-  min-height: 500px;
+  min-height: var(--workspace-height);
   margin: 28px auto 36px;
   display: grid;
   grid-template-columns: 270px minmax(0, 1fr);
@@ -93,7 +93,7 @@ button { cursor: pointer; }
   align-items: stretch;
 }
 
-.control-column { display: grid; grid-template-rows: 326px minmax(180px, 1fr); gap: 14px; min-width: 0; min-height: 0; }
+.control-column { height: var(--workspace-height); display: grid; grid-template-rows: 326px minmax(180px, 1fr); gap: 14px; min-width: 0; min-height: 0; }
 .control-card { min-width: 0; background: var(--paper); border: 1px solid var(--line); border-radius: 11px; padding: 18px; box-shadow: 0 8px 24px rgba(74, 59, 38, .035); }
 .clock-card { height: 326px; }
 .control-label { display: block; margin: 13px 0 7px; color: #545e58; font-size: 11px; font-weight: 600; }
@@ -152,10 +152,9 @@ button { cursor: pointer; }
 
 .display-stage {
   min-width: 0;
-  height: 100%;
   padding: clamp(22px, 3vw, 64px);
   display: grid;
-  grid-template-rows: clamp(26px, 3vh, 38px) minmax(0, 1fr) clamp(124px, 13vh, 164px);
+  grid-template-rows: clamp(26px, 3vh, 38px) minmax(min-content, 1fr) auto;
   row-gap: clamp(8px, 1vw, 16px);
   overflow: hidden;
   border: 1px solid #4b3d30;
@@ -170,7 +169,7 @@ button { cursor: pointer; }
 .live-pill-on { border-color: #5b7259; color: #cad8c2; }
 .live-pill-next .live-dot { background: #d6b268; }
 
-.stage-main { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; align-content: center; align-items: center; gap: clamp(8px, 1vw, 14px) clamp(20px, 4vw, 72px); padding: clamp(4px, .75vh, 12px) 0; }
+.stage-main { width: 100%; min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; align-content: center; align-items: center; gap: clamp(8px, 1vw, 14px) clamp(20px, 4vw, 72px); padding: clamp(4px, .75vh, 12px) 0; }
 .stage-copy { min-width: 0; grid-column: 1; grid-row: 1; align-self: end; display: grid; grid-template-rows: auto auto; align-content: center; gap: clamp(8px, 1.2vh, 14px); }
 .room-heading { min-width: 0; display: grid; grid-template-rows: clamp(28px, 3vh, 40px) clamp(62px, 8.5vh, 108px); }
 .stage-period { min-width: 0; display: grid; grid-template-rows: clamp(24px, 3vh, 36px) clamp(48px, 6vh, 72px); gap: clamp(4px, .6vh, 8px); }
@@ -202,7 +201,7 @@ button { cursor: pointer; }
   .room-selector-inline { grid-column: 1 / -1; grid-row: 2; justify-self: start; }
   .topbar-right { grid-column: 2; grid-row: 1; }
   .workspace { width: min(calc(100% - 32px), 1000px); height: auto; min-height: 0; grid-template-columns: 1fr; margin-top: 18px; }
-  .control-column { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: 326px; align-items: start; }
+  .control-column { height: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: 326px; align-items: start; }
   .schedule-card { grid-column: auto; }
   .clock-card, .schedule-card { height: 326px; }
   .schedule-list { display: block; }
@@ -222,7 +221,7 @@ button { cursor: pointer; }
   .control-column { grid-template-columns: 1fr; grid-template-rows: none; grid-auto-rows: auto; gap: 10px; }
   .clock-card { height: auto; min-height: 280px; }
   .schedule-card { height: 326px; min-height: 326px; }
-  .display-stage { grid-row: auto; min-height: 630px; aspect-ratio: auto; padding: 18px; grid-template-rows: 26px minmax(0, 1fr) auto; row-gap: 8px; }
+  .display-stage { grid-row: auto; min-height: 630px; aspect-ratio: auto; padding: 18px; grid-template-rows: 26px minmax(min-content, 1fr) auto; row-gap: 8px; }
   .stage-main { grid-template-columns: minmax(0, 1fr) 104px; grid-template-rows: auto minmax(72px, auto); align-content: center; align-items: center; gap: 8px 10px; padding: 4px 0; }
   .stage-copy { grid-template-rows: auto auto; align-content: center; gap: 4px; }
   .portrait-frame { grid-column: 2; grid-row: 1; }
@@ -672,14 +671,13 @@ body { background: #edf2f7; }
 
 .merch-row {
   width: 100%;
-  height: 124px;
+  min-height: 124px;
   min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.9fr) minmax(132px, .75fr);
   gap: clamp(8px, 1vw, 12px);
 }
 .merch-card {
-  height: 100%;
   min-width: 0;
   overflow: hidden;
   padding: 11px 13px;
@@ -688,7 +686,7 @@ body { background: #edf2f7; }
   background: rgba(250, 252, 255, .78);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9);
 }
-.products-card { display: flex; flex-direction: column; }
+.products-card { display: flex; flex-direction: column; contain: size; }
 .merch-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .merch-heading h2 { margin: 3px 0 0; color: #263449; font-size: clamp(12px, 1vw, 15px); font-weight: 650; }
 .merch-kicker { display: block; color: #8494aa; font-size: 8px; font-weight: 700; letter-spacing: .16em; }
@@ -700,13 +698,13 @@ body { background: #edf2f7; }
 .merch-empty { display: flex; flex: 1; align-items: center; color: #748399; font-size: 11px; }
 .target-card { display: flex; flex-direction: column; justify-content: center; align-items: flex-start; background: rgba(237, 244, 254, .88); border-color: rgba(95, 133, 188, .27); }
 .target-label { margin-top: 6px; color: #718096; font-size: clamp(10px, .85vw, 13px); }
-.target-value { min-height: 0; max-width: 100%; overflow: auto; margin-top: 3px; color: #3d6dad; font-size: clamp(22px, 2.2vw, 38px); font-weight: 650; line-height: 1.2; white-space: pre-wrap; overflow-wrap: anywhere; }
+.target-value { flex-shrink: 0; min-width: 0; max-width: 100%; margin-top: 3px; color: #3d6dad; font-size: clamp(22px, 2.2vw, 38px); font-weight: 650; line-height: 1.2; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.fullscreen-layout .merch-row { height: clamp(132px, 15vh, 164px); }
+.fullscreen-layout .merch-row { min-height: clamp(132px, 15vh, 164px); }
 .fullscreen-layout .portrait-frame { height: clamp(280px, calc(100vh - 520px), 560px); }
 
 @media (max-width: 620px) {
-  .merch-row { height: auto; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .merch-row { min-height: 0; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .products-card { min-height: 140px; }
   .product-list { grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .product-list li { min-height: 23px; padding: 0; border: 0; background: transparent; }
@@ -1031,6 +1029,24 @@ body, .topbar, .control-card, .display-stage, .merch-card, .auth-card, .admin-ca
 .schedule-edit-row > td { padding: 0; background: rgba(237,244,254,.42); }
 .schedule-edit-form { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 11px; padding: 16px; }
 .schedule-edit-form textarea { min-height: auto; resize: vertical; line-height: 1.6; }
+.schedule-target-field { display: grid; min-width: 0; }
+.schedule-target-field::after, .schedule-edit-form .schedule-target-input {
+  grid-area: 1 / 1;
+  min-width: 0;
+  padding: 7px 9px;
+  border-width: 1px;
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.schedule-target-field::after {
+  content: attr(data-value) "\200b";
+  visibility: hidden;
+  border: 1px solid transparent;
+}
+.schedule-edit-form .schedule-target-input { overflow: hidden; resize: none; }
 .schedule-edit-wide { grid-column: span 2; }
 .schedule-edit-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; padding-top: 3px; }
 .schedule-save-button { min-height: 32px; padding: 0 13px; border: 1px solid #426da9; border-radius: 7px; background: linear-gradient(135deg,#5e86c0,#416ca8); color: #fff; font-size: 9px; cursor: pointer; }
