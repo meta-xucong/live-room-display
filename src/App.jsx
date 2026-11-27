@@ -205,6 +205,15 @@ function LoginPage({ onLogin, theme, onToggleTheme }) {
   );
 }
 
+function revealAvatarUpload(section) {
+  if (!section) return;
+  section.focus({ preventScroll: true });
+  section.scrollIntoView({
+    block: "start",
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
+  });
+}
+
 function AvatarLibrary({ csrfToken }) {
   const [data, setData] = useState(null);
   const [pending, setPending] = useState([]);
@@ -212,18 +221,29 @@ function AvatarLibrary({ csrfToken }) {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [replaceNames, setReplaceNames] = useState([]);
-  const [replaceName, setReplaceName] = useState("");
   const [viewing, setViewing] = useState(null);
   const [avatarAction, setAvatarAction] = useState(null);
   const [nameDraft, setNameDraft] = useState(null);
   const [nameError, setNameError] = useState("");
   const [savingName, setSavingName] = useState(false);
   const fileInput = useRef(null);
+  const selectedHost = useRef("");
+  const pendingSection = useRef(null);
+  const replacementSection = useRef(null);
+  const revealPending = useRef(false);
   const pendingRef = useRef(pending);
   const changingAvatar = busy || savingName || Boolean(avatarAction);
 
   useEffect(() => { pendingRef.current = pending; }, [pending]);
   useEffect(() => () => pendingRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)), []);
+  useEffect(() => {
+    if (!revealPending.current || !pendingSection.current) return;
+    revealPending.current = false;
+    revealAvatarUpload(pendingSection.current);
+  }, [pending]);
+  useEffect(() => {
+    if (replaceNames.length) revealAvatarUpload(replacementSection.current);
+  }, [replaceNames]);
 
   const loadLibrary = useCallback(async () => {
     const response = await api("/api/v1/admin/host-avatars");
@@ -242,7 +262,7 @@ function AvatarLibrary({ csrfToken }) {
 
   function queueFiles(fileList, preferredName = "") {
     const selected = Array.from(fileList ?? []);
-    if (!selected.length) return;
+    if (changingAvatar || !selected.length) return;
     if (pending.length + selected.length > 20) {
       setMessage("一次最多选择 20 张照片。");
       return;
@@ -256,14 +276,21 @@ function AvatarLibrary({ csrfToken }) {
       name: preferredName && index === 0 ? preferredName : inferredHostName(file.name),
       previewUrl: URL.createObjectURL(file),
     }));
+    revealPending.current = true;
     setPending((current) => current.concat(items));
     setMessage("");
     setReplaceNames([]);
   }
 
+  function chooseFiles(hostName = "") {
+    if (changingAvatar) return;
+    selectedHost.current = hostName;
+    fileInput.current?.click();
+  }
+
   function onSelectFiles(event) {
-    queueFiles(event.target.files, replaceName);
-    setReplaceName("");
+    queueFiles(event.target.files, selectedHost.current);
+    selectedHost.current = "";
     event.target.value = "";
   }
 
@@ -271,6 +298,7 @@ function AvatarLibrary({ csrfToken }) {
     const item = pending[index];
     if (item) URL.revokeObjectURL(item.previewUrl);
     setPending((current) => current.filter((_, itemIndex) => itemIndex !== index));
+    setReplaceNames([]);
   }
 
   function clearPending() {
@@ -395,6 +423,7 @@ function AvatarLibrary({ csrfToken }) {
           type="file"
           accept=".jpg,.jpeg,.png,image/jpeg,image/png"
           multiple
+          disabled={changingAvatar}
           onChange={onSelectFiles}
           aria-label="选择主播头像"
         />
@@ -406,36 +435,47 @@ function AvatarLibrary({ csrfToken }) {
           <div className="avatar-drop-glyph">＋</div>
           <strong>拖入照片，或从电脑选择</strong>
           <span>支持 JPG、PNG；每张不超过 8 MB；单次最多 20 张、合计 28 MB</span>
-          <button className="button-primary avatar-choose-button" type="button" onClick={() => fileInput.current?.click()}>选择照片</button>
+          <button className="button-primary avatar-choose-button" type="button" disabled={changingAvatar} onClick={() => chooseFiles()}>选择照片</button>
           <small>默认从文件名识别主播姓名；文件名可写为“主播编号_姓名.jpg”，提交前可修改。</small>
         </div>
         {pending.length > 0 && (
-          <div className="avatar-pending">
-            <div className="avatar-pending-heading"><strong>待上传 {pending.length} 张</strong><button type="button" className="avatar-text-button" onClick={clearPending}>清空</button></div>
+          <section className="avatar-pending" ref={pendingSection} tabIndex={-1} aria-labelledby="avatar-pending-title" aria-busy={busy}>
+            <div className="avatar-pending-heading">
+              <strong id="avatar-pending-title">待上传 {pending.length} 张</strong>
+              <div className="avatar-upload-actions">
+                <button type="button" className="avatar-text-button" disabled={changingAvatar} onClick={clearPending}>清空</button>
+                {!replaceNames.length && (
+                  <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0 || pending.some((item) => !item.name.trim())} onClick={() => submitUpload()}>{busy ? "正在上传…" : "上传到头像库"}</button>
+                )}
+              </div>
+            </div>
+            {invalidFiles.length > 0 && <p className="avatar-invalid-hint">请检查文件格式和单张大小。</p>}
             <div className="avatar-pending-grid">
               {pending.map((item, index) => (
                 <div className="avatar-pending-item" key={item.previewUrl}>
                   <img src={item.previewUrl} alt={item.name || "待上传主播照片"} />
-                  <label>主播姓名<input value={item.name} maxLength={80} onChange={(event) => setPending((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, name: event.target.value } : entry))} /></label>
+                  <label>主播姓名<input value={item.name} maxLength={80} disabled={changingAvatar} onChange={(event) => {
+                    setPending((current) => current.map((entry, entryIndex) => entryIndex === index ? { ...entry, name: event.target.value } : entry));
+                    setReplaceNames([]);
+                  }} /></label>
                   <small>{item.file.name} · {(item.file.size / 1024 / 1024).toFixed(1)} MB</small>
-                  <button type="button" className="avatar-remove-pending" aria-label={"移除 " + item.name} onClick={() => removePending(index)}>移除</button>
+                  <button type="button" className="avatar-remove-pending" aria-label={"移除 " + item.name} disabled={changingAvatar} onClick={() => removePending(index)}>移除</button>
                 </div>
               ))}
             </div>
             {replaceNames.length > 0 && (
-              <div className="avatar-replace-confirm" role="alert">
+              <div className="avatar-replace-confirm" ref={replacementSection} tabIndex={-1} role="alert">
                 <div><strong>有 {replaceNames.length} 位主播已经有头像</strong><span>{replaceNames.join("、")}。替换后，所有使用这些主播的排班页面都会显示新头像。</span></div>
                 <div className="avatar-confirm-actions">
-                  <button type="button" className="avatar-secondary-button" onClick={() => setReplaceNames([])}>返回检查</button>
-                  <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0} onClick={() => submitUpload(true)}>{busy ? "正在保存…" : "确认替换并保存"}</button>
+                  <button type="button" className="avatar-secondary-button" disabled={changingAvatar} onClick={() => {
+                    setReplaceNames([]);
+                    revealAvatarUpload(pendingSection.current);
+                  }}>返回检查</button>
+                  <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0} onClick={() => submitUpload(true)}>{busy ? "正在上传…" : "确认替换并保存"}</button>
                 </div>
               </div>
             )}
-            <div className="avatar-upload-actions">
-              {invalidFiles.length > 0 && <span className="avatar-invalid-hint">请检查文件格式和单张大小。</span>}
-              <button type="button" className="button-primary avatar-choose-button" disabled={changingAvatar || invalidFiles.length > 0 || pending.some((item) => !item.name.trim())} onClick={() => submitUpload(false)}>{busy ? "正在保存…" : "上传到头像库"}</button>
-            </div>
-          </div>
+          </section>
         )}
       </div>
 
@@ -496,7 +536,7 @@ function AvatarLibrary({ csrfToken }) {
                   )}
                 </div>
                 <div className="avatar-profile-actions">
-                  <button type="button" className="avatar-secondary-button" disabled={changingAvatar} onClick={() => { setReplaceName(profile.name); fileInput.current?.click(); }}>更换头像</button>
+                  <button type="button" className="avatar-secondary-button" disabled={changingAvatar} onClick={() => chooseFiles(profile.name)}>更换头像</button>
                   {profile.hasPhoto && (
                     <button type="button" className="avatar-text-button danger" disabled={changingAvatar} onClick={() => removeAvatar(profile, "photo")}>
                       {avatarAction?.id === profile.id && avatarAction.action === "photo" ? "处理中…" : "移除头像"}
