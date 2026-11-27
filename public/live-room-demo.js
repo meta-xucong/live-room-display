@@ -104,7 +104,7 @@
     const isLive = Boolean(program.current);
     const nowDate = new Date(timestamp);
     const statusText = isLive ? "当前直播" : displayed ? "下一场排班" : displayedDirector ? "导演已排班" : "暂无排班";
-    const options = rooms.map((item) => `<option value="${escapeHtml(item.id)}"${item.id === room.id ? " selected" : ""}>${escapeHtml(item.id)}号直播间 · ${escapeHtml(item.name)}</option>`).join("");
+    const options = rooms.map((item) => `<option value="${escapeHtml(item.id)}"${item.id === room.id ? " selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
     const scheduleRows = program.today.map((item) => {
       const active = program.current?.date === item.date && program.current?.start === item.start && program.current?.end === item.end;
       const next = program.next?.date === item.date && program.next?.start === item.start && program.next?.end === item.end;
@@ -130,7 +130,7 @@
         </aside>
         <section class="display-stage" aria-label="直播间门口电子屏预览">
           <div class="stage-topline"><span>直播间现场信息</span><span class="live-pill${isLive ? " live-pill-on" : " live-pill-next"}"><span class="live-dot"></span>${statusText}</span></div>
-          <div class="stage-main"><div class="stage-copy"><div class="room-heading"><div class="room-id-line">${escapeHtml(room.id)}<span>号直播间</span></div><h1>${escapeHtml(room.name)}</h1></div><div class="stage-period"><div class="stage-date">${formatDate(nowDate)}</div><div class="time-strip"><span class="time-strip-label">${isLive ? "主播时段" : displayed ? "下一主播时段" : "主播排班"}</span><span class="time-strip-range">${escapeHtml(formatRange(displayed))}</span></div></div></div><div class="portrait-frame">${portrait}</div>${roles}</div>
+          <div class="stage-main"><div class="stage-copy"><h1>${escapeHtml(room.name)}</h1><div class="stage-period"><div class="stage-date">${formatDate(nowDate)}</div><div class="time-strip"><span class="time-strip-label">${isLive ? "主播时段" : displayed ? "下一主播时段" : "主播排班"}</span><span class="time-strip-range">${escapeHtml(formatRange(displayed))}</span></div></div></div><div class="portrait-frame">${portrait}</div>${roles}</div>
           ${merchandise}
         </section>
       </main>

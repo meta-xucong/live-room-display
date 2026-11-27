@@ -16,7 +16,7 @@ function RoomPickerLabel({ room }) {
   return (
     <>
       <RoomAvatar room={room} />
-      <span className="room-picker-name">{room.id}号直播间 · {room.name}</span>
+      <span className="room-picker-name">{room.name}</span>
     </>
   );
 }
@@ -67,12 +67,12 @@ export function DisplayRoomPicker({ rooms, value, onChange }) {
           onBlur={(event) => {
             if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
           }}>
-          <summary className="room-picker-trigger" title={selected.id + "号直播间 · " + selected.name}>
+          <summary className="room-picker-trigger" title={selected.name}>
             <RoomPickerLabel room={selected} />
           </summary>
           <div className="room-picker-menu" role="group" aria-label="选择直播间">
             {rooms.map((room) => (
-              <button type="button" className="room-picker-option" key={room.roomId ?? room.id} title={room.id + "号直播间 · " + room.name}
+              <button type="button" className="room-picker-option" key={room.roomId ?? room.id} title={room.name}
                 aria-current={selected.id === room.id ? "true" : undefined}
                 onClick={() => { onChange(room.id); closePicker(); }}>
                 <RoomPickerLabel room={room} />

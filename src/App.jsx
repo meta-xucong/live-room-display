@@ -1208,7 +1208,7 @@ export function App() {
           </div>
           <div className="stage-main">
             <div className="stage-copy">
-              <div className="room-heading"><div className="room-id-line">{room?.id ?? "—"}<span>号直播间</span></div><h1>{room?.name ?? "等待直播间信息"}</h1></div>
+              <h1>{room?.name ?? "等待直播间信息"}</h1>
               <div className="stage-period"><div className="stage-date">{formatDate(nowDate)}</div><div className="time-strip"><span className="time-strip-label">{isLive ? "主播时段" : displayed ? "下一主播时段" : "主播排班"}</span><span className="time-strip-range">{formatRange(displayed)}</span></div></div>
             </div>
             <div className="portrait-frame">
